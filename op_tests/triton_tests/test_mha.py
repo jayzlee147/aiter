@@ -12,6 +12,7 @@ from aiter.ops.triton.mha import (
     flash_attn_varlen_fp8_func,
     mha_set_use_fused_bwd_kernel,
     mha_set_use_int64_strides,
+    FP8_DESCALE_head, FP8_DESCALE_block, FP8_DESCALE_token, FP8_DESCALE_None
 )
 from aiter.test_mha_common import (
     attention_ref,
@@ -109,7 +110,13 @@ def fp8_assert_close(
     "DROPOUT, RETURN_LSE, RETURN_SOFTMAX, ", [(0.2, True, True), (0.0, False, False)]
 )
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
-@pytest.mark.parametrize("FP8", [(True), (False)])
+@pytest.mark.parametrize(
+    "FP8, FP8_DESCALE_Q_TYPE, FP8_DESCALE_KV_TYPE, SCALE_BLK_M, SCALE_BLK_N",
+    [(True, FP8_DESCALE_token, FP8_DESCALE_block, 128, 128),
+     (True, FP8_DESCALE_block, FP8_DESCALE_block, 128, 128),
+     (True, FP8_DESCALE_head, FP8_DESCALE_head, 128, 128),
+     (False, FP8_DESCALE_None, FP8_DESCALE_None, 0, 0)]
+)
 def test_mha(
     BATCH: int,
     SEQLEN_Q: int,
@@ -122,6 +129,10 @@ def test_mha(
     RETURN_SOFTMAX: bool,
     CAUSAL: bool,
     FP8: bool,
+    FP8_DESCALE_Q_TYPE: int,
+    FP8_DESCALE_KV_TYPE: int,
+    SCALE_BLK_M: int,
+    SCALE_BLK_N: int,
     dtype=torch.float16,
 ):
     torch.cuda.empty_cache()
@@ -139,6 +150,10 @@ def test_mha(
             causal=CAUSAL,
             return_lse=RETURN_LSE,
             return_attn_probs=RETURN_SOFTMAX,
+            FP8_DESCALE_Q_TYPE=FP8_DESCALE_Q_TYPE,
+            FP8_DESCALE_KV_TYPE=FP8_DESCALE_KV_TYPE,
+            SCALE_BLK_M=SCALE_BLK_M,
+            SCALE_BLK_N=SCALE_BLK_N
         )
     else:
         triton_out = flash_attn_func(

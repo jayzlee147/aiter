@@ -35,8 +35,46 @@ def mha_set_use_int64_strides(value: bool):
     global _USE_INT64_STRIDES
     _USE_INT64_STRIDES = value
 
+def _cast_to_fp8_base(
+    x: torch.Tensor,
+    fp8_dtype,
+    reduce_dims,
+    clamp_val):
+    x_abs_max = x.abs().amax(dim=reduce_dims, keepdim=True)
+    # print(f"{x_abs_max.shape=}")
+    x_abs_max = torch.maximum(x_abs_max, x.new_tensor(clamp_val))
+    fp8_max = torch.finfo(fp8_dtype).max
+    
+    scale = fp8_max / x_abs_max
+    descale_factor = x_abs_max / fp8_max
+    
+    x_fp8 = (x * scale).to(fp8_dtype)
+    return x_fp8, descale_factor
 
-def _cast_to_fp8(
+def _cast_per_token_to_fp8(x: torch.Tensor,
+    fp8_dtype,
+    layout,
+    clamp_val=1e-9):
+    if len(x.shape) != 4:
+        raise ValueError(f"'bshd' tensor should have shape [batch, seqlen, heads, dim], got {x.shape}")
+    reduce_dims = (3,)
+    return _cast_to_fp8_base(x, fp8_dtype, reduce_dims, clamp_val)
+
+def _cast_per_block_to_fp8(x: torch.Tensor,
+    fp8_dtype,
+    layout,
+    BLOCK_N,
+    clamp_val=1e-9):
+    if len(x.shape) != 4:
+        raise ValueError(f"'bshd' tensor should have shape [batch, seqlen, heads, dim], got {x.shape}")
+    batch, seqlen, heads, dim = x.shape
+    BLOCK_N = min(BLOCK_N, seqlen)
+    x = x.view(batch, -1, BLOCK_N, heads, dim)
+    reduce_dims = (2, 4)
+    x_fp8, descale_factor = _cast_to_fp8_base(x, fp8_dtype, reduce_dims, clamp_val)
+    return x_fp8.view(batch, -1, heads, dim), descale_factor.view(batch, -1, heads, 1)
+
+def _cast_per_head_to_fp8(
     x: torch.Tensor,
     fp8_dtype,
     layout,
@@ -75,6 +113,21 @@ def _cast_to_fp8(
 
     return x_fp8, descale_factor
 
+def _cast_to_fp8(x: torch.Tensor,
+    fp8_dtype,
+    layout,
+    descale_type,
+    descale_block_size,
+    clamp_val=1e-9):
+    if descale_type == FP8_DESCALE_head:
+        return _cast_per_head_to_fp8(x, fp8_dtype, layout, clamp_val)
+    elif descale_type == FP8_DESCALE_block:
+        return _cast_per_block_to_fp8(x, fp8_dtype, layout, descale_block_size, clamp_val)
+    elif descale_type == FP8_DESCALE_token:
+        return _cast_per_token_to_fp8(x, fp8_dtype, layout, clamp_val)
+    else: raise ValueError(
+            f"descale_type should be oneof (FP8_DESCALE_head, FP8_DESCALE_block, FP8_DESCALE_token), got {fp8_dtype}"
+        )
 
 def _cast_varlen_to_fp8(
     x: torch.Tensor,
@@ -190,6 +243,10 @@ def _compute_alibi_block(
     else:
         return alibi_block
 
+FP8_DESCALE_None = 0
+FP8_DESCALE_head = 1
+FP8_DESCALE_block = 2
+FP8_DESCALE_token = 3
 
 @triton.jit
 def _attn_fwd_inner(
@@ -216,9 +273,13 @@ def _attn_fwd_inner(
     masked_blocks,
     n_extra_tokens,
     alibi_slope,
-    descale_q,
-    descale_k,
-    descale_v,
+    descale_q_ptr, 
+    descale_k_ptr, 
+    descale_v_ptr,
+    stride_descale_q_s,
+    stride_descale_k_s,
+    stride_descale_v_s,
+    nblocks_scale: tl.constexpr,
     OFFS_M: tl.constexpr,
     OFFS_N: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -233,12 +294,47 @@ def _attn_fwd_inner(
     PADDED_HEAD: tl.constexpr,
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    FP8_DESCALE_Q_TYPE: tl.constexpr,
+    FP8_DESCALE_KV_TYPE: tl.constexpr,
+    SCALE_BLK_M: tl.constexpr, SCALE_BLK_N: tl.constexpr,
 ):
     RCP_LN2: tl.constexpr = 1.4426950408889634
 
+
+    if FP8_DESCALE_Q_TYPE == 1: # FP8_DESCALE_head
+        descale_q = tl.load(descale_q_ptr)
+    elif FP8_DESCALE_Q_TYPE == 2: # FP8_DESCALE_block
+        off_m = start_m * BLOCK_M // SCALE_BLK_M
+        descale_q = tl.load(descale_q_ptr + off_m * stride_descale_q_s)
+    elif FP8_DESCALE_Q_TYPE == 3: # FP8_DESCALE_token
+        descale_q = tl.load(descale_q_ptr + OFFS_M[:, None] * stride_descale_q_s)
+    else:
+        descale_q = 0.0
+
+    if FP8_DESCALE_KV_TYPE == 1: # FP8_DESCALE_head
+        descale_k = tl.load(descale_k_ptr)
+        descale_v = tl.load(descale_v_ptr)
+    elif FP8_DESCALE_KV_TYPE == 2: # FP8_DESCALE_block
+        descale_k_block = tl.load(descale_k_ptr + tl.arange(0, nblocks_scale) * stride_descale_k_s)
+        descale_v_block = tl.load(descale_v_ptr + tl.arange(0, nblocks_scale) * stride_descale_v_s)
+    elif FP8_DESCALE_KV_TYPE == 3: ...
+    else:
+        descale_k = 0.0
+        descale_v = 0.0
     # loop over k, v, and update accumulator
 
     for start_n in range(block_min, block_max, BLOCK_N):
+        if FP8_DESCALE_KV_TYPE == 2: # FP8_DESCALE_block
+            idx_block_n = tl.full([1], start_n // SCALE_BLK_N, dtype=tl.int32) # todo BLOCK_N > SCALE_BLK_N
+            descale_k = descale_k_block.gather(idx_block_n, 0)
+            descale_v = descale_v_block.gather(idx_block_n, 0)
+            # off_n = start_n // SCALE_BLK_N
+            # descale_k = tl.load(descale_k_ptr + off_n * stride_descale_k_s)
+            # descale_v = tl.load(descale_v_ptr + off_n * stride_descale_v_s)
+        elif FP8_DESCALE_KV_TYPE == 3: # FP8_DESCALE_token
+            off_n = start_n + tl.arange(0, BLOCK_N)
+            descale_k = tl.load(descale_k_ptr + off_n[None, :] * stride_descale_k_s)
+            descale_v = tl.load(descale_v_ptr + off_n[:, None] * stride_descale_v_s)
         # For padded blocks, we will overrun the tensor size if
         # we load all BLOCK_N. For others, the blocks are all within range.
         if MASK_STEPS:
@@ -383,9 +479,9 @@ def _attn_fwd(
     stride_vh_in,
     stride_vn_in,
     stride_vk_in,
-    stride_descale_q_z_in,
-    stride_descale_k_z_in,
-    stride_descale_v_z_in,
+    stride_descale_q_z_in, stride_descale_q_s_in, stride_descale_q_h_in,
+    stride_descale_k_z_in, stride_descale_k_s_in, stride_descale_k_h_in,
+    stride_descale_v_z_in, stride_descale_v_s_in, stride_descale_v_h_in,
     stride_oz_in,
     stride_oh_in,
     stride_om_in,
@@ -422,6 +518,10 @@ def _attn_fwd(
     BATCH,
     NUM_XCD: tl.constexpr,
     USE_INT64_STRIDES: tl.constexpr,
+    FP8_DESCALE_Q_TYPE: tl.constexpr,
+    FP8_DESCALE_KV_TYPE: tl.constexpr,
+    SCALE_BLK_M: tl.constexpr,
+    SCALE_BLK_N: tl.constexpr
 ):
     NUM_BLOCKS = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
     # calculate offsets
@@ -466,6 +566,12 @@ def _attn_fwd(
             stride_descale_q_z = tl.cast(stride_descale_q_z_in, tl.int64)
             stride_descale_k_z = tl.cast(stride_descale_k_z_in, tl.int64)
             stride_descale_v_z = tl.cast(stride_descale_v_z_in, tl.int64)
+            stride_descale_q_s = tl.cast(stride_descale_q_s_in, tl.int64)
+            stride_descale_k_s = tl.cast(stride_descale_k_s_in, tl.int64)
+            stride_descale_v_s = tl.cast(stride_descale_v_s_in, tl.int64)
+            stride_descale_q_h = tl.cast(stride_descale_q_h_in, tl.int64)
+            stride_descale_k_h = tl.cast(stride_descale_k_h_in, tl.int64)
+            stride_descale_v_h = tl.cast(stride_descale_v_h_in, tl.int64)
         stride_oz = tl.cast(stride_oz_in, tl.int64)
         stride_oh = tl.cast(stride_oh_in, tl.int64)
         stride_om = tl.cast(stride_om_in, tl.int64)
@@ -498,6 +604,12 @@ def _attn_fwd(
         stride_descale_q_z = stride_descale_q_z_in
         stride_descale_k_z = stride_descale_k_z_in
         stride_descale_v_z = stride_descale_v_z_in
+        stride_descale_q_s = stride_descale_q_s_in
+        stride_descale_k_s = stride_descale_k_s_in
+        stride_descale_v_s = stride_descale_v_s_in
+        stride_descale_q_h = stride_descale_q_h_in
+        stride_descale_k_h = stride_descale_k_h_in
+        stride_descale_v_h = stride_descale_v_h_in
         stride_oz = stride_oz_in
         stride_oh = stride_oh_in
         stride_om = stride_om_in
@@ -664,11 +776,9 @@ def _attn_fwd(
         q_mask = (offs_m[:, None] < seqlen_q) & (offs_d[None, :] < BLOCK_DMODEL)
     q = tl.load(q_ptrs, mask=q_mask, other=0.0)
     if IS_FP8:
-        descale_q = tl.load(descale_q_ptr + off_z * stride_descale_q_z + off_q_head)
-        descale_k = tl.load(descale_k_ptr + off_z * stride_descale_k_z + off_k_head)
-        descale_v = tl.load(descale_v_ptr + off_z * stride_descale_v_z + off_k_head)
-    else:
-        descale_q, descale_k, descale_v = 1.0, 1.0, 1.0
+        descale_q_ptr = descale_q_ptr + off_z * stride_descale_q_z + off_q_head * stride_descale_q_h
+        descale_k_ptr = descale_k_ptr + off_z * stride_descale_k_z + off_k_head * stride_descale_k_h
+        descale_v_ptr = descale_v_ptr + off_z * stride_descale_v_z + off_k_head * stride_descale_v_h
 
     n_extra_tokens = 0
     if seqlen_k < BLOCK_N:
@@ -693,6 +803,7 @@ def _attn_fwd(
     n_full_blocks = n_blocks - masked_blocks
     block_min = 0
     block_max = n_blocks * BLOCK_N
+    nblocks_scale: tl.constexpr = (SEQLEN_K + SCALE_BLK_N -1) // SCALE_BLK_N if SCALE_BLK_N else 0
     # Compute for full blocks. Here we set causal to false regardless of its actual
     # value because there is no masking. Similarly we do not need padding.
     if n_full_blocks > 0:
@@ -721,9 +832,9 @@ def _attn_fwd(
             0,
             0,
             alibi_slope,
-            descale_q,
-            descale_k,
-            descale_v,
+            descale_q_ptr, descale_k_ptr, descale_v_ptr,
+            stride_descale_q_s, stride_descale_k_s, stride_descale_v_s,
+            nblocks_scale,
             offs_m,
             offs_n,
             BLOCK_M,
@@ -737,7 +848,9 @@ def _attn_fwd(
             RETURN_SCORES=RETURN_SCORES,
             PADDED_HEAD=BLOCK_DMODEL != BLOCK_DMODEL_POW2,
             IS_FP8=IS_FP8,
-            FP8_MAX=FP8_MAX,
+            FP8_MAX=FP8_MAX, FP8_DESCALE_Q_TYPE=FP8_DESCALE_Q_TYPE,
+            FP8_DESCALE_KV_TYPE=FP8_DESCALE_KV_TYPE,
+            SCALE_BLK_M=SCALE_BLK_M, SCALE_BLK_N=SCALE_BLK_N
         )
         block_min = block_max
         block_max = n_blocks * BLOCK_N
@@ -778,9 +891,9 @@ def _attn_fwd(
             masked_blocks,
             n_extra_tokens,
             alibi_slope,
-            descale_q,
-            descale_k,
-            descale_v,
+            descale_q_ptr, descale_k_ptr, descale_v_ptr,
+            stride_descale_q_s_in, stride_descale_k_s_in, stride_descale_v_s_in,
+            nblocks_scale,
             offs_m,
             offs_n,
             BLOCK_M,
@@ -794,7 +907,9 @@ def _attn_fwd(
             RETURN_SCORES=RETURN_SCORES,
             PADDED_HEAD=BLOCK_DMODEL != BLOCK_DMODEL_POW2,
             IS_FP8=IS_FP8,
-            FP8_MAX=FP8_MAX,
+            FP8_MAX=FP8_MAX, FP8_DESCALE_Q_TYPE=FP8_DESCALE_Q_TYPE,
+            FP8_DESCALE_KV_TYPE=FP8_DESCALE_KV_TYPE,
+            SCALE_BLK_M=SCALE_BLK_M, SCALE_BLK_N=SCALE_BLK_N
         )
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
@@ -913,6 +1028,9 @@ def _flash_attn_forward(
     descale_k: Optional[torch.Tensor] = None,
     descale_v: Optional[torch.Tensor] = None,
     config: Optional[dict[str, any]] = None,
+    FP8_DESCALE_Q_TYPE = FP8_DESCALE_None,
+    FP8_DESCALE_KV_TYPE = FP8_DESCALE_None,
+    SCALE_BLK_M = 0, SCALE_BLK_N = 0
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
     if bias is not None:
@@ -1044,8 +1162,14 @@ def _flash_attn_forward(
         *k_strides,
         *v_strides,
         descale_q.stride(0) if descale_q is not None else 0,
+        descale_q.stride(1) if descale_q is not None else 0,
+        descale_q.stride(2) if descale_q is not None else 0,
         descale_k.stride(0) if descale_k is not None else 0,
+        descale_k.stride(1) if descale_k is not None else 0,
+        descale_k.stride(2) if descale_k is not None else 0,
         descale_v.stride(0) if descale_v is not None else 0,
+        descale_v.stride(1) if descale_v is not None else 0,
+        descale_v.stride(2) if descale_v is not None else 0,
         *o_strides,
         alibi_slopes.stride(0) if alibi_slopes is not None else 0,
         alibi_slopes.stride(1) if alibi_slopes is not None else 0,
@@ -1077,6 +1201,10 @@ def _flash_attn_forward(
         BATCH=batch,
         NUM_XCD=8,
         USE_INT64_STRIDES=_USE_INT64_STRIDES,
+        FP8_DESCALE_Q_TYPE=FP8_DESCALE_Q_TYPE,
+        FP8_DESCALE_KV_TYPE=FP8_DESCALE_KV_TYPE,
+        SCALE_BLK_M=SCALE_BLK_M,
+        SCALE_BLK_N=SCALE_BLK_N,
         **config,
     )
 
@@ -1333,6 +1461,8 @@ class _FlashAttnFP8Func(torch.autograd.Function):
         return_lse,
         return_softmax,
         is_grad_enabled,
+        FP8_DESCALE_Q_TYPE, FP8_DESCALE_KV_TYPE,
+        SCALE_BLK_M, SCALE_BLK_N,
         config=None,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
@@ -1345,10 +1475,11 @@ class _FlashAttnFP8Func(torch.autograd.Function):
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
 
         # cast input to fp8
-        fp8_dtype = arch_info.get_fp8_e4m3_dtype()
-        q_fp8, descale_q = _cast_to_fp8(q, fp8_dtype, "bshd")
-        k_fp8, descale_k = _cast_to_fp8(k, fp8_dtype, "bshd")
-        v_fp8, descale_v = _cast_to_fp8(v, fp8_dtype, "bshd")
+        fp8_dtype = torch.float8_e4m3fnuz
+
+        q_fp8, descale_q = _cast_to_fp8(q, fp8_dtype, "bshd", FP8_DESCALE_Q_TYPE, SCALE_BLK_M)
+        k_fp8, descale_k = _cast_to_fp8(k, fp8_dtype, "bshd", FP8_DESCALE_KV_TYPE, SCALE_BLK_N)
+        v_fp8, descale_v = _cast_to_fp8(v, fp8_dtype, "bshd", FP8_DESCALE_KV_TYPE, SCALE_BLK_N)
 
         out_padded, softmax_lse, S_dmask, philox_seed, philox_offset = (
             _flash_attn_forward(
@@ -1371,6 +1502,10 @@ class _FlashAttnFP8Func(torch.autograd.Function):
                 descale_q=descale_q,
                 descale_k=descale_k,
                 descale_v=descale_v,
+                FP8_DESCALE_Q_TYPE=FP8_DESCALE_Q_TYPE,
+                FP8_DESCALE_KV_TYPE=FP8_DESCALE_KV_TYPE,
+                SCALE_BLK_M=SCALE_BLK_M,
+                SCALE_BLK_N=SCALE_BLK_N,
                 config=config,
             )
         )
@@ -1393,6 +1528,8 @@ class _FlashAttnFP8Func(torch.autograd.Function):
             ctx.causal = causal
             ctx.window_size = window_size
             ctx.alibi_slopes = alibi_slopes
+            ctx.descale_type = FP8_DESCALE_Q_TYPE
+            ctx.scale_blk_m = SCALE_BLK_M
 
         out = out_padded[..., :head_size_og]
         result = [out]
@@ -1419,7 +1556,7 @@ class _FlashAttnFP8Func(torch.autograd.Function):
             do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_v_og % 8])
 
         fp8_dtype = arch_info.get_fp8_e4m3_dtype()
-        do_padded_fp8, descale_do = _cast_to_fp8(do_padded, fp8_dtype, "bshd")
+        do_padded_fp8, descale_do = _cast_to_fp8(do_padded, fp8_dtype, "bshd", ctx.descale_type, ctx.scale_blk_m)
         if _USE_FUSED_BWD_KERNEL:
             flash_attn_fused_backward(
                 do_padded_fp8,
@@ -1510,7 +1647,11 @@ def flash_attn_fp8_func(
     deterministic=False,
     return_lse=False,
     return_attn_probs=False,
-    config: Optional[dict[str, any]] = None,
+    FP8_DESCALE_Q_TYPE=FP8_DESCALE_head,
+    FP8_DESCALE_KV_TYPE=FP8_DESCALE_head,
+    SCALE_BLK_M=128,
+    SCALE_BLK_N=128,
+    config: Optional[dict[str, any]] = None
 ):
     return _FlashAttnFP8Func.apply(
         q,
@@ -1525,6 +1666,8 @@ def flash_attn_fp8_func(
         return_lse,
         return_attn_probs,
         torch.is_grad_enabled(),
+        FP8_DESCALE_Q_TYPE, FP8_DESCALE_KV_TYPE,
+        SCALE_BLK_M, SCALE_BLK_N,
         config,
     )
 
