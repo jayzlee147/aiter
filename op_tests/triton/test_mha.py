@@ -74,22 +74,30 @@ def fp8_assert_close(tensor_a, tensor_b, atol=ATOL_fp8, rtol=RTOL_fp8, max_diff_
         f"Greatest relative difference: {max_rel_diff} at index {max_rel_pos} (up to {rtol} allowed)"
     )
 
-
+from aiter.ops.triton.mha import (
+    FP8_DESCALE_None,
+    FP8_DESCALE_QhKVh,
+    FP8_DESCALE_QtKVb,
+    FP8_DESCALE_QtKVt,
+    FP8_DESCALE_QbKVb
+) as fp8_scale_types
 @pytest.mark.parametrize('BATCH', [1,4,57,128])
 @pytest.mark.parametrize('SEQLEN_Q, SEQLEN_K', [(1,1), (4,4), (128,128), (2,1), (1,2), (32,16)])
 @pytest.mark.parametrize('NUM_Q_HEADS, NUM_K_HEADS', [(1,1), (16,16), (2,1), (48,8)])
 @pytest.mark.parametrize('HEAD_SZ', [8, 32, 128])
 @pytest.mark.parametrize('DROPOUT, RETURN_LSE, RETURN_SOFTMAX, ',[(0.2, True, True), (0.0, False, False)])
 @pytest.mark.parametrize('CAUSAL', [(True), (False)])
-@pytest.mark.parametrize('FP8',[(True), (False)])
-def test_mha(BATCH: int, SEQLEN_Q: int, SEQLEN_K: int, NUM_Q_HEADS: int, NUM_K_HEADS: int, HEAD_SZ: int, DROPOUT: float, RETURN_LSE: bool, RETURN_SOFTMAX: bool, CAUSAL: bool, FP8: bool, dtype=torch.float16):
+@pytest.mark.parametrize('FP8_DESCALE_TYPE',[FP8_DESCALE_None, FP8_DESCALE_QhKVh, FP8_DESCALE_QtKVb, FP8_DESCALE_QtKVt])
+@pytest.mark.parametrize('BLOCK_M', [32])
+@pytest.mark.parametrize('BLOCK_N', [32])
+def test_mha(BATCH: int, SEQLEN_Q: int, SEQLEN_K: int, NUM_Q_HEADS: int, NUM_K_HEADS: int, HEAD_SZ: int, DROPOUT: float, RETURN_LSE: bool, RETURN_SOFTMAX: bool, CAUSAL: bool, FP8_DESCALE_TYPE: int, BLOCK_M: int, BLOCK_N: int, dtype=torch.float16):
     q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
     k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ ), device="cuda", dtype=dtype)
     v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
                 
     dropout_mask = None
-    if FP8:
-        triton_out = flash_attn_fp8_func(q, k, v, dropout_p=DROPOUT, causal=CAUSAL, return_lse=RETURN_LSE, return_attn_probs=RETURN_SOFTMAX)
+    if FP8_DESCALE_TYPE:
+        triton_out = flash_attn_fp8_func(q, k, v, dropout_p=DROPOUT, causal=CAUSAL, return_lse=RETURN_LSE, return_attn_probs=RETURN_SOFTMAX, fp8_descale_type=FP8_DESCALE_TYPE, BLOCK_N=BLOCK_N)
     else:
         triton_out = flash_attn_func(q, k, v, dropout_p=DROPOUT, causal=CAUSAL, return_lse=RETURN_LSE, return_attn_probs=RETURN_SOFTMAX)
 
