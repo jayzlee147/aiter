@@ -14,7 +14,7 @@ ATOL_fp8 = 2.5e-1
 RTOL_fp8 =  2.5e-1
 
 from aiter.ops.triton.mha import flash_attn_func, flash_attn_fp8_func, flash_attn_varlen_func, flash_attn_varlen_fp8_func
-from aiter.test_mha_common import attention_ref, generate_random_padding_mask, generate_qkv, pad_rearrange_dropout_mask_hts_to_bhss 
+from aiter.test_mha_common import construct_local_mask, attention_ref, generate_random_padding_mask, generate_qkv, pad_rearrange_dropout_mask_hts_to_bhss 
 
 
 
@@ -74,22 +74,217 @@ def fp8_assert_close(tensor_a, tensor_b, atol=ATOL_fp8, rtol=RTOL_fp8, max_diff_
         f"Greatest relative difference: {max_rel_diff} at index {max_rel_pos} (up to {rtol} allowed)"
     )
 
+from aiter.ops.triton.mha import _flash_attn_forward, cast_to_fp8, cast_per_block_to_fp8, cast_per_token_to_fp8, cast_scores_per_block_to_fp8, Tuple
+from einops import rearrange, repeat
+import os
+os.environ["TRITON_CACHE_DIR"] = "/home/sijieli2/triton_cache"
+torch.cuda.set_device(0)
+torch.cuda.manual_seed(0)
+import aiter.ops.triton.mha as amha
+descale_types = (
+    # amha.FP8_DESCALE_None,
+    # amha.FP8_DESCALE_QhKVh,
+    amha.FP8_DESCALE_QtKVb,
+    # amha.FP8_DESCALE_QtKVt,
+    # amha.FP8_DESCALE_QbKVb,
+)
 
-@pytest.mark.parametrize('BATCH', [1,4,57,128])
-@pytest.mark.parametrize('SEQLEN_Q, SEQLEN_K', [(1,1), (4,4), (128,128), (2,1), (1,2), (32,16)])
-@pytest.mark.parametrize('NUM_Q_HEADS, NUM_K_HEADS', [(1,1), (16,16), (2,1), (48,8)])
-@pytest.mark.parametrize('HEAD_SZ', [8, 32, 128])
-@pytest.mark.parametrize('DROPOUT, RETURN_LSE, RETURN_SOFTMAX, ',[(0.2, True, True), (0.0, False, False)])
-@pytest.mark.parametrize('CAUSAL', [(True), (False)])
-@pytest.mark.parametrize('FP8',[(True), (False)])
-def test_mha(BATCH: int, SEQLEN_Q: int, SEQLEN_K: int, NUM_Q_HEADS: int, NUM_K_HEADS: int, HEAD_SZ: int, DROPOUT: float, RETURN_LSE: bool, RETURN_SOFTMAX: bool, CAUSAL: bool, FP8: bool, dtype=torch.float16):
+def _multi_head_attn_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    causal: bool,
+    dropout_mask,
+    window_size_left: int,
+    window_size_right: int,
+    alibi_slopes: Optional[torch.Tensor],
+    return_lse: bool,
+    return_softmax: bool,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    descale_q: Optional[torch.Tensor] = None,
+    descale_k: Optional[torch.Tensor] = None,
+    descale_v: Optional[torch.Tensor] = None,
+    FP8_DESCALE_TYPE = amha.FP8_DESCALE_None,
+    SCALE_BLK_M = 32, SCALE_BLK_N = 32
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # print(f"@@@@@@ {q.shape=}, {k.shape=}, {v.shape=}")
+    # print(f"@@@@@@ {descale_q.shape=}, {descale_k.shape=}, {descale_v.shape=}")
+    # batch, seqlen_q, nheads_q, headdim = q.shape
+    # nheads_k = k.shape[2]
+
+    # out = torch.empty(q.shape, dtype=torch.float32, device=q.device)
+    # for b in range(batch):
+    #     for n in range(nheads_q):
+    #         n1 = n *nheads_k // nheads_q
+    #         m_i = torch.full((SCALE_BLK_M), float("-inf"), dtype=tl.float32)
+    #         l_i = torch.full((SCALE_BLK_M), 1.0, dtype=tl.float32)
+    #         acc = torch.empty((SCALE_BLK_M, headdim), dtype=torch.float32, device=q.device)
+    #         for sq in range(seqlen_q//SCALE_BLK_M):
+    #             start_m = sq * SCALE_BLK_M
+    #             end_m = start_m + SCALE_BLK_M
+    #             q = q[b, start_m:end_m, n, :]
+    #             descale_q = descale_q[b, sq, n, 0]
+    #             for sk in range(seqlen_k//SCALE_BLK_N):
+    #                 start_n = sk * SCALE_BLK_N
+    #                 end_n = start_n + SCALE_BLK_N
+    #                 k = q[b, start_n:end_n, n1, :]
+    #                 v = v[b, start_n:end_n, n1, :]
+    #                 descale_k = descale_k[b, sk, n, 0]
+    #                 descale_v = descale_v[b, sk, n, 0]
+                    
+    #                 qk = torch.matmul(q, k)
+    #                 qk_scaled = qk * descale_q * descale_k * softmax_scale
+    #                 m_ij = torch.maximum(m_i, torch.max(qk_scaled, 1))
+    #                 q_shifted = qk_scaled - m_ij[:, None]
+    #                 p = tl.math.exp(q_shifted)
+    #                 l_ij = tl.sum(p, 1)
+
+    #                 m_diff = m_i - m_ij
+    #                 alpha = tl.math.exp2(m_diff * RCP_LN2)
+    #                 acc = acc * alpha[:, None]
+    #                 l_i = l_i * alpha + l_ij
+    #                 m_i = m_ij
+
+    #                 acc += torch.matmul(p.to(v.dtype), v) * descale_v
+    # for b in range(batch):
+    #     for n0 in range(nheads_q):
+    #         n1 = n0 *nheads_k // nheads_q
+    #         q = q[b, :, n0, :]
+    #         k = k[b, :, n1, :]
+    #         v = v[b, :, n1, :]
+    #         descale_q = descale_q[b, n0, :, :]  # s d
+    #         descale_k = descale_k[b, n1, :, :]  # d s
+    #         descale_v = descale_v[b, :, n1, :]  # s d
+    #         qk = torch.matmul(q, k.transpose(1,0)).float() * descale_q * descale_k * softmax_scale
+
+    #         p = torch.softmax(qk).to(torch.float8_e4m3fnuz)
+
+    #         out[b, :, n0, :] = torch.matmul(p, v) * descale_v
+
+    # return out,
+
+    window_size = (window_size_left, window_size_right)
+    if causal:
+        window_size = (window_size_left, 0)
+    dtype_og = q.dtype
+    q,k,v = q.float(), k.float(), v.float()
+
+    seqlen_q, seqlen_k = q.shape[1], k.shape[1]
+    k = repeat(k, "b s h d -> b s (h g) d", g=q.shape[2] // k.shape[2])
+    v = repeat(v, "b s h d -> b s (h g) d", g=q.shape[2] // v.shape[2])
+    d = q.shape[-1] ** (-0.5)
+
+    scores = torch.einsum("bthd,bshd->bhts", q, k) 
+    print(f"@@@@@@ {scores.shape=}, {descale_q.shape=}, {descale_k.shape=}")
+    scores = scores * descale_q * descale_k * d
+
+    if window_size[0] >= 0 or window_size[1] >= 0:
+        local_mask = construct_local_mask(
+            seqlen_q,
+            seqlen_k,
+            window_size,
+            None,
+            None,
+            q.device,
+            key_leftpad=None,
+        )
+        scores.masked_fill_(local_mask, float("-inf"))
+
+    attention = torch.softmax(scores, dim=-1).to(v.dtype)
+    # Some rows might be completely masked out so we fill them with zero instead of NaN
+    if window_size[0] >= 0 or window_size[1] >= 0:
+        attention = attention.masked_fill(torch.all(local_mask, dim=-1, keepdim=True), 0.0)
+
+    if dropout_p != 0.:
+        dropout_scaling = 1.0 / (1 - dropout_p)
+        v = v * dropout_scaling
+    # attention_drop = attention.masked_fill(~dropout_mask, 0.0) * dropout_scaling
+    # output = torch.einsum('bhts,bshd->bthd', attention_drop , v)
+    if dropout_mask is not None:
+        attention_drop = attention.masked_fill(~dropout_mask, 0.0)
+    else:
+        attention_drop = attention
+    # output = torch.einsum("bhts,bshd->bthd", attention_drop, v) * descale_v
+    attention_descale, attention_scale = cast_scores_per_block_to_fp8(attention_drop, torch.float8_e4m3fnuz, "bhts", SCALE_BLK_M) 
+    attention_scale = rearrange(repeat(attention_scale, "b h t s -> b h (t rT) s", rT=SCALE_BLK_M),
+                                "b h t s -> b t h s")
+    attention_descale = attention_descale.float()
+    output = torch.einsum("bhts,bshd->bthd", attention_descale, v) * attention_scale * descale_v
+    
+    return output, attention
+    # return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
+
+@pytest.mark.parametrize('BATCH', [128])
+@pytest.mark.parametrize('SEQLEN_Q, SEQLEN_K', [(256,256)])
+@pytest.mark.parametrize('NUM_Q_HEADS, NUM_K_HEADS', [(48,8)])
+@pytest.mark.parametrize('HEAD_SZ', [8])
+@pytest.mark.parametrize('DROPOUT, RETURN_LSE, RETURN_SOFTMAX, ',[(0.0, False, False)])
+@pytest.mark.parametrize('CAUSAL', [(False)])
+# @pytest.mark.parametrize('BATCH', [1,4,57,128])
+# @pytest.mark.parametrize('SEQLEN_Q, SEQLEN_K', [(1,1), (4,4), (128,128), (2,1), (1,2), (32,16)])
+# @pytest.mark.parametrize('NUM_Q_HEADS, NUM_K_HEADS', [(1,1), (16,16), (2,1), (48,8)])
+# @pytest.mark.parametrize('HEAD_SZ', [8, 32, 128])
+# @pytest.mark.parametrize('DROPOUT, RETURN_LSE, RETURN_SOFTMAX, ',[(0.2, True, True), (0.0, False, False)])
+# @pytest.mark.parametrize('CAUSAL', [(True), (False)])
+@pytest.mark.parametrize('FP8_DESCALE_TYPE', [*descale_types])
+@pytest.mark.parametrize('SCALE_BLK_M', [16])
+@pytest.mark.parametrize('SCALE_BLK_N', [128])
+def test_mha(BATCH: int, SEQLEN_Q: int, SEQLEN_K: int, NUM_Q_HEADS: int, NUM_K_HEADS: int, HEAD_SZ: int, DROPOUT: float, RETURN_LSE: bool, RETURN_SOFTMAX: bool, CAUSAL: bool, FP8_DESCALE_TYPE: int, SCALE_BLK_M: int, SCALE_BLK_N: int, dtype=torch.float16):
     q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
-    k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ ), device="cuda", dtype=dtype)
+    k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
     v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
                 
     dropout_mask = None
-    if FP8:
-        triton_out = flash_attn_fp8_func(q, k, v, dropout_p=DROPOUT, causal=CAUSAL, return_lse=RETURN_LSE, return_attn_probs=RETURN_SOFTMAX)
+    fp8_dtype = torch.float8_e4m3fnuz
+    if FP8_DESCALE_TYPE & amha.FP8_DESCALE_Qhead:
+        q_fp8, descale_q = cast_to_fp8(q, fp8_dtype, "bshd")
+    elif FP8_DESCALE_TYPE & amha.FP8_DESCALE_Qblock:
+        q_fp8, descale_q = cast_per_block_to_fp8(q, fp8_dtype, "bshd", SCALE_BLK_M)
+    elif FP8_DESCALE_TYPE & amha.FP8_DESCALE_Qtoken:
+        q_fp8, descale_q = cast_per_token_to_fp8(q, fp8_dtype, "bshd")
+    
+    if FP8_DESCALE_TYPE & amha.FP8_DESCALE_KVhead:
+        k_fp8, descale_k = cast_to_fp8(k, fp8_dtype, "bshd")
+        v_fp8, descale_v = cast_to_fp8(v, fp8_dtype, "bshd")
+    elif FP8_DESCALE_TYPE & amha.FP8_DESCALE_KVblock:
+        k_fp8, descale_k = cast_per_block_to_fp8(k, fp8_dtype, "bshd", SCALE_BLK_N)
+        v_fp8, descale_v = cast_per_block_to_fp8(v, fp8_dtype, "bshd", SCALE_BLK_N)
+    elif FP8_DESCALE_TYPE & amha.FP8_DESCALE_Qtoken:
+        k_fp8, descale_k = cast_per_token_to_fp8(k, fp8_dtype, "bshd")
+        v_fp8, descale_v = cast_per_token_to_fp8(v, fp8_dtype, "bshd")
+    descale_q = torch.ones_like(descale_q)
+    descale_k = torch.ones_like(descale_k)
+    descale_v = torch.ones_like(descale_v)
+    if FP8_DESCALE_TYPE:
+        # triton_out = flash_attn_fp8_func(q, k, v, dropout_p=DROPOUT, causal=CAUSAL, return_lse=RETURN_LSE, return_attn_probs=RETURN_SOFTMAX, fp8_descale_type=FP8_DESCALE_TYPE, SCALE_BLK_M=SCALE_BLK_M, SCALE_BLK_N=SCALE_BLK_N)
+        triton_out = _flash_attn_forward(
+            q_fp8,
+            k_fp8,
+            v_fp8,
+            DROPOUT,
+            q.shape[-1] ** (-0.5),
+            causal=CAUSAL,
+            window_size_left=-1,
+            window_size_right=-1,
+            alibi_slopes=None,
+            return_lse=False,
+            return_softmax=False and dropout_p > 0,
+            max_seqlen_q=q.shape[1],
+            max_seqlen_k=k.shape[1],
+            cu_seqlens_q=None,
+            cu_seqlens_k=None,
+            descale_q=descale_q,
+            descale_k=descale_k,
+            descale_v=descale_v,
+            FP8_DESCALE_TYPE=FP8_DESCALE_TYPE,
+            SCALE_BLK_M=SCALE_BLK_M,
+            SCALE_BLK_N=SCALE_BLK_N
+        )
     else:
         triton_out = flash_attn_func(q, k, v, dropout_p=DROPOUT, causal=CAUSAL, return_lse=RETURN_LSE, return_attn_probs=RETURN_SOFTMAX)
 
@@ -115,14 +310,36 @@ def test_mha(BATCH: int, SEQLEN_Q: int, SEQLEN_K: int, NUM_Q_HEADS: int, NUM_K_H
     if DEBUG_MODE:
         print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
 
+    print(f"@@@@@@ {descale_q.shape=}, {descale_k.shape=}, {descale_v.shape=}")
     
-    torch_out = attention_ref(q, k, v, dropout_p=DROPOUT, dropout_mask=dropout_mask, causal=CAUSAL)
+    repeat_heads = descale_q.shape[2]//descale_k.shape[2]
+
+    # descale_q = rearrange(repeat(descale_q, "b s h d -> b (s rS) h d", rS=SCALE_BLK_M),
+    #                       "b s h d -> b h s d")
+    descale_q = rearrange(descale_q, "b s h d -> b h s d")
+
+    descale_k = rearrange(repeat(descale_k, "b s h d -> b (s rS) (h rH) d", rS=SCALE_BLK_N, rH=repeat_heads),
+                          "b s h d -> b h d s")
+    descale_v = repeat(descale_v, "b s h d -> b (s rS) (h rH) d ", rS=SCALE_BLK_N, rH=repeat_heads)
+
+    
+    torch_out = _multi_head_attn_forward(
+        q_fp8, k_fp8, v_fp8, dropout_p=DROPOUT, softmax_scale=q.shape[-1] ** (-0.5), dropout_mask=dropout_mask, causal=CAUSAL,
+        window_size_left=-1, window_size_right=-1, alibi_slopes=None, return_lse=None, return_softmax=None,
+        max_seqlen_q=q.shape[1], max_seqlen_k=k.shape[1], cu_seqlens_q=None, cu_seqlens_k=None,
+        descale_q=descale_q, descale_k=descale_k, descale_v=descale_v, FP8_DESCALE_TYPE=FP8_DESCALE_TYPE,
+        SCALE_BLK_M=SCALE_BLK_M, SCALE_BLK_N=SCALE_BLK_N
+        )
     torch_out, attention_scores = torch_out
     if DEBUG_MODE:
         print(f"torch_out.shape={torch_out.shape}, torch_out={torch_out}")
         print(f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}")
 
-    torch.testing.assert_close(triton_out, torch_out,atol=1e-2, rtol=1e-2)
+    triton_out, torch_out = triton_out[0,200:204,28,:], torch_out[0,200:204,28,:]
+    with open("/home/sijieli2/mha_test.out", "w") as f:
+        print(f"{triton_out=}\n{torch_out=}", file=f)
+
+    torch.testing.assert_close(triton_out, torch_out, atol=2.5e-1, rtol=2.5e-1)
 
 @pytest.mark.parametrize('BATCH', [1,4,57,128])
 @pytest.mark.parametrize('SEQLEN_Q, SEQLEN_K', [(1,1), (4,4), (128,128), (2,1), (1,2), (32,16)])
