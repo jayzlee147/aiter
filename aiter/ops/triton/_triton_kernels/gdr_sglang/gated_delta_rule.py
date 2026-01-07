@@ -283,6 +283,8 @@ def fused_sigmoid_gating_delta_rule_update(
     scale: Optional[float] = None,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: Optional[torch.Tensor] = None,
+    gluon: bool = False,
+    min_hdim: int = 8,
 ) -> torch.Tensor:
     """
     Fully fused sigmoid gating with delta rule for maximum efficiency.
@@ -369,6 +371,8 @@ def fused_sigmoid_gating_delta_rule_update(
         scale=scale,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         cu_seqlens=cu_seqlens,
+        gluon=gluon,
+        min_hdim=min_hdim,
     )
 
 

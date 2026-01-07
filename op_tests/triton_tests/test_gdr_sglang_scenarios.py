@@ -14,6 +14,7 @@ Based on SGLang's test_mamba.py and actual inference flow.
 Author: AIter Team
 """
 
+from re import T
 import pytest
 import torch
 import torch.nn.functional as F
@@ -676,44 +677,64 @@ class TestSGLangIntegration:
 class TestSGLangPerformance:
     """Performance tests with realistic SGLang workloads."""
     
-    @pytest.mark.parametrize("batch_size", [1, 8, 32, 64])
+    @pytest.mark.parametrize("batch_size", [32])
+    # @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64])
     def test_decode_throughput(self, batch_size, device, dtype):
         """Test decode throughput with various batch sizes."""
-        num_heads = 32
+        torch.cuda.manual_seed(0)
+        num_heads_qk = 4
+        num_heads_v = 8
         head_dim = 128
         seq_len = 1
         
-        q = torch.rand(batch_size, seq_len, num_heads, head_dim, dtype=dtype, device=device)
-        k = torch.rand(batch_size, seq_len, num_heads, head_dim, dtype=dtype, device=device)
-        v = torch.rand(batch_size, seq_len, num_heads, head_dim, dtype=dtype, device=device)
+        q = torch.randn(batch_size, seq_len, num_heads_qk, head_dim, dtype=dtype, device=device)
+        k = torch.randn(batch_size, seq_len, num_heads_qk, head_dim, dtype=dtype, device=device)
+        v = torch.randn(batch_size, seq_len, num_heads_v, head_dim, dtype=dtype, device=device)
         
-        A_log = torch.rand(num_heads, dtype=torch.float32, device=device)
-        a = torch.rand(batch_size, num_heads, dtype=dtype, device=device)
-        b = torch.rand(batch_size, num_heads, dtype=dtype, device=device)
-        dt_bias = torch.rand(num_heads, dtype=dtype, device=device)
+        A_log = torch.randn(num_heads_qk, dtype=torch.float32, device=device)
+        a = torch.randn(batch_size, num_heads_qk, dtype=dtype, device=device)
+        b = torch.randn(batch_size, num_heads_qk, dtype=dtype, device=device)
+        dt_bias = torch.randn(num_heads_qk, dtype=dtype, device=device)
         
-        state_pool = torch.rand(100, num_heads, head_dim, head_dim, dtype=torch.float32, device=device)
+        state_pool = torch.randn(100, num_heads_qk, head_dim, head_dim, dtype=torch.float32, device=device)
         cache_indices = torch.arange(batch_size, dtype=torch.int32, device=device)
-        query_start_loc = torch.cat([
-            torch.arange(0, batch_size, dtype=torch.int32, device=device),
-            torch.tensor([batch_size], dtype=torch.int32, device=device)
-        ])
-        
+        # query_start_loc = torch.cat([
+        #     torch.arange(0, batch_size, dtype=torch.int32, device=device),
+        #     torch.tensor([batch_size], dtype=torch.int32, device=device)
+        # ])
+        query_start_loc = torch.tensor([seq_len * i for i in range(batch_size+1)], dtype=torch.int32, device=device)
+
+        gluon_state_pool = state_pool.detach().clone()
+
         # Warmup
         for _ in range(3):
-            _ = fused_sigmoid_gating_delta_rule_update(
+            tri_o = fused_sigmoid_gating_delta_rule_update(
                 A_log, a, dt_bias, 1.0, 20.0,
                 q, k, v, b,
                 state_pool, cache_indices,
                 use_qk_l2norm_in_kernel=True,
                 cu_seqlens=query_start_loc,
+                gluon=False,
+                min_hdim=64,
+            )
+            gluon_o = fused_sigmoid_gating_delta_rule_update(
+                A_log, a, dt_bias, 1.0, 20.0,
+                q, k, v, b,
+                gluon_state_pool, cache_indices,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=query_start_loc,
+                gluon=True,
+                min_hdim=128,
             )
         torch.cuda.synchronize()
-        
+        torch.testing.assert_close(tri_o, gluon_o, equal_nan=True)
+        torch.testing.assert_close(state_pool, gluon_state_pool, equal_nan=True)
+        print("✓ Triton vs Gluon compare passed")
+
         # Benchmark
         import time
         start = time.time()
-        num_iters = 100
+        num_iters = 1000
         for _ in range(num_iters):
             _ = fused_sigmoid_gating_delta_rule_update(
                 A_log, a, dt_bias, 1.0, 20.0,
@@ -721,12 +742,31 @@ class TestSGLangPerformance:
                 state_pool, cache_indices,
                 use_qk_l2norm_in_kernel=True,
                 cu_seqlens=query_start_loc,
+                gluon=False,
+                min_hdim=64,
             )
         torch.cuda.synchronize()
-        elapsed = time.time() - start
+        triton_elapsed = time.time() - start
+
+        start = time.time()
+        num_iters = 1000
+        for _ in range(num_iters):
+            _ = fused_sigmoid_gating_delta_rule_update(
+                A_log, a, dt_bias, 1.0, 20.0,
+                q, k, v, b,
+                state_pool, cache_indices,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=query_start_loc,
+                gluon=True,
+                min_hdim=128,
+            )
+        torch.cuda.synchronize()
+        gluon_elapsed = time.time() - start
         
-        throughput = (num_iters * batch_size) / elapsed
-        print(f"✓ Decode throughput test: B={batch_size}, throughput={throughput:.2f} tokens/s")
+        triton_throughput = (num_iters * batch_size) / triton_elapsed
+        gluon_throughput = (num_iters * batch_size) / gluon_elapsed
+        print(f"✓ Decode elapsed test: B={batch_size}, {triton_elapsed=:.11f}s, {gluon_elapsed=:.11f}s, {triton_elapsed/gluon_elapsed*100:.2f}%")
+        print(f"✓ Decode throughput test: B={batch_size}, triton_throughput={triton_throughput:.2f} tokens/s, gluon_throughput={gluon_throughput:.2f} tokens/s")
 
 
 if __name__ == "__main__":
