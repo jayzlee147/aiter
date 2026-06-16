@@ -15,4 +15,7 @@ void opus_gdn_prefill_fwd(
     torch::Tensor final_state,
     bool has_initial_state,
     bool output_final_state,
-    int BT);
+    int BT,
+    int BV,
+    int num_warps,
+    int k1_algo);

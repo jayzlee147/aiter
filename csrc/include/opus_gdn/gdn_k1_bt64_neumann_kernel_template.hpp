@@ -1,7 +1,5 @@
-// GDN Prefill K1 Kernel — BT=64, MFMA bf16 16×16×16 optimized
-// Step 1: g_cumsum + KKT Gram matrix (MFMA)
-// Step 2: Triangular inverse (I+A)^{-1} via 4×16x16 forward sub + Schur merge (scalar)
-//         + WY factor assembly w_bar, u_bar (MFMA)
+// GDN Prefill K1 Kernel — BT=64, MFMA Neumann variant
+// Phase 2a uses MFMA Neumann series instead of scalar forward substitution.
 //
 // Grid: (NT, B*H)   Block: (BLOCK_SIZE = 256)
 // Target: gfx942 (MI300X), MFMA bf16 16×16×16
@@ -9,7 +7,7 @@
 
 #include "opus_gdn/gdn_defs.h"
 
-namespace gdn_k1_mfma {
+namespace gdn_k1_mfma_neu {
 
 using v4bf16_t = __bf16 __attribute__((ext_vector_type(4)));
 using v4f32_t  = float  __attribute__((ext_vector_type(4)));
@@ -50,8 +48,6 @@ __device__ inline void clear_v4f32(v4f32_t* c) {
     for (int i = 0; i < N; i++) c[i] = v4f32_t{0.f, 0.f, 0.f, 0.f};
 }
 
-// Load 16×16 fp32 subblock as MFMA bf16 source tile (standard A layout)
-// A[m, k_block*4+p] = s[(row_base+m)*stride + col_base + k_block*4 + p]
 __device__ inline v4bf16_t load_fp32_tile(
         const float* __restrict__ s, int row_base, int col_base,
         int stride, int lane_id) {
@@ -63,8 +59,6 @@ __device__ inline v4bf16_t load_fp32_tile(
         static_cast<__bf16>(s[base + 3])};
 }
 
-// Transposed load: B[n,k] = s[(row_base+k)*stride + col_base+n]
-// MFMA with this as source B gives D = A × target (no transpose)
 __device__ inline v4bf16_t load_fp32_tile_T(
         const float* __restrict__ s, int row_base, int col_base,
         int stride, int lane_id) {
@@ -78,15 +72,12 @@ __device__ inline v4bf16_t load_fp32_tile_T(
         static_cast<__bf16>(s[(row_base + kb4 + 3) * stride + col])};
 }
 
-// Convert MFMA fp32 accumulator to bf16 source for register chaining.
-// D layout matches B layout, so using result as source B gives A_next × D.
 __device__ inline v4bf16_t accum_to_src(v4f32_t d) {
     return v4bf16_t{
         static_cast<__bf16>(d[0]), static_cast<__bf16>(d[1]),
         static_cast<__bf16>(d[2]), static_cast<__bf16>(d[3])};
 }
 
-// Store MFMA fp32 result tile to fp32 LDS
 __device__ inline void store_fp32_tile(
         float* __restrict__ s, int row_base, int col_base,
         int stride, v4f32_t d, int lane_id) {
@@ -98,12 +89,12 @@ __device__ inline void store_fp32_tile(
     s[(row_base + mb4 + 3) * stride + col_base + n] = d[3];
 }
 
-} // namespace gdn_k1_mfma
+} // namespace gdn_k1_mfma_neu
 
 template<typename Traits>
 __global__ void __launch_bounds__(Traits::BLOCK_SIZE, 2)
-gdn_k1_kernel(gdn_k1_kargs kargs) {
-    using namespace gdn_k1_mfma;
+gdn_k1_neumann_kernel(gdn_k1_kargs kargs) {
+    using namespace gdn_k1_mfma_neu;
     using T = Traits;
     using D_ATTN = typename T::D_ATTN;
     using D_ACC  = typename T::D_ACC;
@@ -133,15 +124,19 @@ gdn_k1_kernel(gdn_k1_kargs kargs) {
 
     // =====================================================================
     // Shared memory allocation
+    //
+    // Phase 1:  s_g[BT] + s_beta[BT] + s_k[BT×K_STRIDE]     = 17408 bytes
+    // Phase 2a: s_g + s_beta + s_A[BT×BT] (aliases s_k)      = 16896 bytes
+    // Phase 2c: s_g + s_beta + s_vT[BK_SUB×VT_STRIDE]        =  9216 bytes
+    //           (C_inv cached in registers, no s_C_bf16)
+    // Peak: 17408 bytes → fits 3 blocks/CU (17408×3 = 52224 < 65536)
     // =====================================================================
     extern __shared__ char smem_buf[];
 
-    // Phase 1 layout: g[BT] + beta[BT] + k[BT×K_STRIDE] (padded for MFMA)
     D_ACC*  s_g    = reinterpret_cast<D_ACC*>(smem_buf);
     D_ACC*  s_beta = s_g + BT;
     D_ATTN* s_k    = reinterpret_cast<D_ATTN*>(s_beta + BT);
 
-    // Phase 2 layout (s_A aliases s_k region):
     D_ACC*  s_A    = reinterpret_cast<D_ACC*>(s_k);
 
     // =====================================================================
@@ -207,10 +202,6 @@ gdn_k1_kernel(gdn_k1_kargs kargs) {
 
     // =====================================================================
     // Phase 1c+1d: KKT GEMM via MFMA — k × k^T self-matmul
-    //
-    // C[BT, BT] = k[BT, K] × k^T[K, BT]
-    // Both A and B read from s_k (same buffer, different row ranges per warp).
-    // s_A aliases s_k — must finish ALL MFMA reads before writing to s_A.
     // =====================================================================
 
     constexpr int KKT_E_M = 1;
@@ -224,7 +215,6 @@ gdn_k1_kernel(gdn_k1_kargs kargs) {
         kkt_c, s_k, warp_id * 16, K_STRIDE,
                s_k, 0,            K_STRIDE, lane_id);
 
-    // All warps must finish reading s_k before we write to s_A (aliases s_k)
     __syncthreads();
 
     // Post-MFMA: gate-scale lower triangle, zero upper+diagonal, write fp32 to s_A
@@ -241,49 +231,56 @@ gdn_k1_kernel(gdn_k1_kargs kargs) {
     __syncthreads();
 
     // =====================================================================
-    // Phase 2a: Triangular inverse — 4 × 16×16 forward substitution
+    // Phase 2a: Triangular inverse — MFMA Neumann series
+    //
+    // (I+A)^{-1} = sum_{n=0}^{15} (-A)^n (exact: A is 16×16 strictly lower
+    // triangular, hence nilpotent with (-A)^16 = 0).
     //
     // Each warp handles one 16×16 diagonal block independently.
-    // No cross-warp reads during the inner loop → no __syncthreads needed.
+    // 15 MFMA iterations per block via register chaining (accum_to_src).
     // =====================================================================
 
-    int blk = warp_id;
-    int blk_row_start = blk * 16;
+    constexpr v4f32_t z4 = {0.f, 0.f, 0.f, 0.f};
 
-    for (int i = 1; i < 16; i++) {
-        for (int c = lane_id; c < 16; c += T::WARP_SIZE) {
-            if (c >= i) continue;
+    {
+        int br = warp_id * 16;
 
-            int global_row = blk_row_start + i;
-            int global_col = blk_row_start + c;
-            if (global_row >= BT) continue;
-
-            D_ACC neg_a = -s_A[global_row * BT + global_col];
-
-            D_ACC acc = neg_a;
-            for (int j = c + 1; j < i; j++) {
-                int j_global = blk_row_start + j;
-                acc += (-s_A[global_row * BT + j_global]) *
-                       s_A[j_global * BT + global_col];
-            }
-            s_A[global_row * BT + global_col] = acc;
+        // Load (-A) as MFMA A operand
+        v4bf16_t neg_A_tile;
+        {
+            int base = (br + (lane_id & 15)) * BT + br + ((lane_id >> 4) << 2);
+            neg_A_tile = v4bf16_t{
+                static_cast<__bf16>(-s_A[base]),
+                static_cast<__bf16>(-s_A[base + 1]),
+                static_cast<__bf16>(-s_A[base + 2]),
+                static_cast<__bf16>(-s_A[base + 3])};
         }
-    }
 
-    // Add identity
-    for (int i = lane_id; i < 16; i += T::WARP_SIZE) {
-        int r = blk_row_start + i;
-        if (r < BT)
-            s_A[r * BT + r] += 1.0f;
-    }
-    // Zero upper triangle within block
-    for (int idx = lane_id; idx < 16 * 16; idx += T::WARP_SIZE) {
-        int r = idx / 16;
-        int c = idx % 16;
-        int gr = blk_row_start + r;
-        int gc_col = blk_row_start + c;
-        if (gr < BT && gc_col < BT && r < c)
-            s_A[gr * BT + gc_col] = 0.0f;
+        // Horner's method: (I+A)^{-1} = I + (-A)(I + (-A)(I + ...))
+        v4f32_t I_accum;
+        {
+            int n = lane_id & 15;
+            int m_base = (lane_id >> 4) * 4;
+            I_accum = v4f32_t{
+                (m_base == n) ? 1.0f : 0.0f,
+                ((m_base + 1) == n) ? 1.0f : 0.0f,
+                ((m_base + 2) == n) ? 1.0f : 0.0f,
+                ((m_base + 3) == n) ? 1.0f : 0.0f};
+        }
+
+        v4f32_t C_accum = I_accum;
+        for (int iter = 0; iter < 15; iter++) {
+            C_accum = mfma_f32_16x16x16_bf16(
+                neg_A_tile, accum_to_src(C_accum), I_accum);
+        }
+
+        // Store result and zero upper triangle
+        store_fp32_tile(s_A, br, br, BT, C_accum, lane_id);
+        for (int idx = lane_id; idx < 16 * 16; idx += T::WARP_SIZE) {
+            int r = idx / 16, c = idx % 16;
+            if (r < c)
+                s_A[(br + r) * BT + br + c] = 0.0f;
+        }
     }
     __syncthreads();
 
@@ -294,14 +291,9 @@ gdn_k1_kernel(gdn_k1_kargs kargs) {
     //   Level 1: C_21, C_32, C_43  (3 warps, independent)
     //   Level 2: C_31, C_42        (2 warps, independent)
     //   Level 3: C_41              (1 warp)
-    //
-    // Register chaining: MFMA result → bf16 → next MFMA source B,
-    // giving A_next × D_prev without LDS round-trip.
     // =====================================================================
 
-    constexpr v4f32_t z4 = {0.f, 0.f, 0.f, 0.f};
-
-    // Pre-save L blocks overwritten in Level 1 (L_32 by C_32, L_43 by C_43)
+    // Pre-save L blocks overwritten in Level 1
     v4bf16_t sav_L32, sav_L43, sav_L42;
     if (warp_id == 0) {
         sav_L32 = load_fp32_tile(s_A, 32, 16, BT, lane_id);
@@ -343,7 +335,7 @@ gdn_k1_kernel(gdn_k1_kargs kargs) {
     }
     __syncthreads();
 
-    // Save L_42 (still valid, overwritten by C_42 in Level 2)
+    // Save L_42 (overwritten by C_42 in Level 2)
     if (warp_id == 0)
         sav_L42 = load_fp32_tile(s_A, 48, 16, BT, lane_id);
 
@@ -430,7 +422,6 @@ gdn_k1_kernel(gdn_k1_kargs kargs) {
     for (int iv = 0; iv < T::N_V_ITERS; iv++) {
         int v_offset = iv * BK_SUB;
 
-        // v_scaled_T[vi, j] = bf16(v[j, vi] * beta[j]), vec4 HBM load
         {
             constexpr int VEC = 4;
             constexpr int NVEC = BK_SUB / VEC;
@@ -471,7 +462,6 @@ gdn_k1_kernel(gdn_k1_kargs kargs) {
     for (int ik = 0; ik < T::N_K_ITERS; ik++) {
         int k_offset = ik * BK_SUB;
 
-        // k_scaled_T[ki, j] = bf16(k[j, ki] * beta[j] * exp(gc[j])), vec4 HBM load
         {
             constexpr int VEC = 4;
             constexpr int NVEC = BK_SUB / VEC;

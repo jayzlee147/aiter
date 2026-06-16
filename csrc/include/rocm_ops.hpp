@@ -1981,7 +1981,7 @@ namespace py = pybind11;
           py::arg("final_output"));
 
 #define OPUS_GDN_PREFILL_PYBIND                    \
-    m.def("opus_gdn_prefill_fwd",                  \
+    m.def("_opus_gdn_prefill_fwd",                 \
           &opus_gdn_prefill_fwd,                   \
           py::arg("q"),                            \
           py::arg("k"),                            \
@@ -1994,4 +1994,7 @@ namespace py = pybind11;
           py::arg("final_state"),                  \
           py::arg("has_initial_state"),             \
           py::arg("output_final_state"),            \
-          py::arg("BT"));
+          py::arg("BT"),                            \
+          py::arg("BV"),                            \
+          py::arg("num_warps"),                     \
+          py::arg("k1_algo") = 0);

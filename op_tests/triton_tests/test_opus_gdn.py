@@ -140,16 +140,21 @@ def test_opus_with_initial_state(B: int, T: int, H: int, BT: int):
     beta = torch.randn(B, T, H, dtype=torch.float32, device=device).sigmoid()
     h0 = torch.randn(B, H, D, D, dtype=torch.float32, device=device) * 0.1
 
+    # opus expects [B,H,V,K], ref expects [B,H,K,V]
+    h0_vk = h0.clone()
+    h0_kv = h0.transpose(-1, -2).contiguous()
+
     opus_o, opus_ht = opus_gdn_prefill_fwd(
         q, k, v, g, beta.to(torch.bfloat16),
-        initial_state=h0.clone(), output_final_state=True, BT=BT,
+        initial_state=h0_vk, output_final_state=True, BT=BT,
     )
 
     ref_o, ref_ht = recurrent_gated_delta_rule_ref(
         q=q.clone(), k=k.clone(), v=v.clone(),
         beta=beta.to(torch.bfloat16).clone(), g=g.clone(),
-        initial_state=h0.clone(), output_final_state=True,
+        initial_state=h0_kv, output_final_state=True,
     )
 
     assert_close("init_o", ref_o, opus_o, 0.01)
-    assert_close("init_ht", ref_ht, opus_ht, 0.01)
+    # opus_ht is [B,H,V,K], ref_ht is [B,H,K,V]
+    assert_close("init_ht", ref_ht, opus_ht.transpose(-1, -2).contiguous(), 0.01)

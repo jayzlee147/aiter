@@ -1,24 +1,65 @@
-// GDN Prefill K1 Kernel — BT=16, Neumann Series
-// Step 1: g_cumsum + KKT Gram matrix
-// Step 2: Triangular inverse (I+A)^{-1} via Neumann series C = Σ (-A)^n
-//         + WY factor assembly (w_bar, u_bar)
+// GDN Prefill K1 Kernel — BT=16, Neumann Series + MFMA WY
+// Step 1: g_cumsum + KKT Gram matrix (scalar)
+// Step 2: Triangular inverse (I+A)^{-1} via Neumann series (scalar)
+//         + WY factor assembly w_bar, u_bar (MFMA)
 //
 // Grid: (NT, B*H)   Block: (BLOCK_SIZE = 256)
 // Target: gfx942 (MI300X), MFMA bf16 16×16×16
 //
 // A is 16×16 strictly lower triangular → nilpotent of order 16.
 // Neumann series: (I+A)^{-1} = I - A + A² - A³ + … + (-A)^{15}
-// Each (-A)^n = (-A)^{n-1} × (-A), computable via MFMA 16×16×16.
-// In practice A^n = 0 for n ≥ 16, but we truncate at the first zero power.
+// WY GEMMs tiled with warps along N (T_M=1, T_N=4).
 #pragma once
 
-#include <opus/opus.hpp>
 #include "opus_gdn/gdn_defs.h"
+
+namespace gdn_k1_mfma {
+
+using v4bf16_t = __bf16 __attribute__((ext_vector_type(4)));
+using v4f32_t  = float  __attribute__((ext_vector_type(4)));
+
+__device__ inline v4f32_t mfma_f32_16x16x16_bf16(v4bf16_t a, v4bf16_t b, v4f32_t c) {
+    return __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, c, 0, 0, 0);
+}
+
+__device__ inline v4bf16_t load_mfma_tile(
+        const __bf16* __restrict__ lds, int row_base, int col_base,
+        int stride, int lane_id) {
+    int addr = (row_base + (lane_id & 15)) * stride + col_base + ((lane_id >> 4) << 2);
+    return *reinterpret_cast<const v4bf16_t*>(&lds[addr]);
+}
+
+template<int E_M, int E_N, int E_K>
+__device__ void tiled_gemm_mfma(
+        v4f32_t* __restrict__ c,
+        const __bf16* __restrict__ lds_a, int m_base, int stride_a,
+        const __bf16* __restrict__ lds_b, int n_base, int stride_b,
+        int lane_id) {
+    for (int ek = 0; ek < E_K; ek++) {
+        v4bf16_t a_tiles[E_M];
+        for (int em = 0; em < E_M; em++)
+            a_tiles[em] = load_mfma_tile(lds_a, m_base + em * 16, ek * 16, stride_a, lane_id);
+        v4bf16_t b_tiles[E_N];
+        for (int en = 0; en < E_N; en++)
+            b_tiles[en] = load_mfma_tile(lds_b, n_base + en * 16, ek * 16, stride_b, lane_id);
+        for (int em = 0; em < E_M; em++)
+            for (int en = 0; en < E_N; en++)
+                c[em * E_N + en] = mfma_f32_16x16x16_bf16(
+                    a_tiles[em], b_tiles[en], c[em * E_N + en]);
+    }
+}
+
+template<int N>
+__device__ inline void clear_v4f32(v4f32_t* c) {
+    for (int i = 0; i < N; i++) c[i] = v4f32_t{0.f, 0.f, 0.f, 0.f};
+}
+
+} // namespace gdn_k1_mfma
 
 template<typename Traits>
 __global__ void __launch_bounds__(Traits::BLOCK_SIZE, 2)
 gdn_k1_kernel(gdn_k1_kargs kargs) {
-    using namespace opus;
+    using namespace gdn_k1_mfma;
     using T = Traits;
     using D_ATTN = typename T::D_ATTN;
     using D_ACC  = typename T::D_ACC;
@@ -34,7 +75,10 @@ gdn_k1_kernel(gdn_k1_kargs kargs) {
     const int warp_id = tid / T::WARP_SIZE;
     const int lane_id = tid % T::WARP_SIZE;
 
-    const int BT = T::BT;  // 16
+    constexpr int BT = T::BT;  // 16
+    constexpr int BS = T::BLOCK_SIZE;
+    constexpr int PAD = T::SMEM_PAD;
+    constexpr int BK_SUB = T::BK_SUB;
     const int K  = kargs.K;
     const int V  = kargs.V;
     const int H  = kargs.H;
@@ -66,7 +110,7 @@ gdn_k1_kernel(gdn_k1_kargs kargs) {
     const D_ACC* beta_base = reinterpret_cast<const D_ACC*>(kargs.ptr_beta)
                              + (bos + chunk_start) * H + i_h;
 
-    for (int i = tid; i < BT; i += T::BLOCK_SIZE) {
+    for (int i = tid; i < BT; i += BS) {
         int global_t = chunk_start + i;
         if (global_t < kargs.T) {
             s_g[i]    = g_base[i * H];
@@ -80,7 +124,7 @@ gdn_k1_kernel(gdn_k1_kargs kargs) {
 
     // Hillis-Steele prefix sum (4 steps for BT=16)
     for (int stride = 1; stride < BT; stride <<= 1) {
-        for (int i = tid; i < BT; i += T::BLOCK_SIZE) {
+        for (int i = tid; i < BT; i += BS) {
             if (i >= stride)
                 s_g[i] += s_g[i - stride];
         }
@@ -90,7 +134,7 @@ gdn_k1_kernel(gdn_k1_kargs kargs) {
     // Write g_cumsum to HBM
     D_ACC* g_cumsum_base = reinterpret_cast<D_ACC*>(kargs.ptr_g_cumsum)
                            + (bos + chunk_start) * H + i_h;
-    for (int i = tid; i < BT; i += T::BLOCK_SIZE) {
+    for (int i = tid; i < BT; i += BS) {
         if (chunk_start + i < kargs.T)
             g_cumsum_base[i * H] = s_g[i];
     }
@@ -102,8 +146,7 @@ gdn_k1_kernel(gdn_k1_kargs kargs) {
     const D_ATTN* k_base = reinterpret_cast<const D_ATTN*>(kargs.ptr_k)
                            + ((bos + chunk_start) * H + i_h) * K;
 
-    // BT*K = 16*128 = 2048 elements, one pass with 256 threads
-    for (int i = tid; i < BT * K; i += T::BLOCK_SIZE) {
+    for (int i = tid; i < BT * K; i += BS) {
         int row = i / K;
         int col = i % K;
         if (chunk_start + row < kargs.T)
@@ -114,90 +157,46 @@ gdn_k1_kernel(gdn_k1_kargs kargs) {
     __syncthreads();
 
     // =====================================================================
-    // Phase 1c: KKT GEMM — A[BT, BT] = k[BT, K] × k^T[K, BT]
+    // Phase 1c+1d: Scalar KKT + gate scaling
+    // A[s,r] = beta[s] * exp(gc[s]-gc[r]) * (k_s . k_r) for s>r, else 0
     //
-    // For BT=16, this is a single 16×16 output tile.
-    // K=128 → inner dimension = K/16 = 8 MFMA steps.
+    // BT=16: only one 16×16 output tile. Scalar uses all 256 threads
+    // (BT*BT=256=BS), each computing one element with K=128 MACs.
     // =====================================================================
-    auto mma_kkt = make_tiled_mma<bf16_t, bf16_t, fp32_t>(
-        seq<T::KKT_E_M, T::KKT_E_N, T::KKT_E_K>{},
-        seq<T::T_M, T::T_N, T::T_K>{},
-        seq<T::W_M, T::W_N, T::W_K>{},
-        mfma_adaptor_swap_ab{});
-
-    auto p_coord = make_tuple(number<lane_id>{}, number<warp_id>{});
-    auto u_ka = mma_kkt.layout_a(make_tuple(number<K>{}, number<1>{}), p_coord);
-    auto u_kb = mma_kkt.layout_b(make_tuple(number<K>{}, number<1>{}), p_coord);
-
-    auto s_k_handle = make_smem(reinterpret_cast<D_ATTN*>(s_k));
-    auto v_ka = s_k_handle.load<T::VEC_KV>(u_ka);
-    auto v_kb = s_k_handle.load<T::VEC_KV>(u_kb);
-
-    auto v_kkt = mma_kkt.template init_c<D_ACC>();
-    v_kkt = mma_kkt(v_ka, v_kb, v_kkt);
-
-    __syncthreads();
-
-    // =====================================================================
-    // Phase 1d: Gate scaling + lower-triangular mask → A (strict lower tri)
-    // Store scaled A into s_C[BT×BT] fp32 (reusing s_k region)
-    // =====================================================================
-    auto u_c = mma_kkt.layout_c(make_tuple(number<BT>{}, number<1>{}), p_coord);
-    auto y_shape_c = mma_kkt.y_shape_c();
-    constexpr int c_elems = decltype(y_shape_c)::size();
-
-    static_for<c_elems>([&](auto i) {
-        int offset = u_c(number<i>{});
-        int row = offset / BT;
-        int col = offset % BT;
-        D_ACC val = v_kkt[i];
-        if (row > col && row < BT && col < BT) {
+    {
+        int row = tid / BT;
+        int col = tid % BT;
+        D_ACC val = 0.0f;
+        if (row > col) {
+            D_ACC dot = 0.0f;
+            for (int ki = 0; ki < K; ki++)
+                dot += (D_ACC)s_k[row * K + ki] * (D_ACC)s_k[col * K + ki];
             D_ACC g_diff = s_g[row] - s_g[col];
-            val = s_beta[row] * __expf(g_diff) * val;
-        } else {
-            val = 0.0f;
+            val = s_beta[row] * __expf(g_diff) * dot;
         }
-        s_C[row * BT + col] = val;
-    });
+        __syncthreads();
+        s_C[tid] = val;
+    }
     __syncthreads();
 
     // =====================================================================
     // Phase 2a: Neumann series — C = (I + A)^{-1} = Σ_{n=0}^{15} (-A)^n
     //
     // A is 16×16 strictly lower triangular → nilpotent, series is exact.
-    // Algorithm:
-    //   neg_A_pow_0 = I       (n=0 term)
-    //   C = I                 (accumulator, starts with n=0)
-    //   for n = 1 .. 15:
-    //     neg_A_pow_n = neg_A_pow_{n-1} @ (-A)    (16×16 matmul)
-    //     C += neg_A_pow_n
-    //     if neg_A_pow_n == 0: break   (early exit)
-    //
-    // For 16×16 strict lower tri, powers go zero by n=16 at latest.
-    // Effective terms: typically 5-8 are nonzero.
+    // Kept scalar for fp32 precision in the inverse.
     // =====================================================================
 
     // Negate A in place: s_C now holds -A (strict lower tri part) + zeros elsewhere
-    for (int i = tid; i < BT * BT; i += T::BLOCK_SIZE) {
+    for (int i = tid; i < BT * BT; i += BS) {
         int r = i / BT;
         int c = i % BT;
         if (r > c)
             s_C[i] = -s_C[i];
-        // diagonal and upper are already 0
     }
     __syncthreads();
 
-    // s_C = -A.  We need: C_result = I + (-A) + (-A)^2 + (-A)^3 + ...
-    // Initialize neg_A_pow = I, C_result in separate buffer
-
-    // We'll use s_C for -A (read-only), s_neg_A_pow for current power,
-    // and accumulate C_result into s_C itself after we're done reading -A.
-    // Problem: we need -A throughout for matmuls but also accumulate into C.
-    //
-    // Solution: keep -A in s_C, use s_neg_A_pow for the running power,
-    // accumulate C in registers (each thread owns BT*BT/BS = 1 element).
-
-    // BT*BT = 256 = BS, so each thread owns exactly one element of C
+    // s_C = -A. Accumulate C_result = I + (-A) + (-A)^2 + ... in registers.
+    // BT*BT = 256 = BS, so each thread owns exactly one element of C.
     int my_r = tid / BT;
     int my_c = tid % BT;
 
@@ -207,14 +206,10 @@ gdn_k1_kernel(gdn_k1_kargs kargs) {
     s_neg_A_pow[tid] = (my_r == my_c) ? 1.0f : 0.0f;
     __syncthreads();
 
-    // Iterate: neg_A_pow_n = neg_A_pow_{n-1} @ (-A), C += neg_A_pow_n
     for (int n = 1; n < BT; n++) {
-        // new_pow[r, c] = Σ_j old_pow[r, j] * (-A)[j, c]
-        // Since (-A) is strict lower tri, (-A)[j, c] != 0 only for j > c
         D_ACC new_val = 0.0f;
-        for (int j = 0; j < BT; j++) {
+        for (int j = 0; j < BT; j++)
             new_val += s_neg_A_pow[my_r * BT + j] * s_C[j * BT + my_c];
-        }
         __syncthreads();
         s_neg_A_pow[tid] = new_val;
         __syncthreads();
@@ -227,85 +222,116 @@ gdn_k1_kernel(gdn_k1_kargs kargs) {
     __syncthreads();
 
     // =====================================================================
-    // Phase 2c: WY factors
+    // Phase 2c: WY factor GEMMs via MFMA
     //   u_bar = C @ (v * beta)
     //   w_bar = C @ (k * beta * exp(g_cumsum))
     //
-    // C is 16×16 in s_C. Process K/V in 64-wide subtiles.
+    // Tiling: T_M=1, T_N=4 — warps along N (each warp handles 16×16 tile).
+    // C[16,16] fp32 → C_bf16[16, 16+PAD] for MFMA A operand.
+    // v/k pre-scaled + transposed → s_vT[64, 16+PAD] for MFMA B operand.
     // =====================================================================
+
+    constexpr int C_STRIDE = BT + PAD;   // 20
+    constexpr int VT_STRIDE = BT + PAD;  // 20
+
+    // Convert C to bf16 — placed after s_vT region to avoid overlap during conversion
+    D_ATTN* s_C_bf16 = reinterpret_cast<D_ATTN*>(
+        reinterpret_cast<char*>(s_k) + BK_SUB * C_STRIDE * (int)sizeof(D_ATTN));
+
+    for (int i = tid; i < BT * BT; i += BS) {
+        int s = i / BT;
+        int j = i % BT;
+        s_C_bf16[s * C_STRIDE + j] = static_cast<D_ATTN>(s_C[i]);
+    }
+    for (int i = tid; i < BT * PAD; i += BS) {
+        int s = i / PAD;
+        int p = i % PAD;
+        s_C_bf16[s * C_STRIDE + BT + p] = static_cast<D_ATTN>(0);
+    }
+    __syncthreads();
+
+    // s_C/s_neg_A_pow region freed — reuse as s_vT for transposed operand
+    D_ATTN* s_vT = s_k;
+
     D_ATTN* w_bar_base = reinterpret_cast<D_ATTN*>(kargs.ptr_w_bar)
                          + ((bos + chunk_start) * H + i_h) * K;
     D_ATTN* u_bar_base = reinterpret_cast<D_ATTN*>(kargs.ptr_u_bar)
                          + ((bos + chunk_start) * H + i_h) * V;
-
-    // Temp buffer for scaled k/v subtiles: BT*BK_SUB bf16 = 16*64*2 = 2KB
-    // Place after s_neg_A_pow (which is 1KB beyond s_C)
-    D_ATTN* s_kv_sub = reinterpret_cast<D_ATTN*>(s_neg_A_pow + BT * BT);
 
     // --- u_bar = C @ (v * beta) ---
     const D_ATTN* v_base = reinterpret_cast<const D_ATTN*>(kargs.ptr_v)
                            + ((bos + chunk_start) * H + i_h) * V;
 
     for (int iv = 0; iv < T::N_V_ITERS; iv++) {
-        int v_offset = iv * T::BV_SUB;
+        int v_offset = iv * BK_SUB;
 
-        // Load v subtile [BT, BV_SUB=64] scaled by beta
-        for (int i = tid; i < BT * T::BV_SUB; i += T::BLOCK_SIZE) {
-            int row = i / T::BV_SUB;
-            int col = i % T::BV_SUB;
-            if (chunk_start + row < kargs.T) {
-                D_ACC val = static_cast<D_ACC>(v_base[row * H * V + v_offset + col]);
-                s_kv_sub[i] = static_cast<D_ATTN>(val * s_beta[row]);
-            } else {
-                s_kv_sub[i] = static_cast<D_ATTN>(0);
-            }
+        // v_scaled_T[vi, j] = bf16(v[j, vi] * beta[j])
+        for (int i = tid; i < BT * BK_SUB; i += BS) {
+            int j  = i / BK_SUB;
+            int vi = i % BK_SUB;
+            D_ATTN v_val = (chunk_start + j < kargs.T)
+                ? v_base[j * H * V + v_offset + vi]
+                : static_cast<D_ATTN>(0);
+            float scaled = static_cast<D_ACC>(v_val) * s_beta[j];
+            s_vT[vi * VT_STRIDE + j] = static_cast<D_ATTN>(scaled);
+        }
+        for (int i = tid; i < BK_SUB * PAD; i += BS) {
+            int vi = i / PAD;
+            int p  = i % PAD;
+            s_vT[vi * VT_STRIDE + BT + p] = static_cast<D_ATTN>(0);
         }
         __syncthreads();
 
-        // u_bar[BT, 64] = C[BT, BT] @ v_scaled[BT, 64]
-        for (int idx = tid; idx < BT * T::BV_SUB; idx += T::BLOCK_SIZE) {
-            int row = idx / T::BV_SUB;
-            int col = idx % T::BV_SUB;
-            D_ACC acc = 0.0f;
-            for (int j = 0; j < BT; j++)
-                acc += s_C[row * BT + j]
-                     * static_cast<D_ACC>(s_kv_sub[j * T::BV_SUB + col]);
-            if (chunk_start + row < kargs.T)
-                u_bar_base[row * H * V + v_offset + col]
-                    = static_cast<D_ATTN>(acc);
+        // MFMA: each warp computes 16×16 tile at different N offset
+        v4f32_t wy_c[1];
+        clear_v4f32<1>(wy_c);
+        tiled_gemm_mfma<1, 1, 1>(
+            wy_c, s_C_bf16, 0, C_STRIDE,
+                  s_vT, warp_id * 16, VT_STRIDE, lane_id);
+
+        for (int p = 0; p < 4; p++) {
+            int s  = (lane_id >> 4) * 4 + p;
+            int vi = warp_id * 16 + (lane_id & 15);
+            if (chunk_start + s < kargs.T)
+                u_bar_base[s * H * V + v_offset + vi] =
+                    static_cast<D_ATTN>(wy_c[0][p]);
         }
         __syncthreads();
     }
 
     // --- w_bar = C @ (k * beta * exp(g_cumsum)) ---
     for (int ik = 0; ik < T::N_K_ITERS; ik++) {
-        int k_offset = ik * T::BK_SUB;
+        int k_offset = ik * BK_SUB;
 
-        // Load k subtile [BT, BK_SUB=64] scaled by beta * exp(g_cumsum)
-        for (int i = tid; i < BT * T::BK_SUB; i += T::BLOCK_SIZE) {
-            int row = i / T::BK_SUB;
-            int col = i % T::BK_SUB;
-            if (chunk_start + row < kargs.T) {
-                D_ACC val = static_cast<D_ACC>(k_base[row * H * K + k_offset + col]);
-                s_kv_sub[i] = static_cast<D_ATTN>(
-                    val * s_beta[row] * __expf(s_g[row]));
-            } else {
-                s_kv_sub[i] = static_cast<D_ATTN>(0);
-            }
+        // k_scaled_T[ki, j] = bf16(k[j, ki] * beta[j] * exp(gc[j]))
+        for (int i = tid; i < BT * BK_SUB; i += BS) {
+            int j  = i / BK_SUB;
+            int ki = i % BK_SUB;
+            D_ATTN k_val = (chunk_start + j < kargs.T)
+                ? k_base[j * H * K + k_offset + ki]
+                : static_cast<D_ATTN>(0);
+            float scaled = static_cast<D_ACC>(k_val) * s_beta[j] * __expf(s_g[j]);
+            s_vT[ki * VT_STRIDE + j] = static_cast<D_ATTN>(scaled);
+        }
+        for (int i = tid; i < BK_SUB * PAD; i += BS) {
+            int ki = i / PAD;
+            int p  = i % PAD;
+            s_vT[ki * VT_STRIDE + BT + p] = static_cast<D_ATTN>(0);
         }
         __syncthreads();
 
-        // w_bar[BT, 64] = C[BT, BT] @ k_scaled[BT, 64]
-        for (int idx = tid; idx < BT * T::BK_SUB; idx += T::BLOCK_SIZE) {
-            int row = idx / T::BK_SUB;
-            int col = idx % T::BK_SUB;
-            D_ACC acc = 0.0f;
-            for (int j = 0; j < BT; j++)
-                acc += s_C[row * BT + j]
-                     * static_cast<D_ACC>(s_kv_sub[j * T::BK_SUB + col]);
-            if (chunk_start + row < kargs.T)
-                w_bar_base[row * H * K + k_offset + col]
-                    = static_cast<D_ATTN>(acc);
+        v4f32_t wy_c[1];
+        clear_v4f32<1>(wy_c);
+        tiled_gemm_mfma<1, 1, 1>(
+            wy_c, s_C_bf16, 0, C_STRIDE,
+                  s_vT, warp_id * 16, VT_STRIDE, lane_id);
+
+        for (int p = 0; p < 4; p++) {
+            int s  = (lane_id >> 4) * 4 + p;
+            int ki = warp_id * 16 + (lane_id & 15);
+            if (chunk_start + s < kargs.T)
+                w_bar_base[s * H * K + k_offset + ki] =
+                    static_cast<D_ATTN>(wy_c[0][p]);
         }
         __syncthreads();
     }
