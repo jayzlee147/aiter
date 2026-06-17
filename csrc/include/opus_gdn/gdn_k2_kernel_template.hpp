@@ -11,71 +11,12 @@
 #pragma once
 
 #include "opus_gdn/gdn_defs.h"
-
-namespace gdn_k2_mfma {
-
-// MFMA register vector types (gfx942 bf16 16×16×16)
-using v4bf16_t = __bf16 __attribute__((ext_vector_type(4)));
-using v4f32_t  = float  __attribute__((ext_vector_type(4)));
-
-// exp(x) via single-cycle v_exp_f32: exp(x) = 2^(x * log2(e))
-__device__ inline float fast_exp(float x) {
-    return __builtin_amdgcn_exp2f(x * 1.442695041f);
-}
-
-__device__ inline v4f32_t mfma_f32_16x16x16_bf16(v4bf16_t a, v4bf16_t b, v4f32_t c) {
-    return __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, c, 0, 0, 0);
-}
-
-// Load one 16×16 MFMA tile from LDS
-// LDS layout: [rows, stride] bf16, row-major
-// A tile:  lane holds A[row_base + lane%16, col_base + (lane/16)*4 .. +3]
-// B tile:  lane holds B[row_base + lane%16, col_base + (lane/16)*4 .. +3]
-// (Same register packing for A and B; hardware interprets differently)
-__device__ inline v4bf16_t load_mfma_tile(
-        const __bf16* __restrict__ lds, int row_base, int col_base,
-        int stride, int lane_id) {
-    int addr = (row_base + (lane_id & 15)) * stride + col_base + ((lane_id >> 4) << 2);
-    return *reinterpret_cast<const v4bf16_t*>(&lds[addr]);
-}
-
-// Tiled MFMA GEMM
-// Computes C[E_M*16, E_N*16] += A[E_M*16, E_K*16] × B^T[E_N*16, E_K*16]
-//   A stored as [M, stride_a] bf16 (M×K row-major)
-//   B stored as [N, stride_b] bf16 (N×K row-major, opus convention)
-//   Hardware: D = A_reg × B_reg^T, giving C[M,N]
-template<int E_M, int E_N, int E_K>
-__device__ void tiled_gemm_mfma(
-        v4f32_t* __restrict__ c,
-        const __bf16* __restrict__ lds_a, int m_base, int stride_a,
-        const __bf16* __restrict__ lds_b, int n_base, int stride_b,
-        int lane_id) {
-    for (int ek = 0; ek < E_K; ek++) {
-        v4bf16_t a_tiles[E_M];
-        for (int em = 0; em < E_M; em++)
-            a_tiles[em] = load_mfma_tile(lds_a, m_base + em * 16, ek * 16, stride_a, lane_id);
-        v4bf16_t b_tiles[E_N];
-        for (int en = 0; en < E_N; en++)
-            b_tiles[en] = load_mfma_tile(lds_b, n_base + en * 16, ek * 16, stride_b, lane_id);
-        for (int em = 0; em < E_M; em++)
-            for (int en = 0; en < E_N; en++)
-                c[em * E_N + en] = mfma_f32_16x16x16_bf16(
-                    a_tiles[em], b_tiles[en], c[em * E_N + en]);
-    }
-}
-
-// Zero a v4f32_t array
-template<int N>
-__device__ inline void clear_v4f32(v4f32_t* c) {
-    for (int i = 0; i < N; i++) c[i] = v4f32_t{0.f, 0.f, 0.f, 0.f};
-}
-
-} // namespace gdn_k2_mfma
+#include "opus_gdn/gdn_mfma_utils.h"
 
 template<typename Traits>
 __global__ void __launch_bounds__(Traits::BLOCK_SIZE, Traits::OCC_HINT)
 gdn_k2_kernel(gdn_k2_kargs kargs) {
-    using namespace gdn_k2_mfma;
+    using namespace gdn_mfma;
     using T = Traits;
     using D_ATTN = typename T::D_ATTN;
     using D_ACC  = typename T::D_ACC;
@@ -100,7 +41,7 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
     static_assert(H_E_N > 0, "Too many warps for BV dimension (h state)");
 
     // Output GEMM1/2/5 tiling: C[BT, BV], 2D warp tiling
-    constexpr bool BT_LARGE = (BT >= 64);
+    constexpr bool BT_LARGE = (BT >= 32);
     constexpr int O_T_M = BT_LARGE
         ? ((T::NUM_WARPS < BT / W) ? T::NUM_WARPS : BT / W) : 1;
     constexpr int O_T_N = T::NUM_WARPS / O_T_M;
@@ -109,9 +50,12 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
     constexpr int O_E_K = BK_SUB / W;
     static_assert(O_E_N > 0, "Too many warps for BV dimension (output)");
 
-    // QK^T GEMM4 tiling: C[BT, BT], 2D warp tiling
-    constexpr int QKT_E_M = BT / (W * O_T_M);
-    constexpr int QKT_E_N = BT / (W * O_T_N);
+    // QK^T GEMM4 tiling: C[BT, BT], separate 2D tiling (BT may differ from BV)
+    constexpr int QKT_T_M = BT_LARGE
+        ? ((T::NUM_WARPS < BT / W) ? T::NUM_WARPS : BT / W) : 1;
+    constexpr int QKT_T_N = BT_LARGE ? (T::NUM_WARPS / QKT_T_M) : T::NUM_WARPS;
+    constexpr int QKT_E_M = BT / (W * QKT_T_M);
+    constexpr int QKT_E_N = BT / (W * QKT_T_N);
     constexpr int QKT_E_K = BK_SUB / W;
 
     // LDS strides (bf16 element count, including padding)
@@ -152,6 +96,15 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
     } else {
         o_m_base = 0;
         o_n_base = warp_id * W;
+    }
+
+    int qkt_m_base, qkt_n_base;
+    if constexpr (BT_LARGE) {
+        qkt_m_base = (warp_id / QKT_T_N) * (QKT_E_M * W);
+        qkt_n_base = (warp_id % QKT_T_N) * (QKT_E_N * W);
+    } else {
+        qkt_m_base = 0;
+        qkt_n_base = warp_id * W;
     }
 
     // =====================================================================
@@ -609,8 +562,8 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
 
                     tiled_gemm_mfma<QKT_E_M, QKT_E_N, QKT_E_K>(
                         r_A,
-                        s_q4, o_m_base, STRIDE_BK,
-                        s_k4, o_n_base, STRIDE_BK,
+                        s_q4, qkt_m_base, STRIDE_BK,
+                        s_k4, qkt_n_base, STRIDE_BK,
                         lane_id);
                     __syncthreads();
                 }
@@ -621,11 +574,11 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
                     for (int p = 0; p < 4; p++) {
                         int s, r;
                         if constexpr (BT_LARGE) {
-                            s = o_m_base + (lane_id >> 4) * 4 + p;
-                            r = o_n_base + en * W + (lane_id & 15);
+                            s = qkt_m_base + (lane_id >> 4) * 4 + p;
+                            r = qkt_n_base + en * W + (lane_id & 15);
                         } else {
                             s = (lane_id >> 4) * 4 + p;
-                            r = o_n_base + en * W + (lane_id & 15);
+                            r = qkt_n_base + en * W + (lane_id & 15);
                         }
                         if (s >= r && (full_chunk || (s < T_rem && r < T_rem)))
                             r_A[i][p] *= fast_exp(s_g[s] - s_g[r]);
@@ -639,11 +592,11 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
                     int en = i % QKT_E_N;
                     int row_base, col_base;
                     if constexpr (BT_LARGE) {
-                        row_base = o_m_base + (lane_id >> 4) * 4;
-                        col_base = o_n_base + en * W + (lane_id & 15);
+                        row_base = qkt_m_base + (lane_id >> 4) * 4;
+                        col_base = qkt_n_base + en * W + (lane_id & 15);
                     } else {
                         row_base = (lane_id >> 4) * 4;
-                        col_base = o_n_base + en * W + (lane_id & 15);
+                        col_base = qkt_n_base + en * W + (lane_id & 15);
                     }
                     for (int p = 0; p < 4; p++) {
                         int row = row_base + p;
