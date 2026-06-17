@@ -1,18 +1,16 @@
-// GDN Prefill K2 Kernel — MFMA bf16 16×16×16 optimized
-// Step 3: Hidden state update (retrieve, gate-scale, decay, accumulate)
-// Step 4: Output (cross-chunk QH, intra-chunk causal attention)
+// GDN Prefill K2 Kernel — BT=32 specialization
+// Same algorithm as the main template but with BT_LARGE threshold lowered
+// to BT>=32 so the 2D warp tiling correctly covers [BT, BV] and [BT, BT].
 //
-// Grid: (cdiv(V, BV), N*H)   Block: (BLOCK_SIZE = 256)
+// Grid: (cdiv(V, BV), N*H)   Block: (BLOCK_SIZE)
 // h state: register-resident in MFMA accumulator layout, N_K × [BK_SUB, BV]
-// Chunks: serial iteration within each workgroup
-//
-// 5 GEMMs via MFMA bf16 16×16×16 (BT≥32), scalar fallback for BT<32 GEMM4/5
+// 5 GEMMs via MFMA bf16 16×16×16
 // Target: gfx942 (MI300X)
 #pragma once
 
 #include "opus_gdn/gdn_defs.h"
 
-namespace gdn_k2_mfma {
+namespace gdn_k2_bt32_mfma {
 
 // MFMA register vector types (gfx942 bf16 16×16×16)
 using v4bf16_t = __bf16 __attribute__((ext_vector_type(4)));
@@ -70,12 +68,12 @@ __device__ inline void clear_v4f32(v4f32_t* c) {
     for (int i = 0; i < N; i++) c[i] = v4f32_t{0.f, 0.f, 0.f, 0.f};
 }
 
-} // namespace gdn_k2_mfma
+} // namespace gdn_k2_bt32_mfma
 
 template<typename Traits>
 __global__ void __launch_bounds__(Traits::BLOCK_SIZE, Traits::OCC_HINT)
-gdn_k2_kernel(gdn_k2_kargs kargs) {
-    using namespace gdn_k2_mfma;
+gdn_k2_bt32_kernel(gdn_k2_kargs kargs) {
+    using namespace gdn_k2_bt32_mfma;
     using T = Traits;
     using D_ATTN = typename T::D_ATTN;
     using D_ACC  = typename T::D_ACC;
@@ -100,7 +98,7 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
     static_assert(H_E_N > 0, "Too many warps for BV dimension (h state)");
 
     // Output GEMM1/2/5 tiling: C[BT, BV], 2D warp tiling
-    constexpr bool BT_LARGE = (BT >= 64);
+    constexpr bool BT_LARGE = (BT >= 32);
     constexpr int O_T_M = BT_LARGE
         ? ((T::NUM_WARPS < BT / W) ? T::NUM_WARPS : BT / W) : 1;
     constexpr int O_T_N = T::NUM_WARPS / O_T_M;
@@ -109,9 +107,13 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
     constexpr int O_E_K = BK_SUB / W;
     static_assert(O_E_N > 0, "Too many warps for BV dimension (output)");
 
-    // QK^T GEMM4 tiling: C[BT, BT], 2D warp tiling
-    constexpr int QKT_E_M = BT / (W * O_T_M);
-    constexpr int QKT_E_N = BT / (W * O_T_N);
+    // QK^T GEMM4 tiling: C[BT, BT], separate 2D tiling
+    // When BT < BV, O_T_N tiles beyond BT. Use dedicated QKT tiling.
+    constexpr int QKT_T_M = BT_LARGE
+        ? ((T::NUM_WARPS < BT / W) ? T::NUM_WARPS : BT / W) : 1;
+    constexpr int QKT_T_N = BT_LARGE ? (T::NUM_WARPS / QKT_T_M) : T::NUM_WARPS;
+    constexpr int QKT_E_M = BT / (W * QKT_T_M);
+    constexpr int QKT_E_N = BT / (W * QKT_T_N);
     constexpr int QKT_E_K = BK_SUB / W;
 
     // LDS strides (bf16 element count, including padding)
@@ -152,6 +154,15 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
     } else {
         o_m_base = 0;
         o_n_base = warp_id * W;
+    }
+
+    int qkt_m_base, qkt_n_base;
+    if constexpr (BT_LARGE) {
+        qkt_m_base = (warp_id / QKT_T_N) * (QKT_E_M * W);
+        qkt_n_base = (warp_id % QKT_T_N) * (QKT_E_N * W);
+    } else {
+        qkt_m_base = 0;
+        qkt_n_base = warp_id * W;
     }
 
     // =====================================================================
@@ -609,8 +620,8 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
 
                     tiled_gemm_mfma<QKT_E_M, QKT_E_N, QKT_E_K>(
                         r_A,
-                        s_q4, o_m_base, STRIDE_BK,
-                        s_k4, o_n_base, STRIDE_BK,
+                        s_q4, qkt_m_base, STRIDE_BK,
+                        s_k4, qkt_n_base, STRIDE_BK,
                         lane_id);
                     __syncthreads();
                 }
@@ -621,11 +632,11 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
                     for (int p = 0; p < 4; p++) {
                         int s, r;
                         if constexpr (BT_LARGE) {
-                            s = o_m_base + (lane_id >> 4) * 4 + p;
-                            r = o_n_base + en * W + (lane_id & 15);
+                            s = qkt_m_base + (lane_id >> 4) * 4 + p;
+                            r = qkt_n_base + en * W + (lane_id & 15);
                         } else {
                             s = (lane_id >> 4) * 4 + p;
-                            r = o_n_base + en * W + (lane_id & 15);
+                            r = qkt_n_base + en * W + (lane_id & 15);
                         }
                         if (s >= r && (full_chunk || (s < T_rem && r < T_rem)))
                             r_A[i][p] *= fast_exp(s_g[s] - s_g[r]);
@@ -639,11 +650,11 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
                     int en = i % QKT_E_N;
                     int row_base, col_base;
                     if constexpr (BT_LARGE) {
-                        row_base = o_m_base + (lane_id >> 4) * 4;
-                        col_base = o_n_base + en * W + (lane_id & 15);
+                        row_base = qkt_m_base + (lane_id >> 4) * 4;
+                        col_base = qkt_n_base + en * W + (lane_id & 15);
                     } else {
                         row_base = (lane_id >> 4) * 4;
-                        col_base = o_n_base + en * W + (lane_id & 15);
+                        col_base = qkt_n_base + en * W + (lane_id & 15);
                     }
                     for (int p = 0; p < 4; p++) {
                         int row = row_base + p;

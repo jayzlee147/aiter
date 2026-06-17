@@ -35,10 +35,10 @@ def opus_gdn_prefill_fwd(
     scale: float = None,
     initial_state: torch.Tensor = None,
     output_final_state: bool = False,
-    BT: int = 64,
+    BT: int = 32,
     BV: int = 64,
     num_warps: int = 4,
-    k1_algo: int = 0,
+    k1_algo: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Opus HIP kernel for Gated DeltaNet prefill (forward only).
@@ -55,7 +55,7 @@ def opus_gdn_prefill_fwd(
         scale: 1/sqrt(K) if None
         initial_state: [B, H, V, K] fp32 or None
         output_final_state: whether to return final hidden state
-        BT: chunk size, 64 (default) or 16
+        BT: chunk size, 32 (default), 64, or 16
 
     Returns:
         (o, final_state): o is [B, T, H, V] bf16, final_state is [B, H, V, K] fp32 or None
