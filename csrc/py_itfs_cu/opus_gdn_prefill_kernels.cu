@@ -2,6 +2,7 @@
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // Opus-based GDN prefill kernel — host launcher for aiter JIT.
+// Target: gfx942 (MI300X) / gfx950 (MI350)
 // Fuses all 4 steps of Gated DeltaNet chunkwise recurrence into 2 HIP kernels:
 //   K1 = Steps 1+2 (cumsum, KKT, trisol, WY factors)  — token-parallel
 //   K2 = Steps 3+4 (h update, output)                  — head-parallel, chunk-serial
@@ -21,9 +22,11 @@ __global__ void gdn_k1_neumann_kernel(gdn_k1_kargs kargs);
 template<typename Traits>
 __global__ void gdn_k1_bt32_kernel(gdn_k1_kargs kargs);
 template<typename Traits>
+__global__ void gdn_k1_bt128_kernel(gdn_k1_kargs kargs);
+template<typename Traits>
 __global__ void gdn_k2_kernel(gdn_k2_kargs kargs);
 
-enum class K1Algo { BASIC, NEUMANN, BT32 };
+enum class K1Algo { BASIC, NEUMANN, BT32, BT128 };
 
 template<K1Algo algo, typename K1Traits, typename K2Traits>
 void launch_gdn_prefill_impl(
@@ -94,6 +97,8 @@ void launch_gdn_prefill_impl(
         gdn_k1_kernel<K1Traits><<<k1_grid, k1_block, k1_smem, stream>>>(k1args);
     else if constexpr (algo == K1Algo::NEUMANN)
         gdn_k1_neumann_kernel<K1Traits><<<k1_grid, k1_block, k1_smem, stream>>>(k1args);
+    else if constexpr (algo == K1Algo::BT128)
+        gdn_k1_bt128_kernel<K1Traits><<<k1_grid, k1_block, k1_smem, stream>>>(k1args);
     else
         gdn_k1_bt32_kernel<K1Traits><<<k1_grid, k1_block, k1_smem, stream>>>(k1args);
 
@@ -136,7 +141,20 @@ void opus_gdn_prefill_fwd(
         q, k, v, g, beta, o, scale, \
         initial_state, final_state, has_initial_state, output_final_state)
 
-    if (BT == 64 && k1_algo == 1) {
+    if (BT == 128) {
+        if (BV == 64 && num_warps == 4) {
+            DISPATCH(BT128, 128, 64, 4);
+        } else if (BV == 32 && num_warps == 4) {
+            DISPATCH(BT128, 128, 32, 4);
+        } else if (BV == 64 && num_warps == 8) {
+            DISPATCH(BT128, 128, 64, 8);
+        } else if (BV == 32 && num_warps == 8) {
+            DISPATCH(BT128, 128, 32, 8);
+        } else {
+            TORCH_CHECK(false, "Unsupported combination BT=128, BV=", BV,
+                        " num_warps=", num_warps);
+        }
+    } else if (BT == 64 && k1_algo == 1) {
         if (BV == 64 && num_warps == 4) {
             DISPATCH(NEUMANN, 64, 64, 4);
         } else if (BV == 32 && num_warps == 4) {

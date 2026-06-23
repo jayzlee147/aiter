@@ -4,7 +4,7 @@
 //         + WY factor assembly w_bar, u_bar (MFMA)
 //
 // Grid: (NT, B*H)   Block: (BLOCK_SIZE = 256)
-// Target: gfx942 (MI300X), MFMA bf16 16×16×16
+// Target: gfx942 (MI300X) / gfx950 (MI350), MFMA bf16 16×16×16
 //
 // A is 16×16 strictly lower triangular → nilpotent of order 16.
 // Neumann series: (I+A)^{-1} = I - A + A² - A³ + … + (-A)^{15}

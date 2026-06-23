@@ -4,7 +4,7 @@
 //         + WY factor assembly w_bar, u_bar (MFMA)
 //
 // Grid: (NT, B*H)   Block: (BLOCK_SIZE = 256)
-// Target: gfx942 (MI300X), MFMA bf16 16×16×16
+// Target: gfx942 (MI300X) / gfx950 (MI350), MFMA bf16 16×16×16
 #pragma once
 
 #include "opus_gdn/gdn_defs.h"
@@ -34,6 +34,7 @@ gdn_k1_kernel(gdn_k1_kargs kargs) {
     constexpr int PAD = T::SMEM_PAD;
     constexpr int K_STRIDE = T::K_STRIDE;
     constexpr int BK_SUB = T::BK_SUB;
+    constexpr int A_STRIDE = T::A_STRIDE;
     const int K  = kargs.K;
     const int V  = kargs.V;
     const int H  = kargs.H;
@@ -145,7 +146,7 @@ gdn_k1_kernel(gdn_k1_kargs kargs) {
             float val = 0.0f;
             if (s > r)
                 val = kkt_c[en][p] * s_beta[s] * __expf(s_g[s] - s_g[r]);
-            s_A[s * BT + r] = val;
+            s_A[s * A_STRIDE + r] = val;
         }
     }
     __syncthreads();
@@ -168,15 +169,15 @@ gdn_k1_kernel(gdn_k1_kargs kargs) {
             int global_col = blk_row_start + c;
             if (global_row >= BT) continue;
 
-            D_ACC neg_a = -s_A[global_row * BT + global_col];
+            D_ACC neg_a = -s_A[global_row * A_STRIDE + global_col];
 
             D_ACC acc = neg_a;
             for (int j = c + 1; j < i; j++) {
                 int j_global = blk_row_start + j;
-                acc += (-s_A[global_row * BT + j_global]) *
-                       s_A[j_global * BT + global_col];
+                acc += (-s_A[global_row * A_STRIDE + j_global]) *
+                       s_A[j_global * A_STRIDE + global_col];
             }
-            s_A[global_row * BT + global_col] = acc;
+            s_A[global_row * A_STRIDE + global_col] = acc;
         }
     }
 
@@ -184,7 +185,7 @@ gdn_k1_kernel(gdn_k1_kargs kargs) {
     for (int i = lane_id; i < 16; i += T::WARP_SIZE) {
         int r = blk_row_start + i;
         if (r < BT)
-            s_A[r * BT + r] += 1.0f;
+            s_A[r * A_STRIDE + r] += 1.0f;
     }
     // Zero upper triangle within block
     for (int idx = lane_id; idx < 16 * 16; idx += T::WARP_SIZE) {
@@ -193,7 +194,7 @@ gdn_k1_kernel(gdn_k1_kargs kargs) {
         int gr = blk_row_start + r;
         int gc_col = blk_row_start + c;
         if (gr < BT && gc_col < BT && r < c)
-            s_A[gr * BT + gc_col] = 0.0f;
+            s_A[gr * A_STRIDE + gc_col] = 0.0f;
     }
     __syncthreads();
 
@@ -214,10 +215,10 @@ gdn_k1_kernel(gdn_k1_kargs kargs) {
     // Pre-save L blocks overwritten in Level 1 (L_32 by C_32, L_43 by C_43)
     v4bf16_t sav_L32, sav_L43, sav_L42;
     if (warp_id == 0) {
-        sav_L32 = load_fp32_tile(s_A, 32, 16, BT, lane_id);
-        sav_L43 = load_fp32_tile(s_A, 48, 32, BT, lane_id);
+        sav_L32 = load_fp32_tile(s_A, 32, 16, A_STRIDE, lane_id);
+        sav_L43 = load_fp32_tile(s_A, 48, 32, A_STRIDE, lane_id);
     } else if (warp_id == 1) {
-        sav_L43 = load_fp32_tile(s_A, 48, 32, BT, lane_id);
+        sav_L43 = load_fp32_tile(s_A, 48, 32, A_STRIDE, lane_id);
     }
 
     v4f32_t kept_c21 = z4, kept_c32 = z4, kept_c31 = z4;
@@ -225,74 +226,74 @@ gdn_k1_kernel(gdn_k1_kargs kargs) {
     // --- Level 1: C_21, C_32, C_43 ---
     if (warp_id == 0) {
         v4f32_t t = mfma_f32_16x16x16_bf16(
-            load_fp32_tile(s_A, 16, 0, BT, lane_id),
-            load_fp32_tile_T(s_A, 0, 0, BT, lane_id), z4);
+            load_fp32_tile(s_A, 16, 0, A_STRIDE, lane_id),
+            load_fp32_tile_T(s_A, 0, 0, A_STRIDE, lane_id), z4);
         kept_c21 = mfma_f32_16x16x16_bf16(
-            load_fp32_tile(s_A, 16, 16, BT, lane_id),
+            load_fp32_tile(s_A, 16, 16, A_STRIDE, lane_id),
             accum_to_src(t), z4);
         for (int p = 0; p < 4; p++) kept_c21[p] = -kept_c21[p];
-        store_fp32_tile(s_A, 16, 0, BT, kept_c21, lane_id);
+        store_fp32_tile(s_A, 16, 0, A_STRIDE, kept_c21, lane_id);
     } else if (warp_id == 1) {
         v4f32_t t = mfma_f32_16x16x16_bf16(
-            load_fp32_tile(s_A, 32, 16, BT, lane_id),
-            load_fp32_tile_T(s_A, 16, 16, BT, lane_id), z4);
+            load_fp32_tile(s_A, 32, 16, A_STRIDE, lane_id),
+            load_fp32_tile_T(s_A, 16, 16, A_STRIDE, lane_id), z4);
         kept_c32 = mfma_f32_16x16x16_bf16(
-            load_fp32_tile(s_A, 32, 32, BT, lane_id),
+            load_fp32_tile(s_A, 32, 32, A_STRIDE, lane_id),
             accum_to_src(t), z4);
         for (int p = 0; p < 4; p++) kept_c32[p] = -kept_c32[p];
-        store_fp32_tile(s_A, 32, 16, BT, kept_c32, lane_id);
+        store_fp32_tile(s_A, 32, 16, A_STRIDE, kept_c32, lane_id);
     } else if (warp_id == 2) {
         v4f32_t t = mfma_f32_16x16x16_bf16(
-            load_fp32_tile(s_A, 48, 32, BT, lane_id),
-            load_fp32_tile_T(s_A, 32, 32, BT, lane_id), z4);
+            load_fp32_tile(s_A, 48, 32, A_STRIDE, lane_id),
+            load_fp32_tile_T(s_A, 32, 32, A_STRIDE, lane_id), z4);
         v4f32_t c43 = mfma_f32_16x16x16_bf16(
-            load_fp32_tile(s_A, 48, 48, BT, lane_id),
+            load_fp32_tile(s_A, 48, 48, A_STRIDE, lane_id),
             accum_to_src(t), z4);
         for (int p = 0; p < 4; p++) c43[p] = -c43[p];
-        store_fp32_tile(s_A, 48, 32, BT, c43, lane_id);
+        store_fp32_tile(s_A, 48, 32, A_STRIDE, c43, lane_id);
     }
     __syncthreads();
 
     // Save L_42 (still valid, overwritten by C_42 in Level 2)
     if (warp_id == 0)
-        sav_L42 = load_fp32_tile(s_A, 48, 16, BT, lane_id);
+        sav_L42 = load_fp32_tile(s_A, 48, 16, A_STRIDE, lane_id);
 
     // --- Level 2: C_31, C_42 ---
     if (warp_id == 0) {
         v4f32_t t = mfma_f32_16x16x16_bf16(
-            load_fp32_tile(s_A, 32, 0, BT, lane_id),
-            load_fp32_tile_T(s_A, 0, 0, BT, lane_id), z4);
+            load_fp32_tile(s_A, 32, 0, A_STRIDE, lane_id),
+            load_fp32_tile_T(s_A, 0, 0, A_STRIDE, lane_id), z4);
         t = mfma_f32_16x16x16_bf16(sav_L32, accum_to_src(kept_c21), t);
         kept_c31 = mfma_f32_16x16x16_bf16(
-            load_fp32_tile(s_A, 32, 32, BT, lane_id),
+            load_fp32_tile(s_A, 32, 32, A_STRIDE, lane_id),
             accum_to_src(t), z4);
         for (int p = 0; p < 4; p++) kept_c31[p] = -kept_c31[p];
-        store_fp32_tile(s_A, 32, 0, BT, kept_c31, lane_id);
+        store_fp32_tile(s_A, 32, 0, A_STRIDE, kept_c31, lane_id);
     } else if (warp_id == 1) {
         v4f32_t t = mfma_f32_16x16x16_bf16(
-            load_fp32_tile(s_A, 48, 16, BT, lane_id),
-            load_fp32_tile_T(s_A, 16, 16, BT, lane_id), z4);
+            load_fp32_tile(s_A, 48, 16, A_STRIDE, lane_id),
+            load_fp32_tile_T(s_A, 16, 16, A_STRIDE, lane_id), z4);
         t = mfma_f32_16x16x16_bf16(sav_L43, accum_to_src(kept_c32), t);
         v4f32_t c42 = mfma_f32_16x16x16_bf16(
-            load_fp32_tile(s_A, 48, 48, BT, lane_id),
+            load_fp32_tile(s_A, 48, 48, A_STRIDE, lane_id),
             accum_to_src(t), z4);
         for (int p = 0; p < 4; p++) c42[p] = -c42[p];
-        store_fp32_tile(s_A, 48, 16, BT, c42, lane_id);
+        store_fp32_tile(s_A, 48, 16, A_STRIDE, c42, lane_id);
     }
     __syncthreads();
 
     // --- Level 3: C_41 ---
     if (warp_id == 0) {
         v4f32_t t = mfma_f32_16x16x16_bf16(
-            load_fp32_tile(s_A, 48, 0, BT, lane_id),
-            load_fp32_tile_T(s_A, 0, 0, BT, lane_id), z4);
+            load_fp32_tile(s_A, 48, 0, A_STRIDE, lane_id),
+            load_fp32_tile_T(s_A, 0, 0, A_STRIDE, lane_id), z4);
         t = mfma_f32_16x16x16_bf16(sav_L42, accum_to_src(kept_c21), t);
         t = mfma_f32_16x16x16_bf16(sav_L43, accum_to_src(kept_c31), t);
         v4f32_t c41 = mfma_f32_16x16x16_bf16(
-            load_fp32_tile(s_A, 48, 48, BT, lane_id),
+            load_fp32_tile(s_A, 48, 48, A_STRIDE, lane_id),
             accum_to_src(t), z4);
         for (int p = 0; p < 4; p++) c41[p] = -c41[p];
-        store_fp32_tile(s_A, 48, 0, BT, c41, lane_id);
+        store_fp32_tile(s_A, 48, 0, A_STRIDE, c41, lane_id);
     }
     __syncthreads();
 
@@ -311,12 +312,12 @@ gdn_k1_kernel(gdn_k1_kargs kargs) {
     // Convert C_inv to bf16 with padding, placed AFTER s_A
     constexpr int C_STRIDE = BT + PAD;  // 68
     D_ATTN* s_C_bf16 = reinterpret_cast<D_ATTN*>(
-        smem_buf + BT * 2 * sizeof(D_ACC) + BT * BT * sizeof(D_ACC));
+        smem_buf + BT * 2 * sizeof(D_ACC) + BT * A_STRIDE * sizeof(D_ACC));
 
     for (int i = tid; i < BT * BT; i += BS) {
         int s = i / BT;
         int j = i % BT;
-        s_C_bf16[s * C_STRIDE + j] = static_cast<D_ATTN>(s_A[i]);
+        s_C_bf16[s * C_STRIDE + j] = static_cast<D_ATTN>(s_A[s * A_STRIDE + j]);
     }
     __syncthreads();
 

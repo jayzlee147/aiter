@@ -7,7 +7,7 @@
 // Chunks: serial iteration within each workgroup
 //
 // 5 GEMMs via MFMA bf16 16×16×16 (BT≥32), scalar fallback for BT<32 GEMM4/5
-// Target: gfx942 (MI300X)
+// Target: gfx942 (MI300X) / gfx950 (MI350)
 #pragma once
 
 #include "opus_gdn/gdn_defs.h"

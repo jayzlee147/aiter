@@ -1,5 +1,5 @@
 // Gated DeltaNet (GDN) Prefill Kernel — shared types, kargs, traits
-// Target: MI300X (gfx942), MFMA bf16 16×16×16
+// Target: gfx942 (MI300X) / gfx950 (MI350), MFMA bf16 16×16×16
 #pragma once
 
 #ifdef __HIP_DEVICE_COMPILE__
@@ -53,7 +53,7 @@ struct gdn_k2_kargs {
 // K1 traits
 //
 // Layout: [B, T, H, K] with stride_t = H*K, stride_h = K, stride_k = 1
-// MFMA: bf16 16×16×16 uniformly on gfx942
+// MFMA: bf16 16×16×16 uniformly on gfx942/gfx950
 // --------------------------------------------------------------------------
 template<int BT_,
          int K_  = 128,
@@ -100,13 +100,18 @@ struct gdn_k1_traits {
     // Vector widths for load/store (bf16x8 = 16 bytes)
     static constexpr int VEC_KV = 8;
 
-    // MFMA LDS padding: +4 bf16 elements per row to avoid 32-bank conflicts
+    // MFMA LDS padding: +4 bf16 elements per row to avoid bank conflicts
+    // (effective on both 32-bank gfx942 and 64-bank gfx950)
     static constexpr int SMEM_PAD = 4;
     static constexpr int K_STRIDE = K + SMEM_PAD;
 
+    // fp32 A matrix: stride padded to BT+1 to avoid bank conflicts
+    // (BT DWORDs would align every row to the same bank on 32/64-bank LDS)
+    static constexpr int A_STRIDE = BT + 1;
+
     // LDS layout (sizes in bytes)
     static constexpr int smem_k_padded_bytes = BT * K_STRIDE * (int)sizeof(D_ATTN);
-    static constexpr int smem_A_bytes     = BT * BT * (int)sizeof(D_ACC);
+    static constexpr int smem_A_bytes     = BT * A_STRIDE * (int)sizeof(D_ACC);
     static constexpr int smem_scalar_bytes = BT * 2 * (int)sizeof(D_ACC);
     static constexpr int smem_subtile_bytes = BT * BK_SUB * (int)sizeof(D_ATTN);
 
@@ -150,7 +155,7 @@ struct gdn_k2_traits {
     static constexpr int NUM_WARPS = NUM_WARPS_;
     static constexpr int WARP_SIZE = 64;
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
-    static constexpr int OCC_HINT = (NUM_WARPS <= 4) ? 2 : 1;
+    static constexpr int OCC_HINT = (BT_ >= 128) ? 1 : ((NUM_WARPS_ <= 4) ? 2 : 1);
 
     using D_ATTN = bf16_t;
     using D_ACC  = float;
@@ -189,7 +194,8 @@ struct gdn_k2_traits {
 
     static constexpr int VEC_KV = 8;
 
-    // MFMA LDS padding: +4 bf16 elements per row to avoid 32-bank conflicts
+    // MFMA LDS padding: +4 bf16 elements per row to avoid bank conflicts
+    // (effective on both 32-bank gfx942 and 64-bank gfx950)
     static constexpr int SMEM_PAD = 4;
 
     // LDS layout (MFMA optimized, all bf16 buffers padded)

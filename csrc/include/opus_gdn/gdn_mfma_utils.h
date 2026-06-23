@@ -1,6 +1,7 @@
 // MFMA bf16 16×16×16 utility functions for GDN prefill kernels
 // Shared across all K1/K2 kernel templates
 // Uses opus template library for MFMA dispatch and LDS access
+// Target: gfx942 (MI300X) / gfx950 (MI350)
 #pragma once
 
 #include <hip/hip_runtime.h>

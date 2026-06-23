@@ -12,12 +12,12 @@
 //   - MFMA KKT replaces scalar dot product
 //   - MFMA Horner Neumann replaces shuffle-based forward substitution
 //   - MFMA Schur complement replaces 8192-op scalar computation
-//   - s_C fp32 stride padded to BT+1 (33) to eliminate 32-bank LDS conflicts
+//   - s_C fp32 stride padded to BT+1 (33) to eliminate LDS bank conflicts (32/64-bank)
 //   - Transposed WY GEMM enables v4bf16_t vectorized output stores (4x fewer VMEM)
 //   - v4bf16_t vectorized HBM loads for v/k data
 //
 // Grid: (NT, B*H)   Block: (BLOCK_SIZE = 256)
-// Target: gfx942 (MI300X), MFMA bf16 16×16×16
+// Target: gfx942 (MI300X) / gfx950 (MI350), MFMA bf16 16×16×16
 #pragma once
 
 #include "opus_gdn/gdn_defs.h"

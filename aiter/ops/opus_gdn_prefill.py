@@ -4,6 +4,7 @@
 import torch
 import torch.nn.functional as F
 from ..jit.core import compile_ops
+from ..jit.utils.chip_info import get_gfx
 
 
 @compile_ops("module_opus_gdn_prefill")
@@ -44,7 +45,7 @@ def opus_gdn_prefill_fwd(
     Opus HIP kernel for Gated DeltaNet prefill (forward only).
 
     Fuses all 4 chunkwise steps into 2 HIP kernels (K1 + K2).
-    K=V=128 specialized, gfx942 only.
+    K=V=128 specialized, gfx942/gfx950.
 
     Args:
         q: [B, T, H, K] bf16
@@ -55,7 +56,7 @@ def opus_gdn_prefill_fwd(
         scale: 1/sqrt(K) if None
         initial_state: [B, H, V, K] fp32 or None
         output_final_state: whether to return final hidden state
-        BT: chunk size, 32 (default), 64, or 16
+        BT: chunk size, 32 (default), 64, 16, or 128 (gfx950 only)
 
     Returns:
         (o, final_state): o is [B, T, H, V] bf16, final_state is [B, H, V, K] fp32 or None
@@ -71,6 +72,9 @@ def opus_gdn_prefill_fwd(
     v = v.contiguous().to(torch.bfloat16)
     g = g.contiguous().float()
     beta = beta.contiguous().float()
+
+    if BT == 128 and get_gfx() != "gfx950":
+        raise ValueError("BT=128 requires gfx950 (MI350) — LDS exceeds gfx942 64KB limit")
 
     pad_len = (BT - T % BT) % BT
     if pad_len > 0:
