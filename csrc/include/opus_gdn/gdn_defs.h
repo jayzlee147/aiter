@@ -211,19 +211,24 @@ struct gdn_k2_traits {
     //              s_A[BT, BT+PAD] bf16                              (AV)
     static constexpr int smem_g_bytes = BT * (int)sizeof(D_ACC);
     static constexpr int smem_vT_bytes = BV * (BT + SMEM_PAD) * (int)sizeof(D_ATTN);
+    // Persistent q for the whole chunk: all N_K subtiles, [BT, BK_SUB+PAD] each.
+    // Loaded once in phase b/c and reused in phase e (QK^T) — avoids re-reading
+    // q from HBM. Free LDS: k2 occupancy is VGPR-bound, not LDS-bound.
+    static constexpr int N_K_ = K / BK_SUB;
+    static constexpr int smem_q_bytes = N_K_ * BT * (BK_SUB + SMEM_PAD) * (int)sizeof(D_ATTN);
 
     static constexpr size_t smem_size_bytes() {
         constexpr int P = SMEM_PAD;
         int pool_bc  = BV * (BK_SUB + P) * (int)sizeof(D_ATTN)     // s_h_T
-                     + BT * (BK_SUB + P) * (int)sizeof(D_ATTN);   // s_sub
+                     + BT * (BK_SUB + P) * (int)sizeof(D_ATTN);   // s_sub_w
         int pool_d   = BK_SUB * (BT + P) * (int)sizeof(D_ATTN);    // s_k_T
-        int pool_eqk = 2 * BT * (BK_SUB + P) * (int)sizeof(D_ATTN);// s_q + s_k
+        int pool_eqk = BT * (BK_SUB + P) * (int)sizeof(D_ATTN);    // s_k4 (q now persistent)
         int pool_eav = BT * (BT + P) * (int)sizeof(D_ATTN);        // s_A
         int pool = pool_bc;
         if (pool_d   > pool) pool = pool_d;
         if (pool_eqk > pool) pool = pool_eqk;
         if (pool_eav > pool) pool = pool_eav;
-        return smem_g_bytes + smem_vT_bytes + pool;
+        return smem_g_bytes + smem_vT_bytes + smem_q_bytes + pool;
     }
 };
 
