@@ -12,3 +12,7 @@ template __global__ void gdn_k2_kernel<gdn_k2_traits<64, 128, 128, 64, 8>>(gdn_k
 template __global__ void gdn_k2_kernel<gdn_k2_traits<64, 128, 128, 32, 8>>(gdn_k2_kargs);
 template __global__ void gdn_k2_kernel<gdn_k2_traits<32, 128, 128, 64, 4>>(gdn_k2_kargs);
 template __global__ void gdn_k2_kernel<gdn_k2_traits<16, 128, 128, 64, 4>>(gdn_k2_kargs);
+template __global__ void gdn_k2_kernel<gdn_k2_traits<128, 128, 128, 64, 4>>(gdn_k2_kargs);
+template __global__ void gdn_k2_kernel<gdn_k2_traits<128, 128, 128, 32, 4>>(gdn_k2_kargs);
+template __global__ void gdn_k2_kernel<gdn_k2_traits<128, 128, 128, 64, 8>>(gdn_k2_kargs);
+template __global__ void gdn_k2_kernel<gdn_k2_traits<128, 128, 128, 32, 8>>(gdn_k2_kargs);

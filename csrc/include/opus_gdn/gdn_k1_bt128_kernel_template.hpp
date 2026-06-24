@@ -83,11 +83,18 @@ gdn_k1_bt128_kernel(gdn_k1_kargs kargs) {
     __syncthreads();
 
     // Prefix sum (Hillis-Steele)
+    // NOTE: BT=128 spans 2 wavefronts (128 active lanes), so the in-place
+    // update is NOT safe across waves (cross-wave read/write race on s_g).
+    // Read the addend into a register, barrier, then write — guarantees all
+    // reads of the previous level complete before any write of this level.
+    // (BT <= BS always holds here, so each thread owns exactly element `tid`.)
     for (int stride = 1; stride < BT; stride <<= 1) {
-        for (int i = tid; i < BT; i += BS) {
-            if (i >= stride)
-                s_g[i] += s_g[i - stride];
-        }
+        D_ACC prev = 0.0f;
+        if (tid < BT && tid >= stride)
+            prev = s_g[tid - stride];
+        __syncthreads();
+        if (tid < BT && tid >= stride)
+            s_g[tid] += prev;
         __syncthreads();
     }
 
@@ -132,24 +139,31 @@ gdn_k1_bt128_kernel(gdn_k1_kargs kargs) {
     constexpr int KKT_E_N = BT / 16;       // 8
     constexpr int KKT_E_K = T::K / 16;     // 8
 
+    // s_A aliases s_k (same LDS region). Both m_passes read s_k as the B
+    // operand (full 128 rows), so we must finish ALL KKT GEMM reads of s_k
+    // BEFORE writing any result into s_A — otherwise pass-0's s_A writes
+    // clobber the k data that pass-1 still needs. Compute both passes into
+    // registers, barrier, then write.
+    v4f32_t kkt_c[2][KKT_E_N];
     for (int m_pass = 0; m_pass < 2; m_pass++) {
         int m_base = m_pass * 64 + warp_id * 16;
-
-        v4f32_t kkt_c[KKT_E_N];
-        clear_v4f32<KKT_E_N>(kkt_c);
-
+        clear_v4f32<KKT_E_N>(kkt_c[m_pass]);
         tiled_gemm_mfma<KKT_E_M, KKT_E_N, KKT_E_K>(
-            kkt_c, s_k, m_base, K_STRIDE,
-                   s_k, 0,      K_STRIDE, lane_id);
+            kkt_c[m_pass], s_k, m_base, K_STRIDE,
+                           s_k, 0,      K_STRIDE, lane_id);
+    }
+    __syncthreads();  // all reads of s_k (= s_A memory) complete
 
-        // Post-MFMA: gate-scale lower triangle, zero upper+diagonal, write fp32
+    // Post-MFMA: gate-scale lower triangle, zero upper+diagonal, write fp32
+    for (int m_pass = 0; m_pass < 2; m_pass++) {
+        int m_base = m_pass * 64 + warp_id * 16;
         for (int en = 0; en < KKT_E_N; en++) {
             for (int p = 0; p < 4; p++) {
                 int s = m_base + (lane_id >> 4) * 4 + p;
                 int r = en * 16 + (lane_id & 15);
                 float val = 0.0f;
                 if (s > r)
-                    val = kkt_c[en][p] * s_beta[s] * __expf(s_g[s] - s_g[r]);
+                    val = kkt_c[m_pass][en][p] * s_beta[s] * __expf(s_g[s] - s_g[r]);
                 s_A[s * A_STRIDE + r] = val;
             }
         }

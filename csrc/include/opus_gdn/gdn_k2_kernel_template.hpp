@@ -91,7 +91,7 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
 
     int o_m_base, o_n_base;
     if constexpr (BT_LARGE) {
-        o_m_base = (warp_id / O_T_N) * W;
+        o_m_base = (warp_id / O_T_N) * (O_E_M * W);
         o_n_base = (warp_id % O_T_N) * (O_E_N * W);
     } else {
         o_m_base = 0;
@@ -359,7 +359,7 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
         for (int i = 0; i < C_ELEMS; i++) {
             int s;
             if constexpr (BT_LARGE)
-                s = o_m_base + (lane_id >> 4) * 4;
+                s = o_m_base + (i / O_E_N) * W + (lane_id >> 4) * 4;
             else
                 s = (lane_id >> 4) * 4;
             for (int p = 0; p < 4; p++) {
@@ -385,7 +385,7 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
             int en = i % O_E_N;
             int s_base, c;
             if constexpr (BT_LARGE) {
-                s_base = o_m_base + (lane_id >> 4) * 4;
+                s_base = o_m_base + (i / O_E_N) * W + (lane_id >> 4) * 4;
                 c = o_n_base + en * W + (lane_id & 15);
             } else {
                 s_base = (lane_id >> 4) * 4;
@@ -574,7 +574,7 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
                     for (int p = 0; p < 4; p++) {
                         int s, r;
                         if constexpr (BT_LARGE) {
-                            s = qkt_m_base + (lane_id >> 4) * 4 + p;
+                            s = qkt_m_base + (i / QKT_E_N) * W + (lane_id >> 4) * 4 + p;
                             r = qkt_n_base + en * W + (lane_id & 15);
                         } else {
                             s = (lane_id >> 4) * 4 + p;
@@ -592,7 +592,7 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
                     int en = i % QKT_E_N;
                     int row_base, col_base;
                     if constexpr (BT_LARGE) {
-                        row_base = qkt_m_base + (lane_id >> 4) * 4;
+                        row_base = qkt_m_base + (i / QKT_E_N) * W + (lane_id >> 4) * 4;
                         col_base = qkt_n_base + en * W + (lane_id & 15);
                     } else {
                         row_base = (lane_id >> 4) * 4;
@@ -708,7 +708,7 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
                 for (int p = 0; p < 4; p++) {
                     int s, c;
                     if constexpr (BT_LARGE) {
-                        s = o_m_base + (lane_id >> 4) * 4 + p;
+                        s = o_m_base + (i / O_E_N) * W + (lane_id >> 4) * 4 + p;
                         c = o_n_base + en * W + (lane_id & 15);
                     } else {
                         s = (lane_id >> 4) * 4 + p;
