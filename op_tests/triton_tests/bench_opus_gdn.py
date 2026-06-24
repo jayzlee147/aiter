@@ -13,7 +13,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from aiter.jit.core import get_gfx
 from aiter.ops.opus_gdn_prefill import opus_gdn_prefill_fwd
+
+# Detected GPU arch → friendly label for the benchmark header
+_GFX_NAMES = {"gfx942": "MI300X", "gfx950": "MI350"}
+_GFX = get_gfx()
+_GFX_LABEL = f"{_GFX} ({_GFX_NAMES[_GFX]})" if _GFX in _GFX_NAMES else _GFX
 from aiter.ops.triton.gated_delta_net import chunk_gated_delta_rule
 from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill import (
     chunk_gated_delta_rule_fwd_h,
@@ -242,7 +248,7 @@ class TestGDNPerformance:
 def main():
     print(f"\n{'='*120}")
     print(f"  GDN Prefill Benchmark — opus (2 kernels) vs triton (5 kernels)")
-    print(f"  D=K=V={D}, bf16, gfx942 (MI300X)")
+    print(f"  D=K=V={D}, bf16, {_GFX_LABEL}")
     print(f"{'='*120}")
 
     header = (
@@ -271,7 +277,7 @@ def main():
         )
 
     print()
-    print("NOTE: Both K1 and K2 use MFMA bf16 16x16x16 on gfx942.")
+    print(f"NOTE: Both K1 and K2 use MFMA bf16 16x16x16 on {_GFX}.")
     print("      Speedup column shows triton_e2e / opus_e2e (>1 = opus faster).")
     print()
 
