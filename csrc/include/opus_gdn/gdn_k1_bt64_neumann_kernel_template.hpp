@@ -103,17 +103,19 @@ gdn_k1_neumann_kernel(gdn_k1_kargs kargs) {
                            + ((bos + chunk_start) * H + i_h) * K;
 
     {
-        constexpr int VEC = 4;
-        constexpr int K_VEC = T::K / VEC;
+        // v8bf16_t (128-bit) vectorized k load — half the VMEM load instructions
+        // of v4 (borrowed from the BT=32 kernel). K=128 contiguous per (b,t,h).
+        using v8bf16_t = __bf16 __attribute__((ext_vector_type(8)));
+        constexpr int K_VEC = T::K / 8;
         for (int i = tid; i < BT * K_VEC; i += BS) {
             int row = i / K_VEC;
-            int col = (i % K_VEC) * VEC;
+            int col8 = (i % K_VEC) * 8;
             int global_t = chunk_start + row;
-            v4bf16_t val = {};
+            v8bf16_t val{};
             if (global_t < kargs.T)
-                val = *reinterpret_cast<const v4bf16_t*>(
-                    &k_base[row * H * K + col]);
-            *reinterpret_cast<v4bf16_t*>(&s_k[row * K_STRIDE + col]) = val;
+                val = *reinterpret_cast<const v8bf16_t*>(
+                    &k_base[row * H * K + col8]);
+            *reinterpret_cast<v8bf16_t*>(&s_k[row * K_STRIDE + col8]) = val;
         }
     }
     __syncthreads();
@@ -341,14 +343,16 @@ gdn_k1_neumann_kernel(gdn_k1_kargs kargs) {
         int v_offset = iv * BK_SUB;
 
         {
-            constexpr int VEC = 4;
+            // v8 (128-bit) HBM load; transposed scaled store stays per-element.
+            using v8bf16_t = __bf16 __attribute__((ext_vector_type(8)));
+            constexpr int VEC = 8;
             constexpr int NVEC = BK_SUB / VEC;
             for (int i = tid; i < BT * NVEC; i += BS) {
                 int j  = i / NVEC;
                 int vi = (i % NVEC) * VEC;
-                v4bf16_t vals = {};
+                v8bf16_t vals{};
                 if (chunk_start + j < kargs.T)
-                    vals = *reinterpret_cast<const v4bf16_t*>(
+                    vals = *reinterpret_cast<const v8bf16_t*>(
                         &v_base[j * H * V + v_offset + vi]);
                 D_ACC beta_j = s_beta[j];
                 for (int vv = 0; vv < VEC; vv++)
@@ -381,14 +385,16 @@ gdn_k1_neumann_kernel(gdn_k1_kargs kargs) {
         int k_offset = ik * BK_SUB;
 
         {
-            constexpr int VEC = 4;
+            // v8 (128-bit) HBM load; transposed scaled store stays per-element.
+            using v8bf16_t = __bf16 __attribute__((ext_vector_type(8)));
+            constexpr int VEC = 8;
             constexpr int NVEC = BK_SUB / VEC;
             for (int i = tid; i < BT * NVEC; i += BS) {
                 int j  = i / NVEC;
                 int ki = (i % NVEC) * VEC;
-                v4bf16_t vals = {};
+                v8bf16_t vals{};
                 if (chunk_start + j < kargs.T)
-                    vals = *reinterpret_cast<const v4bf16_t*>(
+                    vals = *reinterpret_cast<const v8bf16_t*>(
                         &k_base[j * H * K + k_offset + ki]);
                 D_ACC scale_j = s_beta[j] * __expf(s_g[j]);
                 for (int vv = 0; vv < VEC; vv++)
