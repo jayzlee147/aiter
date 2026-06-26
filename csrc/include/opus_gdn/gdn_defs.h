@@ -233,6 +233,28 @@ struct gdn_k2_traits {
 };
 
 // --------------------------------------------------------------------------
+// Wavefront scan-only kernel arguments (h-state update with inter-WG sync)
+// --------------------------------------------------------------------------
+struct gdn_wf_h_kargs {
+    const void* __restrict__ ptr_k;         // [B, T, H, K]   bf16
+    const void* __restrict__ ptr_w_bar;     // [B, T, H, K]   bf16
+    const void* __restrict__ ptr_u_bar;     // [B, T, H, V]   bf16
+    const void* __restrict__ ptr_g_cumsum;  // [B, T, H]      fp32
+    const void* __restrict__ ptr_h0;        // [B, H, V, K]   fp32  (nullable)
+    void* __restrict__ ptr_h;               // [B, NT, H, K, V] bf16  h snapshots (nullable)
+    void* __restrict__ ptr_v_new;           // [B, T, H, V]   bf16  (nullable)
+    void* __restrict__ ptr_ht;              // [B, H, V, K]   fp32  final state (nullable)
+    void* __restrict__ ptr_h_pass;          // [N_flat, N_super, K, BV] fp32
+    uint32_t* __restrict__ ptr_flags;       // [N_flat * N_super] uint32
+    const void* __restrict__ ptr_q;         // [B, T, H, K]   bf16  (nullable, for fused output)
+    void* __restrict__ ptr_o;               // [B, T, H, V]   bf16  (nullable, fused output)
+    int B, T, H, K, V, NT;
+    int S;
+    int N_super;
+    float scale;
+};
+
+// --------------------------------------------------------------------------
 // Utilities
 // --------------------------------------------------------------------------
 __host__ __device__ inline int ceil_div(int a, int b) {

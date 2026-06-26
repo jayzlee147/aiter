@@ -441,6 +441,131 @@ def test_fused_sigmoid_gating_delta_rule_update(
 
 
 @pytest.mark.parametrize(
+    ("B", "T", "H", "D", "dtype"),
+    [
+        pytest.param(
+            *test,
+            id="B{}-T{}-H{}-D{}-{}".format(*test),
+        )
+        for test in [
+            (1, 1024, 4, 128, torch.bfloat16),
+            (1, 2048, 4, 128, torch.bfloat16),
+            (1, 4096, 4, 128, torch.bfloat16),
+            (1, 8192, 8, 128, torch.bfloat16),
+            (2, 2048, 4, 64, torch.bfloat16),
+            (1, 4096, 4, 128, torch.float16),
+            (1, 2048, 4, 64, torch.float16),
+        ]
+    ],
+)
+def test_chunk_parallel_scan(
+    B: int,
+    T: int,
+    H: int,
+    D: int,
+    dtype: torch.dtype,
+):
+    """Test parallel scan path against recurrent reference implementation."""
+    torch.manual_seed(42)
+
+    q = torch.rand(B, T, H, D, dtype=dtype)
+    k = torch.rand(B, T, H, D, dtype=dtype)
+    v = torch.rand(B, T, H, D, dtype=dtype)
+    beta = torch.rand(B, T, H, dtype=dtype).sigmoid()
+    g = F.logsigmoid(torch.rand(B, T, H, dtype=torch.float32))
+    h0 = torch.zeros(B, H, D, D, dtype=torch.float32)
+    q, k, v, beta, g, h0 = map(
+        lambda x: x.to(device).requires_grad_(False), (q, k, v, beta, g, h0)
+    )
+
+    tri, tri_ht = chunk_gated_delta_rule(
+        q=F.normalize(q.clone(), p=2, dim=-1),
+        k=F.normalize(k.clone(), p=2, dim=-1),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        scale=1.0,
+        initial_state=h0.clone(),
+        output_final_state=True,
+    )
+
+    ref, ref_ht = recurrent_gated_delta_rule_ref(
+        q=F.normalize(q.clone(), p=2, dim=-1),
+        k=F.normalize(k.clone(), p=2, dim=-1),
+        v=v.clone(),
+        beta=beta.clone(),
+        g=g.clone(),
+        scale=1.0,
+        output_final_state=True,
+        initial_state=h0.clone(),
+    )
+
+    assert_close("o", ref, tri, 0.005)
+    assert_close("ht", ref_ht, tri_ht, 0.005)
+
+
+@pytest.mark.parametrize(
+    "T",
+    [1024, 2048, 4096, 8192],
+    ids=lambda t: f"T{t}",
+)
+def test_parallel_vs_serial_equivalence(T: int):
+    """Force both serial and parallel paths and compare outputs directly."""
+    torch.manual_seed(42)
+    B, H, D = 1, 4, 128
+    dtype = torch.bfloat16
+
+    q = torch.rand(B, T, H, D, dtype=dtype)
+    k = torch.rand(B, T, H, D, dtype=dtype)
+    v = torch.rand(B, T, H, D, dtype=dtype)
+    beta = torch.rand(B, T, H, dtype=dtype).sigmoid()
+    g = F.logsigmoid(torch.rand(B, T, H, dtype=torch.float32))
+    h0 = torch.zeros(B, H, D, D, dtype=torch.float32)
+    q, k, v, beta, g, h0 = map(
+        lambda x: x.to(device).requires_grad_(False), (q, k, v, beta, g, h0)
+    )
+
+    from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill import chunk_delta_h
+
+    orig_threshold = chunk_delta_h.PARALLEL_NT_THRESHOLD
+
+    # Force serial path
+    chunk_delta_h.PARALLEL_NT_THRESHOLD = 999999
+    try:
+        serial_o, serial_ht = chunk_gated_delta_rule(
+            q=F.normalize(q.clone(), p=2, dim=-1),
+            k=F.normalize(k.clone(), p=2, dim=-1),
+            v=v.clone(),
+            g=g.clone(),
+            beta=beta.clone(),
+            scale=1.0,
+            initial_state=h0.clone(),
+            output_final_state=True,
+        )
+    finally:
+        chunk_delta_h.PARALLEL_NT_THRESHOLD = orig_threshold
+
+    # Force parallel path
+    chunk_delta_h.PARALLEL_NT_THRESHOLD = 1
+    try:
+        parallel_o, parallel_ht = chunk_gated_delta_rule(
+            q=F.normalize(q.clone(), p=2, dim=-1),
+            k=F.normalize(k.clone(), p=2, dim=-1),
+            v=v.clone(),
+            g=g.clone(),
+            beta=beta.clone(),
+            scale=1.0,
+            initial_state=h0.clone(),
+            output_final_state=True,
+        )
+    finally:
+        chunk_delta_h.PARALLEL_NT_THRESHOLD = orig_threshold
+
+    assert_close("o", serial_o, parallel_o, 0.002)
+    assert_close("ht", serial_ht, parallel_ht, 0.002)
+
+
+@pytest.mark.parametrize(
     ("H", "D", "mask_p", "cu_seqlens", "dtype"),
     [
         pytest.param(*test, id="H{}-D{}-mask_p{}-cu_seqlens{}-{}".format(*test))

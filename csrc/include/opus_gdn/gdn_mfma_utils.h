@@ -93,4 +93,45 @@ __device__ inline void store_fp32_tile(
     s[(row_base + mb4 + 3) * stride + col_base + n] = d[3];
 }
 
+// =========================================================================
+// MFMA 32x32x8 bf16 — 2x FLOPs per instruction vs 16x16x16
+// =========================================================================
+using v16f32_t = opus::vector_t<opus::fp32_t, 16>;
+
+__device__ inline v16f32_t mfma_f32_32x32x8_bf16(v4bf16_t a, v4bf16_t b, v16f32_t c) {
+    return opus::mfma<opus::bf16_t, opus::bf16_t, opus::fp32_t, 32, 32, 8>{}(a, b, c);
+}
+
+__device__ inline v4bf16_t load_mfma_tile_32(
+        const opus::bf16_t* __restrict__ lds, int row_base, int col_base,
+        int stride, int lane_id) {
+    int addr = (row_base + (lane_id & 31)) * stride + col_base + ((lane_id >> 5) << 2);
+    return opus::make_smem<opus::bf16_t>(const_cast<opus::bf16_t*>(lds)).template load<4>(addr);
+}
+
+template<int E_M, int E_N, int E_K>
+__device__ void tiled_gemm_mfma_32(
+        v16f32_t* __restrict__ c,
+        const opus::bf16_t* __restrict__ lds_a, int m_base, int stride_a,
+        const opus::bf16_t* __restrict__ lds_b, int n_base, int stride_b,
+        int lane_id) {
+    for (int ek = 0; ek < E_K; ek++) {
+        v4bf16_t a_tiles[E_M];
+        for (int em = 0; em < E_M; em++)
+            a_tiles[em] = load_mfma_tile_32(lds_a, m_base + em * 32, ek * 8, stride_a, lane_id);
+        v4bf16_t b_tiles[E_N];
+        for (int en = 0; en < E_N; en++)
+            b_tiles[en] = load_mfma_tile_32(lds_b, n_base + en * 32, ek * 8, stride_b, lane_id);
+        for (int em = 0; em < E_M; em++)
+            for (int en = 0; en < E_N; en++)
+                c[em * E_N + en] = mfma_f32_32x32x8_bf16(
+                    a_tiles[em], b_tiles[en], c[em * E_N + en]);
+    }
+}
+
+template<int N>
+__device__ inline void clear_v16f32(v16f32_t* c) {
+    for (int i = 0; i < N; i++) opus::clear(c[i]);
+}
+
 } // namespace gdn_mfma

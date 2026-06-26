@@ -25,6 +25,8 @@ template<typename Traits>
 __global__ void gdn_k1_bt128_kernel(gdn_k1_kargs kargs);
 template<typename Traits>
 __global__ void gdn_k2_kernel(gdn_k2_kargs kargs);
+template<typename Traits>
+__global__ void gdn_wf_h_kernel(gdn_wf_h_kargs kargs);
 
 enum class K1Algo { BASIC, NEUMANN, BT32, BT128 };
 
@@ -103,6 +105,116 @@ void launch_gdn_prefill_impl(
         gdn_k1_bt32_kernel<K1Traits><<<k1_grid, k1_block, k1_smem, stream>>>(k1args);
 
     gdn_k2_kernel<K2Traits><<<k2_grid, k2_block, k2_smem, stream>>>(k2args);
+}
+
+// =========================================================================
+// Wavefront H-scan launcher
+// =========================================================================
+template<typename K2Traits>
+void launch_gdn_wavefront_h_impl(
+    torch::Tensor k,
+    torch::Tensor w_bar,
+    torch::Tensor u_bar,
+    torch::Tensor g_cumsum,
+    torch::Tensor h_out,
+    torch::Tensor v_new_out,
+    torch::Tensor initial_state,
+    torch::Tensor final_state,
+    bool has_initial_state,
+    bool output_final_state,
+    int S,
+    torch::Tensor q,
+    torch::Tensor o,
+    float scale)
+{
+    const int B = k.size(0), T = k.size(1), H = k.size(2), K = k.size(3);
+    const int V = u_bar.size(3);
+    constexpr int BT = K2Traits::BT;
+    constexpr int BV = K2Traits::BV;
+    const int NT = T / BT;
+    const int N_super = NT / S;
+    const int N_flat = ceil_div(V, BV) * B * H;
+
+    auto opts_fp32 = torch::TensorOptions().dtype(torch::kFloat32).device(k.device());
+    auto opts_i32  = torch::TensorOptions().dtype(torch::kInt32).device(k.device());
+
+    auto h_pass = torch::zeros({N_flat, N_super, K2Traits::N_K, BV, K2Traits::BK_SUB}, opts_fp32);
+    auto flags  = torch::zeros({N_flat * N_super}, opts_i32);
+
+    gdn_wf_h_kargs args{};
+    args.ptr_k         = k.data_ptr();
+    args.ptr_w_bar     = w_bar.data_ptr();
+    args.ptr_u_bar     = u_bar.data_ptr();
+    args.ptr_g_cumsum  = g_cumsum.data_ptr();
+    args.ptr_h0        = has_initial_state ? initial_state.data_ptr() : nullptr;
+    args.ptr_h         = h_out.data_ptr();
+    args.ptr_v_new     = v_new_out.defined() ? v_new_out.data_ptr() : nullptr;
+    args.ptr_ht        = output_final_state ? final_state.data_ptr() : nullptr;
+    args.ptr_h_pass    = h_pass.template data_ptr<float>();
+    args.ptr_flags     = reinterpret_cast<uint32_t*>(flags.template data_ptr<int>());
+    args.B = B; args.T = T; args.H = H; args.K = K; args.V = V;
+    args.NT = NT; args.S = S; args.N_super = N_super;
+    args.ptr_q     = q.defined() ? q.data_ptr() : nullptr;
+    args.ptr_o     = o.defined() ? o.data_ptr() : nullptr;
+    args.scale     = scale;
+
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(at::device_of(k));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+
+    dim3 grid(N_flat, N_super);
+    dim3 block(K2Traits::BLOCK_SIZE);
+
+    constexpr int PAD = K2Traits::SMEM_PAD;
+    constexpr int STRIDE_BK = K2Traits::BK_SUB + PAD;
+    constexpr int STRIDE_BT = BT + PAD;
+    constexpr int smem_g  = BT * (int)sizeof(float);
+    constexpr int smem_vT = BV * STRIDE_BT * (int)sizeof(bf16_t);
+    constexpr int pool_bc = BT * STRIDE_BK * (int)sizeof(bf16_t);
+    constexpr int pool_d  = K2Traits::BK_SUB * STRIDE_BT * (int)sizeof(bf16_t);
+    constexpr int pool_h  = K2Traits::BK_SUB * BV * (int)sizeof(bf16_t); // h LDS staging (bf16)
+    constexpr int pool_max = (pool_bc > pool_d) ? pool_bc : pool_d;
+    constexpr int pool    = (pool_max > pool_h) ? pool_max : pool_h;
+    constexpr size_t smem = smem_g + smem_vT + pool;
+
+    gdn_wf_h_kernel<K2Traits><<<grid, block, smem, stream>>>(args);
+}
+
+void opus_gdn_wavefront_h_fwd(
+    torch::Tensor k,
+    torch::Tensor w_bar,
+    torch::Tensor u_bar,
+    torch::Tensor g_cumsum,
+    torch::Tensor h_out,
+    torch::Tensor v_new_out,
+    torch::Tensor initial_state,
+    torch::Tensor final_state,
+    bool has_initial_state,
+    bool output_final_state,
+    int S,
+    int BT,
+    torch::Tensor q,
+    torch::Tensor o,
+    float scale)
+{
+    TORCH_CHECK(k.dim() == 4, "k must be 4D [B, T, H, K]");
+    TORCH_CHECK(k.size(3) == 128, "K must be 128");
+    TORCH_CHECK(u_bar.size(3) == 128, "V must be 128");
+    TORCH_CHECK(k.scalar_type() == at::ScalarType::BFloat16, "k must be bf16");
+    TORCH_CHECK(k.size(1) % BT == 0, "T must be a multiple of BT");
+    TORCH_CHECK((k.size(1) / BT) % S == 0, "NT must be a multiple of S");
+    TORCH_CHECK(BT == 64 || BT == 128, "BT must be 64 or 128");
+
+    if (BT == 128) {
+        launch_gdn_wavefront_h_impl<gdn_k2_traits<128, 128, 128, 64, 4>>(
+            k, w_bar, u_bar, g_cumsum, h_out, v_new_out,
+            initial_state, final_state, has_initial_state, output_final_state, S,
+            q, o, scale);
+    } else {
+        launch_gdn_wavefront_h_impl<gdn_k2_traits<64, 128, 128, 64, 4>>(
+            k, w_bar, u_bar, g_cumsum, h_out, v_new_out,
+            initial_state, final_state, has_initial_state, output_final_state, S,
+            q, o, scale);
+    }
 }
 
 void opus_gdn_prefill_fwd(

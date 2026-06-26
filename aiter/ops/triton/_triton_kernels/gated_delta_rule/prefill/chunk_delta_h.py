@@ -583,6 +583,350 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
             tl.store(p_dh3, b_dh4.to(p_dh3.dtype.element_ty), boundary_check=(0, 1))
 
 
+# ============================================================================
+# Parallel scan v2: 3-kernel, S=8, no iterations
+# ============================================================================
+
+PARALLEL_S = 8
+PARALLEL_NT_THRESHOLD = 16
+
+
+@triton.heuristics(
+    {
+        "SAVE_NEW_VALUE": lambda args: args["v_new"] is not None,
+        "STORE_H": lambda args: args["h"] is not None,
+        "STORE_D_SUPER": lambda args: args["d_super"] is not None,
+        "USE_H_PREFIX": lambda args: args["h_prefix"] is not None,
+    }
+)
+@triton.jit(do_not_specialize=["T"])
+def parallel_scan_v2_kernel(
+    k,
+    v,
+    w,
+    v_new,
+    g,
+    h,
+    d_super,
+    h_prefix,
+    T,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BV: tl.constexpr,
+    S: tl.constexpr,
+    SAVE_NEW_VALUE: tl.constexpr,
+    STORE_H: tl.constexpr,
+    STORE_D_SUPER: tl.constexpr,
+    USE_H_PREFIX: tl.constexpr,
+):
+    """Parallel scan v2 kernel with two modes controlled by heuristic flags:
+    STORE_D_SUPER=True, STORE_H=False (Phase 1): init=0, compute d_super only
+    STORE_H=True, USE_H_PREFIX=True (Phase 3): init=h_prefix, store h/v_new
+    """
+    i_v, i_super, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_n, i_h = i_nh // H, i_nh % H
+    bos = i_n * T
+
+    b_h1 = tl.zeros([64, BV], dtype=tl.float32)
+    if K > 64:
+        b_h2 = tl.zeros([64, BV], dtype=tl.float32)
+    if K > 128:
+        b_h3 = tl.zeros([64, BV], dtype=tl.float32)
+    if K > 192:
+        b_h4 = tl.zeros([64, BV], dtype=tl.float32)
+
+    NT = tl.cdiv(T, BT)
+    N_super = NT // S
+    t_start = i_super * S
+
+    v_base = v + ((bos * H + i_h) * V).to(tl.int64)
+    k_base = k + ((bos * H + i_h) * K).to(tl.int64)
+    w_base = w + ((bos * H + i_h) * K).to(tl.int64)
+    stride_v = H * V
+    stride_k = H * K
+
+    if STORE_H:
+        h_base = h + ((i_n * NT * H + i_h) * K * V).to(tl.int64)
+        stride_h = H * K * V
+    if SAVE_NEW_VALUE:
+        vn_base = v_new + ((bos * H + i_h) * V).to(tl.int64)
+
+    if USE_H_PREFIX:
+        hp_base = h_prefix + ((i_n * N_super * H + i_h) * K * V).to(tl.int64)
+        hp_off = i_super * H * K * V
+        p_hp1 = tl.make_block_ptr(
+            hp_base + hp_off, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0)
+        )
+        b_h1 += tl.load(p_hp1, boundary_check=(0, 1)).to(tl.float32)
+        if K > 64:
+            p_hp2 = tl.make_block_ptr(
+                hp_base + hp_off, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0)
+            )
+            b_h2 += tl.load(p_hp2, boundary_check=(0, 1)).to(tl.float32)
+        if K > 128:
+            p_hp3 = tl.make_block_ptr(
+                hp_base + hp_off, (K, V), (V, 1), (128, i_v * BV), (64, BV), (1, 0)
+            )
+            b_h3 += tl.load(p_hp3, boundary_check=(0, 1)).to(tl.float32)
+        if K > 192:
+            p_hp4 = tl.make_block_ptr(
+                hp_base + hp_off, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0)
+            )
+            b_h4 += tl.load(p_hp4, boundary_check=(0, 1)).to(tl.float32)
+
+    for i_s in range(S):
+        i_t = t_start + i_s
+
+        if STORE_H:
+            p_h1 = tl.make_block_ptr(
+                h_base + i_t * stride_h, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0)
+            )
+            tl.store(p_h1, b_h1.to(p_h1.dtype.element_ty), boundary_check=(0, 1))
+            if K > 64:
+                p_h2 = tl.make_block_ptr(
+                    h_base + i_t * stride_h, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0)
+                )
+                tl.store(p_h2, b_h2.to(p_h2.dtype.element_ty), boundary_check=(0, 1))
+            if K > 128:
+                p_h3 = tl.make_block_ptr(
+                    h_base + i_t * stride_h, (K, V), (V, 1), (128, i_v * BV), (64, BV), (1, 0)
+                )
+                tl.store(p_h3, b_h3.to(p_h3.dtype.element_ty), boundary_check=(0, 1))
+            if K > 192:
+                p_h4 = tl.make_block_ptr(
+                    h_base + i_t * stride_h, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0)
+                )
+                tl.store(p_h4, b_h4.to(p_h4.dtype.element_ty), boundary_check=(0, 1))
+
+        # b_v = w @ h (state-dependent correction)
+        p_w = tl.make_block_ptr(
+            w_base, (T, K), (stride_k, 1), (i_t * BT, 0), (BT, 64), (1, 0)
+        )
+        b_w = tl.load(p_w, boundary_check=(0, 1))
+        b_v = tl.dot(b_w, b_h1.to(b_w.dtype))
+        if K > 64:
+            p_w = tl.make_block_ptr(
+                w_base, (T, K), (stride_k, 1), (i_t * BT, 64), (BT, 64), (1, 0)
+            )
+            b_w = tl.load(p_w, boundary_check=(0, 1))
+            b_v += tl.dot(b_w, b_h2.to(b_w.dtype))
+        if K > 128:
+            p_w = tl.make_block_ptr(
+                w_base, (T, K), (stride_k, 1), (i_t * BT, 128), (BT, 64), (1, 0)
+            )
+            b_w = tl.load(p_w, boundary_check=(0, 1))
+            b_v += tl.dot(b_w, b_h3.to(b_w.dtype))
+        if K > 192:
+            p_w = tl.make_block_ptr(
+                w_base, (T, K), (stride_k, 1), (i_t * BT, 192), (BT, 64), (1, 0)
+            )
+            b_w = tl.load(p_w, boundary_check=(0, 1))
+            b_v += tl.dot(b_w, b_h4.to(b_w.dtype))
+
+        p_v = tl.make_block_ptr(
+            v_base, (T, V), (stride_v, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+        )
+        b_v = tl.load(p_v, boundary_check=(0, 1)) - b_v
+
+        if SAVE_NEW_VALUE:
+            p_vn = tl.make_block_ptr(
+                vn_base, (T, V), (stride_v, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+            )
+            tl.store(p_vn, b_v.to(p_vn.dtype.element_ty), boundary_check=(0, 1))
+
+        last_idx = min((t_start + i_s + 1) * BT, T) - 1
+        m_t = (i_t * BT + tl.arange(0, BT)) < T
+        b_g_last = tl.load(g + bos * H + last_idx * H + i_h)
+        p_g = tl.make_block_ptr(
+            g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
+        )
+        b_g = tl.load(p_g, boundary_check=(0,))
+        b_v = b_v * tl.where(m_t, exp(b_g_last - b_g), 0)[:, None]
+        b_g_last_exp = exp(b_g_last)
+        b_h1 *= b_g_last_exp
+        if K > 64:
+            b_h2 *= b_g_last_exp
+        if K > 128:
+            b_h3 *= b_g_last_exp
+        if K > 192:
+            b_h4 *= b_g_last_exp
+
+        b_v = b_v.to(k.dtype.element_ty)
+
+        p_k = tl.make_block_ptr(
+            k_base, (K, T), (1, stride_k), (0, i_t * BT), (64, BT), (0, 1)
+        )
+        b_k = tl.load(p_k, boundary_check=(0, 1))
+        b_h1 += tl.dot(b_k, b_v)
+        if K > 64:
+            p_k = tl.make_block_ptr(
+                k_base, (K, T), (1, stride_k), (64, i_t * BT), (64, BT), (0, 1)
+            )
+            b_k = tl.load(p_k, boundary_check=(0, 1))
+            b_h2 += tl.dot(b_k, b_v)
+        if K > 128:
+            p_k = tl.make_block_ptr(
+                k_base, (K, T), (1, stride_k), (128, i_t * BT), (64, BT), (0, 1)
+            )
+            b_k = tl.load(p_k, boundary_check=(0, 1))
+            b_h3 += tl.dot(b_k, b_v)
+        if K > 192:
+            p_k = tl.make_block_ptr(
+                k_base, (K, T), (1, stride_k), (192, i_t * BT), (64, BT), (0, 1)
+            )
+            b_k = tl.load(p_k, boundary_check=(0, 1))
+            b_h4 += tl.dot(b_k, b_v)
+
+    # epilogue: write d_super (Phase 1 only)
+    if STORE_D_SUPER:
+        ds_base = d_super + ((i_n * N_super * H + i_h) * K * V).to(tl.int64)
+        ds_off = i_super * H * K * V
+
+        p_ds1 = tl.make_block_ptr(
+            ds_base + ds_off, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0)
+        )
+        tl.store(p_ds1, b_h1.to(p_ds1.dtype.element_ty), boundary_check=(0, 1))
+        if K > 64:
+            p_ds2 = tl.make_block_ptr(
+                ds_base + ds_off, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0)
+            )
+            tl.store(p_ds2, b_h2.to(p_ds2.dtype.element_ty), boundary_check=(0, 1))
+        if K > 128:
+            p_ds3 = tl.make_block_ptr(
+                ds_base + ds_off, (K, V), (V, 1), (128, i_v * BV), (64, BV), (1, 0)
+            )
+            tl.store(p_ds3, b_h3.to(p_ds3.dtype.element_ty), boundary_check=(0, 1))
+        if K > 192:
+            p_ds4 = tl.make_block_ptr(
+                ds_base + ds_off, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0)
+            )
+            tl.store(p_ds4, b_h4.to(p_ds4.dtype.element_ty), boundary_check=(0, 1))
+
+
+@triton.heuristics(
+    {
+        "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
+        "STORE_FINAL_STATE": lambda args: args["ht"] is not None,
+    }
+)
+@triton.autotune(
+    configs=[
+        triton.Config({"BKV": BKV}, num_warps=num_warps)
+        for BKV in [32, 64, 128]
+        for num_warps in [2, 4, 8]
+    ],
+    key=["H", "K", "V"],
+    use_cuda_graph=USE_CUDA_GRAPH,
+    **autotune_cache_kwargs,
+)
+@triton.jit(do_not_specialize=["T"])
+def scalar_gated_prefix_scan_kernel(
+    d_super,
+    g,
+    h_prefix,
+    h0,
+    ht,
+    T,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    S: tl.constexpr,
+    N_super: tl.constexpr,
+    BKV: tl.constexpr,
+    USE_INITIAL_STATE: tl.constexpr,
+    STORE_FINAL_STATE: tl.constexpr,
+):
+    i_kv, i_nh = tl.program_id(0), tl.program_id(1)
+    i_n, i_h = i_nh // H, i_nh % H
+    bos = i_n * T
+
+    offs = tl.arange(0, BKV)
+    total_kv = K * V
+    kv_idx = i_kv * BKV + offs
+    i_k = kv_idx // V
+    i_v_elem = kv_idx % V
+    mask = kv_idx < total_kv
+
+    h0_base = h0 + i_nh * K * V if USE_INITIAL_STATE else None
+    b_h_acc = tl.zeros([BKV], dtype=tl.float32)
+    if USE_INITIAL_STATE:
+        b_h_acc = tl.load(h0_base + kv_idx, mask=mask, other=0.0).to(tl.float32)
+
+    ds_base = d_super + (i_n * N_super * H + i_h) * K * V
+    hp_base = h_prefix + (i_n * N_super * H + i_h) * K * V
+    stride_super = H * K * V
+
+    for i_s in range(N_super):
+        tl.store(hp_base + i_s * stride_super + kv_idx, b_h_acc, mask=mask)
+
+        b_alpha = 0.0
+        for j in range(S):
+            chunk_idx = i_s * S + j
+            last_t = min((chunk_idx + 1) * BT, T) - 1
+            b_alpha += tl.load(g + bos * H + last_t * H + i_h)
+
+        b_alpha_exp = exp(b_alpha)
+
+        b_d = tl.load(ds_base + i_s * stride_super + kv_idx, mask=mask, other=0.0)
+        b_h_acc = b_alpha_exp * b_h_acc + b_d
+
+    if STORE_FINAL_STATE:
+        ht_base = ht + i_nh * K * V
+        tl.store(ht_base + kv_idx, b_h_acc, mask=mask)
+
+
+def _parallel_scan_v2_fwd_h(
+    k, w, u, g, initial_state, output_final_state,
+    BT, save_new_value, B, T, H, K, V, N, NT,
+):
+    S = PARALLEL_S
+    N_super = NT // S
+
+    h = k.new_empty(B, NT, H, K, V)
+    v_new = torch.empty_like(u) if save_new_value else None
+    final_state = (
+        k.new_empty(N, H, K, V, dtype=torch.float32) if output_final_state else None
+    )
+
+    d_super = torch.empty(B, N_super, H, K, V, dtype=torch.float32, device=k.device)
+    h_prefix = torch.empty(B, N_super, H, K, V, dtype=torch.float32, device=k.device)
+
+    BV = 64
+    grid_scan = (triton.cdiv(V, BV), N_super, N * H)
+
+    # Phase 1: local scan with init=0, output d_super only (no h/v_new)
+    parallel_scan_v2_kernel[grid_scan](
+        k=k, v=u, w=w, v_new=None, g=g,
+        h=None, d_super=d_super, h_prefix=None,
+        T=T, H=H, K=K, V=V, BT=BT, BV=BV, S=S,
+        num_warps=4, num_stages=2,
+    )
+
+    def grid_prefix(meta):
+        return (triton.cdiv(K * V, meta["BKV"]), N * H)
+
+    # Phase 2: scalar prefix scan over super-chunks
+    scalar_gated_prefix_scan_kernel[grid_prefix](
+        d_super=d_super, g=g, h_prefix=h_prefix,
+        h0=initial_state,
+        ht=final_state,
+        T=T, H=H, K=K, V=V, BT=BT, S=S, N_super=N_super,
+    )
+
+    # Phase 3: full scan with correct h_prefix
+    parallel_scan_v2_kernel[grid_scan](
+        k=k, v=u, w=w, v_new=v_new, g=g,
+        h=h, d_super=None, h_prefix=h_prefix,
+        T=T, H=H, K=K, V=V, BT=BT, BV=BV, S=S,
+        num_warps=4, num_stages=2,
+    )
+
+    return h, v_new, final_state
+
+
 def chunk_gated_delta_rule_fwd_h(
     k: torch.Tensor,
     w: torch.Tensor,
@@ -611,6 +955,21 @@ def chunk_gated_delta_rule_fwd_h(
             prepare_chunk_offsets(cu_seqlens, BT),
         )
     assert K <= 256, "current kernel does not support head dimension larger than 256."
+
+    S = PARALLEL_S
+    use_parallel = (
+        cu_seqlens is None
+        and gk is None
+        and g is not None
+        and NT >= PARALLEL_NT_THRESHOLD
+        and NT % S == 0
+    )
+
+    if use_parallel:
+        return _parallel_scan_v2_fwd_h(
+            k, w, u, g, initial_state, output_final_state,
+            BT, save_new_value, B, T, H, K, V, N, NT,
+        )
 
     h = k.new_empty(B, NT, H, K, V)
     final_state = (
