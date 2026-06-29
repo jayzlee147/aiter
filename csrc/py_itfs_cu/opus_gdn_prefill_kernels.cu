@@ -15,6 +15,20 @@
 
 #include "opus_gdn/gdn_defs.h"
 #include "opus_gdn/ref_fwd_h.hpp"   // reference FLA fwd_h (BV=16/32/64, beats triton)
+#include <cstring>
+
+// gfx950 (MI350) uses the neumann LDS C_inv path (OCC=2); gfx942 (MI300) uses
+// the register-cached path (OCC=3). Host can't see __gfx950__, so detect at
+// runtime (the JIT build is per-machine, so device arch == runtime arch).
+static inline bool gdn_is_gfx950() {
+    static int cached = -1;
+    if (cached < 0) {
+        hipDeviceProp_t p;
+        cached = (hipGetDeviceProperties(&p, 0) == hipSuccess &&
+                  std::strstr(p.gcnArchName, "gfx950") != nullptr) ? 1 : 0;
+    }
+    return cached != 0;
+}
 
 // Forward declarations — definitions live in separate TUs to avoid ODR conflicts
 template<typename Traits>
@@ -111,7 +125,8 @@ void launch_gdn_prefill_impl(
     if constexpr (algo == K1Algo::BASIC)
         gdn_k1_kernel<K1Traits><<<k1_grid, k1_block, k1_smem, stream>>>(k1args);
     else if constexpr (algo == K1Algo::NEUMANN)
-        gdn_k1_neumann_kernel<K1Traits><<<k1_grid, k1_block, k1_smem, stream>>>(k1args);
+        gdn_k1_neumann_kernel<K1Traits><<<k1_grid, k1_block,
+            gdn_is_gfx950() ? K1Traits::smem_size_bytes_cinv_lds() : k1_smem, stream>>>(k1args);
     else if constexpr (algo == K1Algo::BT128)
         gdn_k1_bt128_kernel<K1Traits><<<k1_grid, k1_block, k1_smem, stream>>>(k1args);
     else
