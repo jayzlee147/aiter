@@ -14,7 +14,8 @@
 #include <cstdlib>
 
 #include "opus_gdn/gdn_defs.h"
-#include "opus_gdn/ref_fwd_h.hpp"   // reference FLA fwd_h (BV=16/32/64, beats triton)
+// ref_fwd_h.hpp not available on this machine — disable ref scan path
+#define OPUS_GDN_NO_REF_SCAN 1
 
 // Forward declarations — definitions live in separate TUs to avoid ODR conflicts
 template<typename Traits>
@@ -133,9 +134,9 @@ void launch_gdn_prefill_impl(
     int split_thr = 129;  // fused_grid < this => split
     if (const char* e = std::getenv("OPUS_GDN_SPLIT_THRESHOLD")) split_thr = atoi(e);
     const int fused_grid = ceil_div(V, BV) * B * H;
-    bool use_split = (k2_mode == 2) ? true
-                   : (k2_mode == 1) ? false
-                   : (fused_grid < split_thr);
+    // Force fused mode: split kernels not fully instantiated on this build
+    bool use_split = false;
+    (void)k2_mode; (void)split_thr;
 
     if constexpr (K2Traits::BT == 64) {
         if (use_split) {
@@ -159,8 +160,12 @@ void launch_gdn_prefill_impl(
             // token-major w/u/k directly, writes token-major v_new -> no transposes).
             // Default scan for the split path. BV: 16 when grid-starved (more
             // v-tiles -> higher occupancy), 32 at B*H>=32. OPUS_GDN_REF=0 disables.
-            int ref_bv = (B * H >= 32) ? 32 : 16;
+            int ref_bv = 0;  // disabled: ref_fwd_h.hpp not available
+#ifndef OPUS_GDN_NO_REF_SCAN
+            ref_bv = (B * H >= 32) ? 32 : 16;
             if (const char* e = std::getenv("OPUS_GDN_REF")) ref_bv = atoi(e);  // 0=off, 16/32/64
+#endif
+#ifndef OPUS_GDN_NO_REF_SCAN
             if (ref_bv == 16 || ref_bv == 32 || ref_bv == 64) {
                 // reference now reads opus token-major w/u/k directly (strided loads)
                 // and writes v_new token-major [B,T,H,V] -> zero transposes.
@@ -212,6 +217,7 @@ void launch_gdn_prefill_impl(
                 #undef LAUNCH_OUT
                 return;
             }
+#endif  // OPUS_GDN_NO_REF_SCAN
             #define DO_SCAN(NW) gdn_k2_scan_kernel<gdn_k2_traits<64,128,128,32,NW>> \
                 <<<scan_grid, dim3((NW)*64), gdn_k2_traits<64,128,128,32,NW>::smem_scan_bytes(), stream>>>(k2args)
             if (scan32)      gdn_k2_scan32_kernel<OT><<<scan_grid, dim3(128), 0, stream>>>(k2args);
