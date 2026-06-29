@@ -262,6 +262,32 @@ struct gdn_k2_traits {
         if (pool_eav > pool) pool = pool_eav;
         return smem_g_bytes + smem_vT_bytes + smem_q_bytes + pool;
     }
+
+    // LDS for the split-path scan kernel (gdn_k2_scan_kernel):
+    //   s_g[BT] + s_vT[BV,STRIDE_BT] + pool
+    //   pool = max( s_hT[BV,STRIDE_BK] + s_sub_w[BT,STRIDE_BK],  s_kT[BK_SUB,STRIDE_BT] )
+    static constexpr size_t smem_scan_bytes() {
+        constexpr int P = SMEM_PAD;
+        constexpr int A = (int)sizeof(D_ATTN);
+        int pool_bc = (BV + BT) * (BK_SUB + P);
+        int pool_d  = BK_SUB * (BT + P);
+        int pool = (pool_bc > pool_d) ? pool_bc : pool_d;
+        return BT * (int)sizeof(D_ACC) + (BV * (BT + P) + pool) * A;
+    }
+
+    // LDS for the split-path output kernel (gdn_k2_out_kernel):
+    //   s_g[BT] + s_q[N_K,BT,STRIDE_BK] + s_kh[max(BV,BT),STRIDE_BK]
+    //          + s_vT[BV,STRIDE_BT] + s_A5[BT,STRIDE_BT]
+    static constexpr size_t smem_out_bytes() {
+        constexpr int P = SMEM_PAD;
+        constexpr int A = (int)sizeof(D_ATTN);
+        constexpr int MX = (BV > BT) ? BV : BT;
+        return BT * (int)sizeof(D_ACC)
+             + (N_K_ * BT * (BK_SUB + P)
+              + MX * (BK_SUB + P)
+              + BV * (BT + P)
+              + BT * (BT + P)) * A;
+    }
 };
 
 // --------------------------------------------------------------------------

@@ -73,26 +73,30 @@ gdn_k1_neumann_kernel(gdn_k1_kargs kargs) {
     const D_ACC* beta_base = reinterpret_cast<const D_ACC*>(kargs.ptr_beta)
                              + (bos + chunk_start) * H + i_h;
 
+    // Load beta (no scan needed).
     for (int i = tid; i < BT; i += BS) {
         int global_t = chunk_start + i;
-        if (global_t < kargs.T) {
-            s_g[i]    = g_base[i * H];
-            s_beta[i] = beta_base[i * H];
-        } else {
-            s_g[i]    = 0.0f;
-            s_beta[i] = 0.0f;
+        s_beta[i] = (global_t < kargs.T) ? beta_base[i * H] : 0.0f;
+    }
+
+    // Inclusive prefix sum of g in a SINGLE warp via __shfl_up (BT == WARP_SIZE
+    // = 64): warp-lockstep register exchange — no LDS round-trip, no
+    // __syncthreads. Replaces the block Hillis-Steele's log2(BT)=6 barriers with
+    // one (the publish below). Bit-identical: same stride-doubling order, just
+    // registers instead of LDS. K1 is barrier/latency-bound on gfx950, so this
+    // removes ~6 of its runtime barriers.
+    static_assert(BT == T::WARP_SIZE, "single-warp scan requires BT == WARP_SIZE");
+    if (warp_id == 0) {
+        int global_t = chunk_start + lane_id;
+        float val = (global_t < kargs.T) ? g_base[lane_id * H] : 0.0f;
+        #pragma unroll
+        for (int off = 1; off < BT; off <<= 1) {
+            float up = __shfl_up(val, off, BT);
+            if (lane_id >= off) val += up;
         }
+        s_g[lane_id] = val;
     }
     __syncthreads();
-
-    // Prefix sum (Hillis-Steele)
-    for (int stride = 1; stride < BT; stride <<= 1) {
-        for (int i = tid; i < BT; i += BS) {
-            if (i >= stride)
-                s_g[i] += s_g[i - stride];
-        }
-        __syncthreads();
-    }
 
     // Write g_cumsum to HBM
     D_ACC* g_cumsum_base = reinterpret_cast<D_ACC*>(kargs.ptr_g_cumsum)
