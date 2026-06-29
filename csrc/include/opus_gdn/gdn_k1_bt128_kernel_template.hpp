@@ -487,4 +487,12 @@ gdn_k1_bt128_kernel(gdn_k1_kargs kargs) {
         }
         __syncthreads();
     }
+
+    if (kargs.ptr_k1_done) {
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+        __syncthreads();
+        if (tid == 0)
+            __atomic_store_n(kargs.ptr_k1_done + i_t * (kargs.B * kargs.H) + i_bh,
+                             1u, __ATOMIC_RELAXED);
+    }
 }

@@ -9,7 +9,7 @@
 #include "opus_gdn/gdn_mfma_utils.h"
 
 template<typename Traits>
-__global__ void __launch_bounds__(Traits::BLOCK_SIZE, 2)
+__global__ void __launch_bounds__(Traits::BLOCK_SIZE, 3)
 gdn_k1_neumann_kernel(gdn_k1_kargs kargs) {
     using namespace gdn_mfma;
     using T = Traits;
@@ -310,23 +310,16 @@ gdn_k1_neumann_kernel(gdn_k1_kargs kargs) {
     // Step 2: For each subtile, load pre-scaled v/k transposed → MFMA
     // =====================================================================
 
-    // Convert C_inv to bf16 with padding, placed AFTER s_A
-    constexpr int C_STRIDE = BT + PAD;  // 68
-    D_ATTN* s_C_bf16 = reinterpret_cast<D_ATTN*>(
-        smem_buf + BT * 2 * sizeof(D_ACC) + BT * A_STRIDE * sizeof(D_ACC));
-
-    for (int i = tid; i < BT * BT; i += BS) {
-        int s = i / BT;
-        int j = i % BT;
-        s_C_bf16[s * C_STRIDE + j] = static_cast<D_ATTN>(s_A[s * A_STRIDE + j]);
-    }
-    __syncthreads();
+    // Cache C_inv tiles in registers (eliminates s_C_bf16 from LDS → OCC=3)
+    constexpr int WY_EK_C = BT / 16;  // 4
+    v4bf16_t cached_C[WY_EK_C];
+    for (int ek = 0; ek < WY_EK_C; ek++)
+        cached_C[ek] = load_fp32_tile(s_A, warp_id * 16, ek * 16, A_STRIDE, lane_id);
 
     // s_A region freed — reuse for v_scaled_T / k_scaled_T
     constexpr int VT_STRIDE = BT + PAD;  // 68
     D_ATTN* s_vT = s_k;
 
-    constexpr int WY_EM = 1;
     constexpr int WY_EN = BK_SUB / 16;   // 4
     constexpr int WY_EK = BT / 16;       // 4
 
@@ -362,11 +355,15 @@ gdn_k1_neumann_kernel(gdn_k1_kargs kargs) {
         }
         __syncthreads();
 
-        v4f32_t wy_c[WY_EM * WY_EN];
-        clear_v4f32<WY_EM * WY_EN>(wy_c);
-        tiled_gemm_mfma<WY_EM, WY_EN, WY_EK>(
-            wy_c, s_C_bf16, warp_id * 16, C_STRIDE,
-                  s_vT,     0,             VT_STRIDE, lane_id);
+        v4f32_t wy_c[WY_EN];
+        clear_v4f32<WY_EN>(wy_c);
+        for (int ek = 0; ek < WY_EK; ek++) {
+            v4bf16_t b_tiles[WY_EN];
+            for (int en = 0; en < WY_EN; en++)
+                b_tiles[en] = load_mfma_tile(s_vT, en * 16, ek * 16, VT_STRIDE, lane_id);
+            for (int en = 0; en < WY_EN; en++)
+                wy_c[en] = mfma_f32_16x16x16_bf16(cached_C[ek], b_tiles[en], wy_c[en]);
+        }
 
         for (int en = 0; en < WY_EN; en++) {
             for (int p = 0; p < 4; p++) {
@@ -404,11 +401,15 @@ gdn_k1_neumann_kernel(gdn_k1_kargs kargs) {
         }
         __syncthreads();
 
-        v4f32_t wy_c[WY_EM * WY_EN];
-        clear_v4f32<WY_EM * WY_EN>(wy_c);
-        tiled_gemm_mfma<WY_EM, WY_EN, WY_EK>(
-            wy_c, s_C_bf16, warp_id * 16, C_STRIDE,
-                  s_vT,     0,             VT_STRIDE, lane_id);
+        v4f32_t wy_c[WY_EN];
+        clear_v4f32<WY_EN>(wy_c);
+        for (int ek = 0; ek < WY_EK; ek++) {
+            v4bf16_t b_tiles[WY_EN];
+            for (int en = 0; en < WY_EN; en++)
+                b_tiles[en] = load_mfma_tile(s_vT, en * 16, ek * 16, VT_STRIDE, lane_id);
+            for (int en = 0; en < WY_EN; en++)
+                wy_c[en] = mfma_f32_16x16x16_bf16(cached_C[ek], b_tiles[en], wy_c[en]);
+        }
 
         for (int en = 0; en < WY_EN; en++) {
             for (int p = 0; p < 4; p++) {
@@ -420,5 +421,13 @@ gdn_k1_neumann_kernel(gdn_k1_kargs kargs) {
             }
         }
         __syncthreads();
+    }
+
+    if (kargs.ptr_k1_done) {
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+        __syncthreads();
+        if (tid == 0)
+            __atomic_store_n(kargs.ptr_k1_done + i_t * (kargs.B * kargs.H) + i_bh,
+                             1u, __ATOMIC_RELAXED);
     }
 }

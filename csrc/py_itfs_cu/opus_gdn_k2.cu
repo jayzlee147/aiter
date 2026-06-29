@@ -9,6 +9,17 @@ template<typename Traits> __global__ void gdn_k2_kernel(gdn_k2_kargs kargs) {}
 template __global__ void gdn_k2_kernel<gdn_k2_traits<64, 128, 128, 64, 4>>(gdn_k2_kargs);
 template __global__ void gdn_k2_kernel<gdn_k2_traits<64, 128, 128, 32, 4>>(gdn_k2_kargs);
 template __global__ void gdn_k2_kernel<gdn_k2_traits<64, 128, 128, 64, 8>>(gdn_k2_kargs);
+// OCC=2 variant: separate function with forced VGPR limit
+using K2_OCC2_Traits = gdn_k2_traits<64, 128, 128, 64, 8, 2>;
+#ifdef __HIP_DEVICE_COMPILE__
+__global__ void __launch_bounds__(512, 2)
+__attribute__((amdgpu_waves_per_eu(4, 4)))
+gdn_k2_kernel_occ2(gdn_k2_kargs kargs) {
+    gdn_k2_kernel_impl<K2_OCC2_Traits>(kargs);
+}
+#else
+__global__ void gdn_k2_kernel_occ2(gdn_k2_kargs kargs) {}
+#endif
 template __global__ void gdn_k2_kernel<gdn_k2_traits<64, 128, 128, 32, 8>>(gdn_k2_kargs);
 template __global__ void gdn_k2_kernel<gdn_k2_traits<32, 128, 128, 64, 4>>(gdn_k2_kargs);
 template __global__ void gdn_k2_kernel<gdn_k2_traits<16, 128, 128, 64, 4>>(gdn_k2_kargs);

@@ -14,8 +14,7 @@
 #include "opus_gdn/gdn_mfma_utils.h"
 
 template<typename Traits>
-__global__ void __launch_bounds__(Traits::BLOCK_SIZE, Traits::OCC_HINT)
-gdn_k2_kernel(gdn_k2_kargs kargs) {
+__device__ void gdn_k2_kernel_impl(gdn_k2_kargs kargs) {
     using namespace gdn_mfma;
     using T = Traits;
     using D_ATTN = typename T::D_ATTN;
@@ -146,10 +145,12 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
 
     D_ACC*   s_g   = reinterpret_cast<D_ACC*>(smem_buf);
     D_ATTN*  s_v_T = reinterpret_cast<D_ATTN*>(smem_buf + T::smem_g_bytes);
-    // Persistent q (all N_K subtiles) — written once in phase b/c, reused in
-    // phase e to avoid a second HBM read of q. Layout: subtile bk at
-    // s_q + bk*BT*STRIDE_BK, each [BT, STRIDE_BK].
-    D_ATTN*  s_q   = reinterpret_cast<D_ATTN*>(smem_buf + T::smem_g_bytes + T::smem_vT_bytes);
+    constexpr bool PQ = T::PERSISTENT_Q;
+    // When PERSISTENT_Q: s_q holds all N_K subtiles across phases b/c→e.
+    // When !PERSISTENT_Q: s_q is unused; q goes into the pool each phase.
+    [[maybe_unused]] D_ATTN* s_q = PQ
+        ? reinterpret_cast<D_ATTN*>(smem_buf + T::smem_g_bytes + T::smem_vT_bytes)
+        : nullptr;
     D_ATTN*  s_pool = reinterpret_cast<D_ATTN*>(
                          smem_buf + T::smem_g_bytes + T::smem_vT_bytes + T::smem_q_bytes);
 
@@ -272,6 +273,7 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
         clear_v4f32<C_ELEMS>(r_o_cross);
 
         D_ATTN* s_h_T = s_pool;                     // [BV, STRIDE_BK]
+        constexpr bool SBC = T::SERIALIZE_BC;
 
         for (int bk = 0; bk < N_K; bk++) {
             v4f32_t* h_cur = (bk == 0) ? h1 : h2;
@@ -282,17 +284,21 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
                 int col_T = h_m_base + (lane_id >> 4) * 4;
                 v4bf16_t val;
                 for (int p = 0; p < 4; p++)
-                    val[p] = static_cast<D_ATTN>(h_cur[en][p]);
+                    val[p] = fast_f32_to_bf16(h_cur[en][p]);
                 *reinterpret_cast<v4bf16_t*>(&s_h_T[row_T * STRIDE_BK + col_T]) = val;
             }
 
-            // Install prefetched w → s_sub_w (transient) and q → s_q[bk]
-            // (persistent for the whole chunk). Separate buffers so retrieve and
-            // cross GEMMs need no barrier between them (4→2 barriers/bk), and the
-            // persistent q is reused in phase e instead of re-reading from HBM.
+            // SERIALIZE_BC: w and q share one sub buffer; do retrieve then cross.
+            // Otherwise: w and q in separate buffers; shared_b GEMM does both.
             D_ATTN* s_sub_w = s_pool + BV * STRIDE_BK;
-            D_ATTN* s_q_bk  = s_q + bk * BT * STRIDE_BK;
+            [[maybe_unused]] D_ATTN* s_q_bk;
+            if constexpr (PQ) {
+                s_q_bk = s_q + bk * BT * STRIDE_BK;
+            } else if constexpr (!SBC) {
+                s_q_bk = s_pool + BV * STRIDE_BK + BT * STRIDE_BK;
+            }
 
+            // Install w → s_sub_w (and q → s_q_bk if not serialized)
             #pragma unroll
             for (int li = 0; li < PF_LOADS; li++) {
                 int i = tid + li * BS;
@@ -300,12 +306,13 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
                     int row = i / PF_NVEC;
                     int col = (i % PF_NVEC) * PF_VEC;
                     *reinterpret_cast<v4bf16_t*>(&s_sub_w[row * STRIDE_BK + col]) = pf_w[li];
-                    *reinterpret_cast<v4bf16_t*>(&s_q_bk[row * STRIDE_BK + col]) = pf_q[li];
+                    if constexpr (!SBC)
+                        *reinterpret_cast<v4bf16_t*>(&s_q_bk[row * STRIDE_BK + col]) = pf_q[li];
                 }
             }
             __syncthreads();
 
-            // Prefetch next bk's w/q from HBM (VMEM overlaps both GEMMs below)
+            // Prefetch next bk's w/q from HBM (VMEM overlaps GEMM below)
             if (bk + 1 < N_K) {
                 int k_off_next = (bk + 1) * BK_SUB;
                 #pragma unroll
@@ -326,12 +333,37 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
                 }
             }
 
-            tiled_gemm_mfma<O_E_M, O_E_N, O_E_K>(
-                r_retrieve, s_sub_w, o_m_base, STRIDE_BK,
-                            s_h_T,   o_n_base, STRIDE_BK, lane_id);
-            tiled_gemm_mfma<O_E_M, O_E_N, O_E_K>(
-                r_o_cross,  s_q_bk,  o_m_base, STRIDE_BK,
-                            s_h_T,   o_n_base, STRIDE_BK, lane_id);
+            if constexpr (SBC) {
+                // Serialized: GEMM1 (retrieve) with w, then GEMM2 (cross) with q
+                tiled_gemm_mfma<O_E_M, O_E_N, O_E_K>(
+                    r_retrieve,
+                    s_sub_w, o_m_base, STRIDE_BK,
+                    s_h_T,   o_n_base, STRIDE_BK, lane_id);
+                __syncthreads();
+
+                // Reuse s_sub_w for q
+                #pragma unroll
+                for (int li = 0; li < PF_LOADS; li++) {
+                    int i = tid + li * BS;
+                    if (i < PF_ELEMS) {
+                        int row = i / PF_NVEC;
+                        int col = (i % PF_NVEC) * PF_VEC;
+                        *reinterpret_cast<v4bf16_t*>(&s_sub_w[row * STRIDE_BK + col]) = pf_q[li];
+                    }
+                }
+                __syncthreads();
+
+                tiled_gemm_mfma<O_E_M, O_E_N, O_E_K>(
+                    r_o_cross,
+                    s_sub_w, o_m_base, STRIDE_BK,
+                    s_h_T,   o_n_base, STRIDE_BK, lane_id);
+            } else {
+                tiled_gemm_mfma_shared_b<O_E_M, O_E_N, O_E_K>(
+                    r_retrieve, r_o_cross,
+                    s_sub_w, o_m_base, STRIDE_BK,
+                    s_q_bk,  o_m_base, STRIDE_BK,
+                    s_h_T,   o_n_base, STRIDE_BK, lane_id);
+            }
             __syncthreads();
         }
 
@@ -374,12 +406,11 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
             v4bf16_t v_new_pack;
             for (int p = 0; p < 4; p++) {
                 int s = s_base + p;
-                D_ACC u_val = 0.0f;
-                if ((full_chunk || s < T_rem) && (v_full || v_off + c < V))
-                    u_val = static_cast<D_ACC>(
-                        u_ch[s * stride_v + v_off + c]);
-                D_ACC v_new_val = u_val - r_retrieve[i][p];
-                D_ATTN v_new_bf16 = static_cast<D_ATTN>(v_new_val);
+                D_ATTN u_val_bf16 = (full_chunk || s < T_rem) && (v_full || v_off + c < V)
+                    ? u_ch[s * stride_v + v_off + c]
+                    : static_cast<D_ATTN>(0);
+                D_ACC v_new_val = static_cast<D_ACC>(u_val_bf16) - r_retrieve[i][p];
+                D_ATTN v_new_bf16 = fast_f32_to_bf16(v_new_val);
                 v_new_pack[p] = v_new_bf16;
 
                 if (vn_ch && (full_chunk || s < T_rem) && (v_full || v_off + c < V))
@@ -388,19 +419,26 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
             *reinterpret_cast<v4bf16_t*>(&s_v_T[c * STRIDE_BT + s_base]) = v_new_pack;
         }
 
-        // Prefetch k[bk=0] → pf_q for phase e (QK^T). q is already resident in
-        // the persistent s_q buffer from phase b/c, so it is NOT re-read here.
-        // (VMEM loads overlap with phase d execution, ~1000+ cycles)
+        // k[bk=0] for phase e was prefetched at chunk start → pf_ke.
+        // Transfer to pf_q (which phase e QKT loop expects).
+        // !PERSISTENT_Q: also prefetch q[bk=0] → pf_w for phase e.
+        // Prefetch k[bk=0] → pf_q for phase e (QK^T).
+        // !PERSISTENT_Q: also prefetch q[bk=0] → pf_w for phase e.
         #pragma unroll
         for (int li = 0; li < PF_LOADS; li++) {
             int i = tid + li * BS;
             pf_q[li] = {};
+            if constexpr (!PQ) pf_w[li] = {};
             if (i < PF_ELEMS) {
                 int row = i / PF_NVEC;
                 int col = (i % PF_NVEC) * PF_VEC;
-                if (full_chunk || row < T_rem)
+                if (full_chunk || row < T_rem) {
                     pf_q[li] = *reinterpret_cast<const v4bf16_t*>(
                         &k_ch[row * stride_k + col]);
+                    if constexpr (!PQ)
+                        pf_w[li] = *reinterpret_cast<const v4bf16_t*>(
+                            &q_ch[row * stride_k + col]);
+                }
             }
         }
 
@@ -451,7 +489,7 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
                     D_ACC gate = (full_chunk || s < T_rem)
                         ? fast_exp(g_last - s_g[s]) : 0.0f;
                     for (int vi = 0; vi < PF_VEC; vi++)
-                        s_k_T[(j + vi) * STRIDE_BT + s] = static_cast<D_ATTN>(
+                        s_k_T[(j + vi) * STRIDE_BT + s] = fast_f32_to_bf16(
                             static_cast<D_ACC>(pf_k[li][vi]) * gate);
                 }
             }
@@ -493,9 +531,12 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
 
         {
             // ---- GEMM4: QK^T via MFMA ----
-            // q is read from the persistent s_q (subtile bk at s_q+bk*BT*STRIDE_BK);
-            // only k needs an LDS install buffer here.
+            // PERSISTENT_Q: q from persistent s_q; only k needs pool buffer.
+            // !PERSISTENT_Q: both q and k installed into pool from pf_w/pf_q.
             D_ATTN* s_k4 = s_pool;                    // [BT, STRIDE_BK]
+            [[maybe_unused]] D_ATTN* s_q4 = PQ
+                ? nullptr
+                : (s_pool + BT * STRIDE_BK);          // [BT, STRIDE_BK] after s_k4
             D_ATTN* s_A5 = s_pool;                    // [BT, STRIDE_BT] reuses s_k4
 
             if constexpr (BT >= 32) {
@@ -504,7 +545,7 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
                 clear_v4f32<QKT_E_M * QKT_E_N>(r_A);
 
                 for (int bk = 0; bk < N_K; bk++) {
-                    // Install pf_q → s_k4 (register→LDS); q already in s_q.
+                    // Install k → s_k4 from pf_q
                     #pragma unroll
                     for (int li = 0; li < PF_LOADS; li++) {
                         int i = tid + li * BS;
@@ -512,31 +553,39 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
                             int row = i / PF_NVEC;
                             int col = (i % PF_NVEC) * PF_VEC;
                             *reinterpret_cast<v4bf16_t*>(&s_k4[row * STRIDE_BK + col]) = pf_q[li];
+                            if constexpr (!PQ)
+                                *reinterpret_cast<v4bf16_t*>(&s_q4[row * STRIDE_BK + col]) = pf_w[li];
                         }
                     }
                     __syncthreads();
 
-                    // Async prefetch k[bk+1] → pf_q (VMEM overlaps with GEMM4)
+                    // Async prefetch k[bk+1] → pf_q, q[bk+1] → pf_w
                     if (bk + 1 < N_K) {
                         int k_off_next = (bk + 1) * BK_SUB;
                         #pragma unroll
                         for (int li = 0; li < PF_LOADS; li++) {
                             int i = tid + li * BS;
                             pf_q[li] = {};
+                            if constexpr (!PQ) pf_w[li] = {};
                             if (i < PF_ELEMS) {
                                 int row = i / PF_NVEC;
                                 int col = (i % PF_NVEC) * PF_VEC;
-                                if (full_chunk || row < T_rem)
+                                if (full_chunk || row < T_rem) {
                                     pf_q[li] = *reinterpret_cast<const v4bf16_t*>(
                                         &k_ch[row * stride_k + k_off_next + col]);
+                                    if constexpr (!PQ)
+                                        pf_w[li] = *reinterpret_cast<const v4bf16_t*>(
+                                            &q_ch[row * stride_k + k_off_next + col]);
+                                }
                             }
                         }
                     }
 
+                    D_ATTN* q_src = PQ ? (s_q + bk * BT * STRIDE_BK) : s_q4;
                     tiled_gemm_mfma<QKT_E_M, QKT_E_N, QKT_E_K>(
                         r_A,
-                        s_q + bk * BT * STRIDE_BK, qkt_m_base, STRIDE_BK,
-                        s_k4,                      qkt_n_base, STRIDE_BK,
+                        q_src, qkt_m_base, STRIDE_BK,
+                        s_k4,  qkt_n_base, STRIDE_BK,
                         lane_id);
                     __syncthreads();
                 }
@@ -573,7 +622,7 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
                     }
                     for (int p = 0; p < 4; p++) {
                         int row = row_base + p;
-                        s_A5[row * STRIDE_BT + col_base] = static_cast<D_ATTN>(r_A[i][p]);
+                        s_A5[row * STRIDE_BT + col_base] = fast_f32_to_bf16(r_A[i][p]);
                     }
                 }
 
@@ -583,7 +632,6 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
                 clear_v4f32<1>(r_A);
 
                 for (int bk = 0; bk < N_K; bk++) {
-                    // Install pf_q → s_k4 (register→LDS); q already in s_q.
                     #pragma unroll
                     for (int li = 0; li < PF_LOADS; li++) {
                         int i = tid + li * BS;
@@ -591,31 +639,38 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
                             int row = i / PF_NVEC;
                             int col = (i % PF_NVEC) * PF_VEC;
                             *reinterpret_cast<v4bf16_t*>(&s_k4[row * STRIDE_BK + col]) = pf_q[li];
+                            if constexpr (!PQ)
+                                *reinterpret_cast<v4bf16_t*>(&s_q4[row * STRIDE_BK + col]) = pf_w[li];
                         }
                     }
                     __syncthreads();
 
-                    // Async prefetch k[bk+1] → pf_q
                     if (bk + 1 < N_K) {
                         int k_off_next = (bk + 1) * BK_SUB;
                         #pragma unroll
                         for (int li = 0; li < PF_LOADS; li++) {
                             int i = tid + li * BS;
                             pf_q[li] = {};
+                            if constexpr (!PQ) pf_w[li] = {};
                             if (i < PF_ELEMS) {
                                 int row = i / PF_NVEC;
                                 int col = (i % PF_NVEC) * PF_VEC;
-                                if (full_chunk || row < T_rem)
+                                if (full_chunk || row < T_rem) {
                                     pf_q[li] = *reinterpret_cast<const v4bf16_t*>(
                                         &k_ch[row * stride_k + k_off_next + col]);
+                                    if constexpr (!PQ)
+                                        pf_w[li] = *reinterpret_cast<const v4bf16_t*>(
+                                            &q_ch[row * stride_k + k_off_next + col]);
+                                }
                             }
                         }
                     }
 
                     if (warp_id == 0) {
                         constexpr int QKT_EK_SM = BK_SUB / W;
+                        D_ATTN* q_src_sm = PQ ? (s_q + bk * BT * STRIDE_BK) : s_q4;
                         tiled_gemm_mfma<1, 1, QKT_EK_SM>(
-                            r_A, s_q + bk * BT * STRIDE_BK, 0, STRIDE_BK,
+                            r_A, q_src_sm, 0, STRIDE_BK,
                             s_k4, 0, STRIDE_BK, lane_id);
                     }
                     __syncthreads();
@@ -630,7 +685,7 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
                             r_A[0][p] *= fast_exp(s_g[s] - s_g[r]);
                         else
                             r_A[0][p] = 0.0f;
-                        s_A5[s * STRIDE_BT + r] = static_cast<D_ATTN>(r_A[0][p]);
+                        s_A5[s * STRIDE_BT + r] = fast_f32_to_bf16(r_A[0][p]);
                     }
                 }
             }
@@ -712,4 +767,10 @@ gdn_k2_kernel(gdn_k2_kargs kargs) {
             }
         }
     }
+}
+
+template<typename Traits>
+__global__ void __launch_bounds__(Traits::BLOCK_SIZE, Traits::OCC_HINT)
+gdn_k2_kernel(gdn_k2_kargs kargs) {
+    gdn_k2_kernel_impl<Traits>(kargs);
 }

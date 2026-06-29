@@ -14,6 +14,22 @@
 
 #include "opus_gdn/gdn_defs.h"
 
+namespace {
+hipStream_t g_pipeline_stream = nullptr;
+hipEvent_t  g_pipeline_event  = nullptr;
+
+hipStream_t get_pipeline_stream() {
+    if (!g_pipeline_stream)
+        hipStreamCreateWithFlags(&g_pipeline_stream, hipStreamNonBlocking);
+    return g_pipeline_stream;
+}
+hipEvent_t get_pipeline_event() {
+    if (!g_pipeline_event)
+        hipEventCreateWithFlags(&g_pipeline_event, hipEventDisableTiming);
+    return g_pipeline_event;
+}
+} // namespace
+
 // Forward declarations — definitions live in separate TUs to avoid ODR conflicts
 template<typename Traits>
 __global__ void gdn_k1_kernel(gdn_k1_kargs kargs);
@@ -25,8 +41,14 @@ template<typename Traits>
 __global__ void gdn_k1_bt128_kernel(gdn_k1_kargs kargs);
 template<typename Traits>
 __global__ void gdn_k2_kernel(gdn_k2_kargs kargs);
+__global__ void gdn_k2_kernel_occ2(gdn_k2_kargs kargs);
 template<typename Traits>
 __global__ void gdn_wf_h_kernel(gdn_wf_h_kargs kargs);
+template<typename Traits>
+__global__ void gdn_k2_scan_kernel(gdn_k2_kargs kargs);
+
+template<typename Traits>
+__global__ void gdn_k2_output_kernel(gdn_k2_output_kargs kargs);
 
 enum class K1Algo { BASIC, NEUMANN, BT32, BT128 };
 
@@ -42,7 +64,8 @@ void launch_gdn_prefill_impl(
     torch::Tensor initial_state,
     torch::Tensor final_state,
     bool has_initial_state,
-    bool output_final_state)
+    bool output_final_state,
+    bool pipeline = false)
 {
     const int B = q.size(0);
     const int T = q.size(1);
@@ -59,6 +82,27 @@ void launch_gdn_prefill_impl(
     auto w_bar    = torch::empty({B, T, H, K}, opts_bf16);
     auto u_bar    = torch::empty({B, T, H, V}, opts_bf16);
     auto g_cumsum = torch::empty({B, T, H},    opts_fp32);
+
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(at::device_of(q));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+
+    // Pipeline overlap: K1 and K2 run concurrently on separate streams
+    torch::Tensor k1_done_t;
+    uint32_t* k1_done_ptr = nullptr;
+    hipStream_t k2_stream = stream;
+    hipEvent_t pipeline_event = nullptr;
+
+    if (pipeline) {
+        auto opts_u32 = torch::TensorOptions().dtype(torch::kInt32).device(q.device());
+        k1_done_t = torch::zeros({NT * B * H}, opts_u32);
+        k1_done_ptr = reinterpret_cast<uint32_t*>(k1_done_t.data_ptr());
+
+        k2_stream = get_pipeline_stream();
+        pipeline_event = get_pipeline_event();
+        hipEventRecord(pipeline_event, stream);
+        hipStreamWaitEvent(k2_stream, pipeline_event, 0);
+    }
+
     gdn_k1_kargs k1args{};
     k1args.ptr_k       = k.data_ptr();
     k1args.ptr_v       = v.data_ptr();
@@ -67,6 +111,7 @@ void launch_gdn_prefill_impl(
     k1args.ptr_w_bar   = w_bar.data_ptr();
     k1args.ptr_u_bar   = u_bar.data_ptr();
     k1args.ptr_g_cumsum = g_cumsum.data_ptr();
+    k1args.ptr_k1_done = k1_done_ptr;
     k1args.B = B; k1args.T = T; k1args.H = H; k1args.K = K; k1args.V = V;
 
     gdn_k2_kargs k2args{};
@@ -80,12 +125,10 @@ void launch_gdn_prefill_impl(
     k2args.ptr_ht      = output_final_state ? final_state.data_ptr() : nullptr;
     k2args.ptr_h_snap  = nullptr;
     k2args.ptr_v_new   = nullptr;
+    k2args.ptr_k1_done = k1_done_ptr;
     k2args.B = B; k2args.T = T; k2args.H = H; k2args.K = K; k2args.V = V;
     k2args.NT = NT;
     k2args.scale = scale;
-
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(at::device_of(q));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     dim3 k1_grid(NT, B * H);
     dim3 k1_block(K1Traits::BLOCK_SIZE);
@@ -95,6 +138,20 @@ void launch_gdn_prefill_impl(
     dim3 k2_block(K2Traits::BLOCK_SIZE);
     size_t k2_smem = K2Traits::smem_size_bytes();
 
+    // Helper lambda to launch the right K2 kernel
+    auto launch_k2 = [&](hipStream_t s) {
+        if constexpr (K2Traits::SERIALIZE_BC) {
+            gdn_k2_kernel_occ2<<<k2_grid, k2_block, k2_smem, s>>>(k2args);
+        } else {
+            gdn_k2_kernel<K2Traits><<<k2_grid, k2_block, k2_smem, s>>>(k2args);
+        }
+    };
+
+    if (pipeline) {
+        launch_k2(k2_stream);
+    }
+
+    // Launch K1 on main stream
     if constexpr (algo == K1Algo::BASIC)
         gdn_k1_kernel<K1Traits><<<k1_grid, k1_block, k1_smem, stream>>>(k1args);
     else if constexpr (algo == K1Algo::NEUMANN)
@@ -104,7 +161,156 @@ void launch_gdn_prefill_impl(
     else
         gdn_k1_bt32_kernel<K1Traits><<<k1_grid, k1_block, k1_smem, stream>>>(k1args);
 
-    gdn_k2_kernel<K2Traits><<<k2_grid, k2_block, k2_smem, stream>>>(k2args);
+    if (pipeline) {
+        hipEventRecord(pipeline_event, k2_stream);
+        hipStreamWaitEvent(stream, pipeline_event, 0);
+    } else {
+        launch_k2(stream);
+    }
+}
+
+// =========================================================================
+// Split K2 launcher: scan-only (serial) + output (parallel)
+// =========================================================================
+template<K1Algo algo, typename K1Traits, typename K2Traits>
+void launch_gdn_prefill_split_impl(
+    torch::Tensor q, torch::Tensor k, torch::Tensor v,
+    torch::Tensor g, torch::Tensor beta, torch::Tensor o,
+    float scale,
+    torch::Tensor initial_state, torch::Tensor final_state,
+    bool has_initial_state, bool output_final_state)
+{
+    const int B = q.size(0), T = q.size(1), H = q.size(2), K = q.size(3);
+    const int V = v.size(3);
+    constexpr int BT = K1Traits::BT;
+    constexpr int BV = K2Traits::BV;
+    constexpr int PAD = K2Traits::SMEM_PAD;
+    constexpr int BK_SUB = K2Traits::BK_SUB;
+    const int NT = ceil_div(T, BT);
+    const int NV = ceil_div(V, BV);
+
+    auto opts_bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(q.device());
+    auto opts_fp32 = torch::TensorOptions().dtype(torch::kFloat32).device(q.device());
+
+    auto w_bar    = torch::empty({B, T, H, K}, opts_bf16);
+    auto u_bar    = torch::empty({B, T, H, V}, opts_bf16);
+    auto g_cumsum = torch::empty({B, T, H},    opts_fp32);
+
+    // Intermediates for split K2
+    auto h_snap   = torch::empty({B, NT, H, K, V}, opts_fp32);
+    auto v_new    = torch::empty({B, T, H, V}, opts_bf16);
+
+    // --- K1 ---
+    gdn_k1_kargs k1args{};
+    k1args.ptr_k       = k.data_ptr();
+    k1args.ptr_v       = v.data_ptr();
+    k1args.ptr_beta    = beta.data_ptr();
+    k1args.ptr_g       = g.data_ptr();
+    k1args.ptr_w_bar   = w_bar.data_ptr();
+    k1args.ptr_u_bar   = u_bar.data_ptr();
+    k1args.ptr_g_cumsum = g_cumsum.data_ptr();
+    k1args.B = B; k1args.T = T; k1args.H = H; k1args.K = K; k1args.V = V;
+
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(at::device_of(q));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+
+    dim3 k1_grid(NT, B * H);
+    dim3 k1_block(K1Traits::BLOCK_SIZE);
+    size_t k1_smem = K1Traits::smem_size_bytes();
+
+    if constexpr (algo == K1Algo::NEUMANN)
+        gdn_k1_neumann_kernel<K1Traits><<<k1_grid, k1_block, k1_smem, stream>>>(k1args);
+    else if constexpr (algo == K1Algo::BASIC)
+        gdn_k1_kernel<K1Traits><<<k1_grid, k1_block, k1_smem, stream>>>(k1args);
+    else if constexpr (algo == K1Algo::BT128)
+        gdn_k1_bt128_kernel<K1Traits><<<k1_grid, k1_block, k1_smem, stream>>>(k1args);
+    else
+        gdn_k1_bt32_kernel<K1Traits><<<k1_grid, k1_block, k1_smem, stream>>>(k1args);
+
+    // --- K2 scan-only ---
+    gdn_k2_kargs scan_args{};
+    scan_args.ptr_q       = nullptr;
+    scan_args.ptr_k       = k.data_ptr();
+    scan_args.ptr_w_bar   = w_bar.data_ptr();
+    scan_args.ptr_u_bar   = u_bar.data_ptr();
+    scan_args.ptr_g_cumsum = g_cumsum.data_ptr();
+    scan_args.ptr_h0      = has_initial_state ? initial_state.data_ptr() : nullptr;
+    scan_args.ptr_o       = nullptr;
+    scan_args.ptr_ht      = output_final_state ? final_state.data_ptr() : nullptr;
+    scan_args.ptr_h_snap  = h_snap.data_ptr();
+    scan_args.ptr_v_new   = v_new.data_ptr();
+    scan_args.B = B; scan_args.T = T; scan_args.H = H; scan_args.K = K; scan_args.V = V;
+    scan_args.NT = NT;
+    scan_args.scale = scale;
+
+    dim3 scan_grid(NV, B * H);
+    dim3 scan_block(K2Traits::BLOCK_SIZE);
+    // Scan LDS: s_g + s_v_T + pool (no s_q)
+    constexpr int STRIDE_BK = BK_SUB + PAD;
+    constexpr int STRIDE_BT = BT + PAD;
+    constexpr int scan_smem_g  = BT * (int)sizeof(float);
+    constexpr int scan_smem_vT = BV * STRIDE_BT * (int)sizeof(bf16_t);
+    constexpr int scan_pool_bc = BV * STRIDE_BK * (int)sizeof(bf16_t)
+                               + BT * STRIDE_BK * (int)sizeof(bf16_t);
+    constexpr int scan_pool_d  = BK_SUB * STRIDE_BT * (int)sizeof(bf16_t);
+    constexpr int scan_pool    = (scan_pool_bc > scan_pool_d) ? scan_pool_bc : scan_pool_d;
+    constexpr size_t scan_smem = scan_smem_g + scan_smem_vT + scan_pool;
+
+    gdn_k2_scan_kernel<K2Traits><<<scan_grid, scan_block, scan_smem, stream>>>(scan_args);
+
+    // --- K2 output (parallel) ---
+    gdn_k2_output_kargs out_args{};
+    out_args.ptr_q       = q.data_ptr();
+    out_args.ptr_k       = k.data_ptr();
+    out_args.ptr_v_new   = v_new.data_ptr();
+    out_args.ptr_h_snap  = h_snap.data_ptr();
+    out_args.ptr_g_cumsum = g_cumsum.data_ptr();
+    out_args.ptr_o       = o.data_ptr();
+    out_args.B = B; out_args.T = T; out_args.H = H; out_args.K = K; out_args.V = V;
+    out_args.NT = NT; out_args.NV = NV;
+    out_args.scale = scale;
+
+    dim3 out_grid(NT * NV, B * H);
+    dim3 out_block(K2Traits::BLOCK_SIZE);
+    // Output LDS: s_g + s_v_T + pool
+    // pool needs: phase c (s_h_T + s_sub) or phase e (s_q_e + s_k_e)
+    constexpr int out_pool_c  = BV * STRIDE_BK * (int)sizeof(bf16_t)
+                              + BT * STRIDE_BK * (int)sizeof(bf16_t);
+    constexpr int out_pool_e  = 2 * BT * STRIDE_BK * (int)sizeof(bf16_t);
+    constexpr int out_pool_av = BT * STRIDE_BT * (int)sizeof(bf16_t);
+    constexpr int out_pool    = (out_pool_c > out_pool_e) ? out_pool_c : out_pool_e;
+    constexpr int out_pool_final = (out_pool > out_pool_av) ? out_pool : out_pool_av;
+    constexpr size_t out_smem = scan_smem_g + scan_smem_vT + out_pool_final;
+
+    gdn_k2_output_kernel<K2Traits><<<out_grid, out_block, out_smem, stream>>>(out_args);
+}
+
+void opus_gdn_prefill_split_fwd(
+    torch::Tensor q, torch::Tensor k, torch::Tensor v,
+    torch::Tensor g, torch::Tensor beta, torch::Tensor o,
+    float scale,
+    torch::Tensor initial_state, torch::Tensor final_state,
+    bool has_initial_state, bool output_final_state,
+    int BT, int BV, int num_warps)
+{
+    TORCH_CHECK(q.dim() == 4, "q must be 4D [B, T, H, K]");
+    TORCH_CHECK(q.size(3) == 128 && v.size(3) == 128);
+    TORCH_CHECK(BT == 64, "Split mode currently only supports BT=64");
+    TORCH_CHECK(BV == 64, "Split mode currently only supports BV=64");
+
+    if (num_warps == 8) {
+        launch_gdn_prefill_split_impl<K1Algo::NEUMANN,
+            gdn_k1_traits<64, 128, 128, 4>,
+            gdn_k2_traits<64, 128, 128, 64, 8>>(
+            q, k, v, g, beta, o, scale,
+            initial_state, final_state, has_initial_state, output_final_state);
+    } else {
+        launch_gdn_prefill_split_impl<K1Algo::NEUMANN,
+            gdn_k1_traits<64, 128, 128, 4>,
+            gdn_k2_traits<64, 128, 128, 64, 4>>(
+            q, k, v, g, beta, o, scale,
+            initial_state, final_state, has_initial_state, output_final_state);
+    }
 }
 
 // =========================================================================
@@ -209,6 +415,12 @@ void opus_gdn_wavefront_h_fwd(
             k, w_bar, u_bar, g_cumsum, h_out, v_new_out,
             initial_state, final_state, has_initial_state, output_final_state, S,
             q, o, scale);
+    } else if (q.defined() && q.numel() > 0) {
+        // Fused mode: use nw=8 for better latency hiding
+        launch_gdn_wavefront_h_impl<gdn_k2_traits<64, 128, 128, 64, 8>>(
+            k, w_bar, u_bar, g_cumsum, h_out, v_new_out,
+            initial_state, final_state, has_initial_state, output_final_state, S,
+            q, o, scale);
     } else {
         launch_gdn_wavefront_h_impl<gdn_k2_traits<64, 128, 128, 64, 4>>(
             k, w_bar, u_bar, g_cumsum, h_out, v_new_out,
@@ -232,7 +444,9 @@ void opus_gdn_prefill_fwd(
     int BT,
     int BV,
     int num_warps,
-    int k1_algo)
+    int k1_algo,
+    bool pipeline,
+    int occ_hint)
 {
     TORCH_CHECK(q.dim() == 4, "q must be 4D [B, T, H, K]");
     TORCH_CHECK(q.size(3) == 128, "K must be 128");
@@ -246,12 +460,22 @@ void opus_gdn_prefill_fwd(
     TORCH_CHECK(BV == 64 || BV == 32, "Unsupported BV=", BV, ". Supported: 64, 32");
     TORCH_CHECK(num_warps == 2 || num_warps == 4 || num_warps == 8, "Unsupported num_warps=", num_warps, ". Supported: 2, 4, 8");
 
+    // OCC=2 override: serialized b/c GEMMs + reduced LDS
+    if (occ_hint == 2 && BT == 64 && BV == 64 && num_warps == 8) {
+        launch_gdn_prefill_impl<K1Algo::NEUMANN,
+            gdn_k1_traits<64, 128, 128, 4>,
+            gdn_k2_traits<64, 128, 128, 64, 8, 2>>(
+            q, k, v, g, beta, o, scale,
+            initial_state, final_state, has_initial_state, output_final_state, pipeline);
+        return;
+    }
+
 #define DISPATCH(algo, bt, bv, nw) \
     launch_gdn_prefill_impl<K1Algo::algo, \
         gdn_k1_traits<bt, 128, 128, 4>, \
         gdn_k2_traits<bt, 128, 128, bv, nw>>( \
         q, k, v, g, beta, o, scale, \
-        initial_state, final_state, has_initial_state, output_final_state)
+        initial_state, final_state, has_initial_state, output_final_state, pipeline)
 
     if (BT == 128) {
         if (BV == 64 && num_warps == 4) {

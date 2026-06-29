@@ -19,6 +19,7 @@ struct gdn_k1_kargs {
     void* __restrict__ ptr_w_bar;          // [B, T, H, K]   bf16  output
     void* __restrict__ ptr_u_bar;          // [B, T, H, V]   bf16  output
     void* __restrict__ ptr_g_cumsum;       // [B, T, H]      fp32  output
+    uint32_t* __restrict__ ptr_k1_done;    // [NT * B * H] atomic flags (nullable)
     int B;
     int T;
     int H;
@@ -40,6 +41,7 @@ struct gdn_k2_kargs {
     void* __restrict__ ptr_ht;             // [B, H, V, K]    fp32  final state (nullable)
     void* __restrict__ ptr_h_snap;         // [B, NT, H, V, K] fp32 h snapshots
     void* __restrict__ ptr_v_new;          // [B, T, H, V]    bf16  corrected values
+    const uint32_t* __restrict__ ptr_k1_done;  // [NT * B * H] atomic flags (nullable)
     int B;
     int T;
     int H;
@@ -119,11 +121,8 @@ struct gdn_k1_traits {
         int phase1 = smem_k_padded_bytes + smem_scalar_bytes;
         if constexpr (BT >= 64) {
             int phase2ab = smem_A_bytes + 16*16*(int)sizeof(D_ACC) + smem_scalar_bytes;
-            int c_bf16_bytes = BT * (BT + SMEM_PAD) * (int)sizeof(D_ATTN);
-            int phase2c = smem_A_bytes + c_bf16_bytes + smem_scalar_bytes;
             int peak = phase1;
             if (phase2ab > peak) peak = phase2ab;
-            if (phase2c  > peak) peak = phase2c;
             return peak;
         } else {
             int phase2 = smem_A_bytes + smem_subtile_bytes + smem_scalar_bytes;
@@ -146,7 +145,8 @@ template<int BT_,
          int K_  = 128,
          int V_  = 128,
          int BV_ = 64,
-         int NUM_WARPS_ = 4>
+         int NUM_WARPS_ = 4,
+         int OCC_OVERRIDE_ = 0>
 struct gdn_k2_traits {
     static constexpr int BT = BT_;
     static constexpr int K  = K_;
@@ -155,7 +155,18 @@ struct gdn_k2_traits {
     static constexpr int NUM_WARPS = NUM_WARPS_;
     static constexpr int WARP_SIZE = 64;
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
-    static constexpr int OCC_HINT = (BT_ >= 128) ? 1 : ((NUM_WARPS_ <= 4) ? 2 : 1);
+    static constexpr int OCC_HINT = (OCC_OVERRIDE_ > 0) ? OCC_OVERRIDE_
+                                   : ((BT_ >= 128) ? 1
+                                   : ((NUM_WARPS_ <= 4) ? 2
+                                   : ((BV_ <= 32) ? 2 : 1)));
+
+    // Disable persistent q when OCC>=2 and nw>4: LDS with persistent q
+    // (35072+) would exceed 32768 and block OCC=2.
+    static constexpr bool PERSISTENT_Q = (OCC_HINT <= 1) || (NUM_WARPS_ <= 4);
+
+    // Serialize phase b/c GEMMs (retrieve then cross, sharing one sub buffer)
+    // to reduce pool_bc from 3 buffers to 2, enabling OCC=2 LDS fit.
+    static constexpr bool SERIALIZE_BC = !PERSISTENT_Q && (OCC_HINT >= 2);
 
     using D_ATTN = bf16_t;
     using D_ACC  = float;
@@ -203,26 +214,32 @@ struct gdn_k2_traits {
     // Persistent regions:
     //   s_g[BT] fp32                          — gate cumsum
     //   s_v_T[BV, BT+PAD] bf16               — v_new transposed (phases b'→e)
+    //   (PERSISTENT_Q only) s_q[N_K, BT, BK_SUB+PAD] bf16
     //
     // Pool (aliased per phase):
-    //   Phase b/c: s_h_T[BV, BK_SUB+PAD] + s_sub[BT, BK_SUB+PAD]
+    //   Phase b/c: s_h_T[BV, BK_SUB+PAD] + s_sub_w[BT, BK_SUB+PAD]
+    //              + (!PERSISTENT_Q: s_sub_q[BT, BK_SUB+PAD])
     //   Phase d:   s_k_T[BK_SUB, BT+PAD] bf16
-    //   Phase e:   s_q[BT, BK_SUB+PAD] + s_k[BT, BK_SUB+PAD] bf16  (QK^T)
-    //              s_A[BT, BT+PAD] bf16                              (AV)
+    //   Phase e:   (PERSISTENT_Q)  s_k[BT, BK_SUB+PAD] bf16
+    //              (!PERSISTENT_Q) s_k[BT, BK_SUB+PAD] + s_q[BT, BK_SUB+PAD]
+    //              s_A[BT, BT+PAD] bf16 (AV, reuses pool)
     static constexpr int smem_g_bytes = BT * (int)sizeof(D_ACC);
     static constexpr int smem_vT_bytes = BV * (BT + SMEM_PAD) * (int)sizeof(D_ATTN);
-    // Persistent q for the whole chunk: all N_K subtiles, [BT, BK_SUB+PAD] each.
-    // Loaded once in phase b/c and reused in phase e (QK^T) — avoids re-reading
-    // q from HBM. Free LDS: k2 occupancy is VGPR-bound, not LDS-bound.
     static constexpr int N_K_ = K / BK_SUB;
-    static constexpr int smem_q_bytes = N_K_ * BT * (BK_SUB + SMEM_PAD) * (int)sizeof(D_ATTN);
+    static constexpr int smem_q_bytes = PERSISTENT_Q
+        ? (N_K_ * BT * (BK_SUB + SMEM_PAD) * (int)sizeof(D_ATTN))
+        : 0;
 
     static constexpr size_t smem_size_bytes() {
         constexpr int P = SMEM_PAD;
+        int one_sub = BT * (BK_SUB + P) * (int)sizeof(D_ATTN);
+        // SERIALIZE_BC: w and q share one sub buffer (serialized GEMMs)
         int pool_bc  = BV * (BK_SUB + P) * (int)sizeof(D_ATTN)     // s_h_T
-                     + BT * (BK_SUB + P) * (int)sizeof(D_ATTN);   // s_sub_w
+                     + one_sub                                       // s_sub_w
+                     + (PERSISTENT_Q || SERIALIZE_BC ? 0 : one_sub);// s_sub_q
         int pool_d   = BK_SUB * (BT + P) * (int)sizeof(D_ATTN);    // s_k_T
-        int pool_eqk = BT * (BK_SUB + P) * (int)sizeof(D_ATTN);    // s_k4 (q now persistent)
+        int pool_eqk = PERSISTENT_Q ? one_sub                       // s_k4 only
+                     : (2 * one_sub);                                // s_k4 + s_q4
         int pool_eav = BT * (BT + P) * (int)sizeof(D_ATTN);        // s_A
         int pool = pool_bc;
         if (pool_d   > pool) pool = pool_d;
@@ -251,6 +268,21 @@ struct gdn_wf_h_kargs {
     int B, T, H, K, V, NT;
     int S;
     int N_super;
+    float scale;
+};
+
+// --------------------------------------------------------------------------
+// K2 output kernel arguments (split mode: parallel output, no serial deps)
+// --------------------------------------------------------------------------
+struct gdn_k2_output_kargs {
+    const void* __restrict__ ptr_q;         // [B, T, H, K]    bf16
+    const void* __restrict__ ptr_k;         // [B, T, H, K]    bf16
+    const void* __restrict__ ptr_v_new;     // [B, T, H, V]    bf16
+    const void* __restrict__ ptr_h_snap;    // [B, NT, H, K, V] fp32
+    const void* __restrict__ ptr_g_cumsum;  // [B, T, H]       fp32
+    void* __restrict__ ptr_o;               // [B, T, H, V]    bf16  output
+    int B, T, H, K, V, NT;
+    int NV;                                 // cdiv(V, BV)
     float scale;
 };
 

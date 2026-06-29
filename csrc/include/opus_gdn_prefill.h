@@ -18,7 +18,25 @@ void opus_gdn_prefill_fwd(
     int BT,
     int BV,
     int num_warps,
-    int k1_algo);
+    int k1_algo,
+    bool pipeline = false,
+    int occ_hint = 0);
+
+void opus_gdn_prefill_split_fwd(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor g,
+    torch::Tensor beta,
+    torch::Tensor o,
+    float scale,
+    torch::Tensor initial_state,
+    torch::Tensor final_state,
+    bool has_initial_state,
+    bool output_final_state,
+    int BT,
+    int BV,
+    int num_warps);
 
 void opus_gdn_wavefront_h_fwd(
     torch::Tensor k,

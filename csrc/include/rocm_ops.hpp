@@ -1997,7 +1997,25 @@ namespace py = pybind11;
           py::arg("BT"),                            \
           py::arg("BV"),                            \
           py::arg("num_warps"),                     \
-          py::arg("k1_algo") = 0);                 \
+          py::arg("k1_algo") = 0,                  \
+          py::arg("pipeline") = false,              \
+          py::arg("occ_hint") = 0);                 \
+    m.def("_opus_gdn_prefill_split_fwd",            \
+          &opus_gdn_prefill_split_fwd,              \
+          py::arg("q"),                            \
+          py::arg("k"),                            \
+          py::arg("v"),                            \
+          py::arg("g"),                            \
+          py::arg("beta"),                         \
+          py::arg("o"),                            \
+          py::arg("scale"),                        \
+          py::arg("initial_state"),                \
+          py::arg("final_state"),                  \
+          py::arg("has_initial_state"),             \
+          py::arg("output_final_state"),            \
+          py::arg("BT"),                            \
+          py::arg("BV"),                            \
+          py::arg("num_warps"));                    \
     m.def("_opus_gdn_wavefront_h_fwd",             \
           &opus_gdn_wavefront_h_fwd,               \
           py::arg("k"),                            \
