@@ -8,8 +8,16 @@
 #include "opus_gdn/gdn_defs.h"
 #include "opus_gdn/gdn_mfma_utils.h"
 
+// Arch-specialized occupancy: gfx942 (MI300) is LDS-bound, so register-caching
+// C_inv frees LDS and lifts OCC 2→3 (-30% K1). gfx950 (MI350) has 160KB LDS —
+// not the limiter — so OCC=3 is a no-op there; keep the simpler LDS path at OCC=2.
+#if defined(__gfx950__)
+#define GDN_K1_NEUMANN_OCC 2
+#else
+#define GDN_K1_NEUMANN_OCC 3
+#endif
 template<typename Traits>
-__global__ void __launch_bounds__(Traits::BLOCK_SIZE, 3)
+__global__ void __launch_bounds__(Traits::BLOCK_SIZE, GDN_K1_NEUMANN_OCC)
 gdn_k1_neumann_kernel(gdn_k1_kargs kargs) {
     using namespace gdn_mfma;
     using T = Traits;
@@ -310,11 +318,27 @@ gdn_k1_neumann_kernel(gdn_k1_kargs kargs) {
     // Step 2: For each subtile, load pre-scaled v/k transposed → MFMA
     // =====================================================================
 
-    // Cache C_inv tiles in registers (eliminates s_C_bf16 from LDS → OCC=3)
+#if defined(__gfx950__)
+    // gfx950 (OCC=2): stage C_inv in LDS as bf16 (placed after s_A). 160KB LDS
+    // is not the occupancy limiter here, so register-caching gains nothing.
+    constexpr int C_STRIDE = BT + PAD;  // 68
+    D_ATTN* s_C_bf16 = reinterpret_cast<D_ATTN*>(
+        smem_buf + BT * 2 * sizeof(D_ACC) + BT * A_STRIDE * sizeof(D_ACC));
+    for (int i = tid; i < BT * BT; i += BS) {
+        int s = i / BT;
+        int j = i % BT;
+        s_C_bf16[s * C_STRIDE + j] = static_cast<D_ATTN>(s_A[s * A_STRIDE + j]);
+    }
+    __syncthreads();
+    constexpr int WY_EM = 1;
+#else
+    // gfx942 (OCC=3): cache C_inv tiles in registers (eliminates s_C_bf16 from
+    // LDS → 25856→18176 bytes → OCC 2→3, -30% K1 on the LDS-bound MI300).
     constexpr int WY_EK_C = BT / 16;  // 4
     v4bf16_t cached_C[WY_EK_C];
     for (int ek = 0; ek < WY_EK_C; ek++)
         cached_C[ek] = load_fp32_tile(s_A, warp_id * 16, ek * 16, A_STRIDE, lane_id);
+#endif
 
     // s_A region freed — reuse for v_scaled_T / k_scaled_T
     constexpr int VT_STRIDE = BT + PAD;  // 68
@@ -355,6 +379,13 @@ gdn_k1_neumann_kernel(gdn_k1_kargs kargs) {
         }
         __syncthreads();
 
+#if defined(__gfx950__)
+        v4f32_t wy_c[WY_EM * WY_EN];
+        clear_v4f32<WY_EM * WY_EN>(wy_c);
+        tiled_gemm_mfma<WY_EM, WY_EN, WY_EK>(
+            wy_c, s_C_bf16, warp_id * 16, C_STRIDE,
+                  s_vT,     0,             VT_STRIDE, lane_id);
+#else
         v4f32_t wy_c[WY_EN];
         clear_v4f32<WY_EN>(wy_c);
         for (int ek = 0; ek < WY_EK; ek++) {
@@ -364,6 +395,7 @@ gdn_k1_neumann_kernel(gdn_k1_kargs kargs) {
             for (int en = 0; en < WY_EN; en++)
                 wy_c[en] = mfma_f32_16x16x16_bf16(cached_C[ek], b_tiles[en], wy_c[en]);
         }
+#endif
 
         for (int en = 0; en < WY_EN; en++) {
             for (int p = 0; p < 4; p++) {
@@ -401,6 +433,13 @@ gdn_k1_neumann_kernel(gdn_k1_kargs kargs) {
         }
         __syncthreads();
 
+#if defined(__gfx950__)
+        v4f32_t wy_c[WY_EM * WY_EN];
+        clear_v4f32<WY_EM * WY_EN>(wy_c);
+        tiled_gemm_mfma<WY_EM, WY_EN, WY_EK>(
+            wy_c, s_C_bf16, warp_id * 16, C_STRIDE,
+                  s_vT,     0,             VT_STRIDE, lane_id);
+#else
         v4f32_t wy_c[WY_EN];
         clear_v4f32<WY_EN>(wy_c);
         for (int ek = 0; ek < WY_EK; ek++) {
@@ -410,6 +449,7 @@ gdn_k1_neumann_kernel(gdn_k1_kargs kargs) {
             for (int en = 0; en < WY_EN; en++)
                 wy_c[en] = mfma_f32_16x16x16_bf16(cached_C[ek], b_tiles[en], wy_c[en]);
         }
+#endif
 
         for (int en = 0; en < WY_EN; en++) {
             for (int p = 0; p < 4; p++) {

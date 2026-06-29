@@ -117,6 +117,8 @@ struct gdn_k1_traits {
     static constexpr int smem_scalar_bytes = BT * 2 * (int)sizeof(D_ACC);
     static constexpr int smem_subtile_bytes = BT * BK_SUB * (int)sizeof(D_ATTN);
 
+    // OCC=3 size (C_inv register-cached, no s_C_bf16). Used on gfx942 where the
+    // smaller LDS lifts occupancy 2→3; also fine for all non-neumann k1 kernels.
     static constexpr size_t smem_size_bytes() {
         int phase1 = smem_k_padded_bytes + smem_scalar_bytes;
         if constexpr (BT >= 64) {
@@ -128,6 +130,19 @@ struct gdn_k1_traits {
             int phase2 = smem_A_bytes + smem_subtile_bytes + smem_scalar_bytes;
             return (phase1 > phase2) ? phase1 : phase2;
         }
+    }
+
+    // OCC=2 size (neumann's C_inv staged in LDS as s_C_bf16). Used on gfx950,
+    // whose 160KB LDS is not the occupancy limiter — the register-cache (OCC=3)
+    // optimization is a no-op there, so the simpler LDS path is kept.
+    static constexpr size_t smem_size_bytes_cinv_lds() {
+        int base = smem_size_bytes();
+        if constexpr (BT >= 64) {
+            int c_bf16_bytes = BT * (BT + SMEM_PAD) * (int)sizeof(D_ATTN);
+            int phase2c = smem_A_bytes + c_bf16_bytes + smem_scalar_bytes;
+            return (phase2c > base) ? phase2c : base;
+        }
+        return base;
     }
 
     // Number of 16×16 diagonal blocks for forward substitution (BT=64 → 4 blocks)
