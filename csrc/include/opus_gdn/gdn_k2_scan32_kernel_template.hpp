@@ -18,6 +18,9 @@
 template<typename Traits>
 __global__ void __launch_bounds__(128, 2)
 gdn_k2_scan32_kernel(gdn_k2_kargs kargs) {
+// 32x32x16 bf16 MFMA needs gfx950-insts; stub on other arches so the TU still
+// compiles (this is research-only, env-gated via OPUS_GDN_SCAN32, never default).
+#if defined(__gfx950__)
     using b8   = __bf16 __attribute__((ext_vector_type(8)));
     using v8   = __bf16 __attribute__((ext_vector_type(8)));
     using f16v = float  __attribute__((ext_vector_type(16)));
@@ -143,4 +146,7 @@ gdn_k2_scan32_kernel(gdn_k2_kargs kargs) {
           for (int i=0;i<16;i++){ int kk=kt*32+(i/4)*8+hi*4+(i%4); int bv=v_off+o;
             if (bv<V) ht[(int64_t)bv*K + kk]=Hacc[j][i]; } }
     }
+#else
+    (void)kargs;  // 32x32x16 bf16 MFMA unavailable off gfx950
+#endif
 }
