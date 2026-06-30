@@ -1313,6 +1313,7 @@
             "f'{AITER_CSRC_DIR}/py_itfs_cu/opus_gdn_k2_scan_hip.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/opus_gdn_k2_scan32.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/opus_gdn_k2_out.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/opus_gdn_wf_h.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/opus_gdn_prefill_kernels.cu'",
             "f'{AITER_CSRC_DIR}/pybind/opus_gdn_prefill_pybind.cu'"
         ],

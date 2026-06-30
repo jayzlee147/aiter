@@ -110,3 +110,128 @@ def opus_gdn_prefill_fwd(
         o = o[:, :T]
 
     return o, final_st if output_final_state else None
+
+
+@compile_ops("module_opus_gdn_prefill")
+def _opus_gdn_wavefront_h_fwd(
+    k: torch.Tensor,
+    w_bar: torch.Tensor,
+    u_bar: torch.Tensor,
+    g_cumsum: torch.Tensor,
+    h_out: torch.Tensor,
+    v_new_out: torch.Tensor,
+    initial_state: torch.Tensor,
+    final_state: torch.Tensor,
+    has_initial_state: bool,
+    output_final_state: bool,
+    S: int,
+    BT: int,
+    q: torch.Tensor,
+    o: torch.Tensor,
+    scale: float,
+) -> None: ...
+
+
+def opus_gdn_wavefront_h_fwd(
+    k: torch.Tensor,
+    w_bar: torch.Tensor,
+    u_bar: torch.Tensor,
+    g_cumsum: torch.Tensor,
+    initial_state: torch.Tensor = None,
+    output_final_state: bool = False,
+    save_v_new: bool = True,
+    S: int = 8,
+    BT: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """
+    Wavefront-parallel h-state scan for GDN prefill (forward only, scan-only).
+
+    Args:
+        k: [B, T, H, K] bf16 — keys
+        w_bar: [B, T, H, K] bf16 — WY factor w
+        u_bar: [B, T, H, V] bf16 — WY factor u
+        g_cumsum: [B, T, H] fp32 — cumulative gate sums
+        initial_state: [B, H, V, K] fp32 or None
+        output_final_state: whether to return final h-state
+        save_v_new: whether to output corrected values
+        S: chunks per super-chunk (wavefront segment size)
+        BT: chunk size (64 or 128)
+
+    Returns:
+        (h, v_new, final_state):
+            h: [B, NT, H, K, V] bf16 — h snapshots at each chunk boundary
+            v_new: [B, T, H, V] bf16 or None
+            final_state: [B, H, V, K] fp32 or None
+    """
+    B, T, H, K = k.shape
+    V = u_bar.shape[-1]
+    NT = T // BT
+    assert T % BT == 0, f"T={T} must be a multiple of BT={BT}"
+    assert NT % S == 0, f"NT={NT} must be a multiple of S={S}"
+
+    h_out = torch.empty(B, NT, H, K, V, dtype=torch.bfloat16, device=k.device)
+    v_new_out = torch.empty(B, T, H, V, dtype=torch.bfloat16, device=k.device) if save_v_new else torch.empty(0, device=k.device, dtype=torch.bfloat16)
+
+    has_init = initial_state is not None
+    init_st = initial_state.contiguous().float() if has_init else torch.empty(0, device=k.device, dtype=torch.float32)
+    final_st = torch.empty(B, H, V, K, dtype=torch.float32, device=k.device) if output_final_state else torch.empty(0, device=k.device, dtype=torch.float32)
+
+    empty_bf16 = torch.empty(0, device=k.device, dtype=torch.bfloat16)
+    _opus_gdn_wavefront_h_fwd(
+        k, w_bar, u_bar, g_cumsum,
+        h_out, v_new_out,
+        init_st, final_st,
+        has_init, output_final_state, S, BT,
+        empty_bf16, empty_bf16, 0.0,
+    )
+
+    return h_out, v_new_out if save_v_new else None, final_st if output_final_state else None
+
+
+def opus_gdn_wavefront_fused_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    w_bar: torch.Tensor,
+    u_bar: torch.Tensor,
+    g_cumsum: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor = None,
+    output_final_state: bool = False,
+    S: int = 8,
+    BT: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """
+    Fused wavefront scan + output for GDN prefill.
+    Computes h-state scan and output in a single kernel, eliminating
+    intermediate h snapshot and v_new stores.
+
+    Returns:
+        (o, final_state):
+            o: [B, T, H, V] bf16
+            final_state: [B, H, V, K] fp32 or None
+    """
+    B, T, H, K = k.shape
+    V = u_bar.shape[-1]
+    NT = T // BT
+    assert T % BT == 0
+    assert NT % S == 0
+
+    o = torch.empty(B, T, H, V, dtype=torch.bfloat16, device=k.device)
+    h_out = torch.empty(0, device=k.device, dtype=torch.bfloat16)
+    v_new_out = torch.empty(0, device=k.device, dtype=torch.bfloat16)
+
+    has_init = initial_state is not None
+    init_st = initial_state.contiguous().float() if has_init else torch.empty(0, device=k.device, dtype=torch.float32)
+    final_st = torch.empty(B, H, V, K, dtype=torch.float32, device=k.device) if output_final_state else torch.empty(0, device=k.device, dtype=torch.float32)
+
+    _opus_gdn_wavefront_h_fwd(
+        k, w_bar, u_bar, g_cumsum,
+        h_out, v_new_out,
+        init_st, final_st,
+        has_init, output_final_state, S, BT,
+        q, o, scale,
+    )
+
+    return o, final_st if output_final_state else None
+
+

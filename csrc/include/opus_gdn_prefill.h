@@ -20,3 +20,20 @@ void opus_gdn_prefill_fwd(
     int num_warps,
     int k1_algo,
     int k2_mode);
+
+void opus_gdn_wavefront_h_fwd(
+    torch::Tensor k,
+    torch::Tensor w_bar,
+    torch::Tensor u_bar,
+    torch::Tensor g_cumsum,
+    torch::Tensor h_out,
+    torch::Tensor v_new_out,
+    torch::Tensor initial_state,
+    torch::Tensor final_state,
+    bool has_initial_state,
+    bool output_final_state,
+    int S,
+    int BT,
+    torch::Tensor q,
+    torch::Tensor o,
+    float scale);
