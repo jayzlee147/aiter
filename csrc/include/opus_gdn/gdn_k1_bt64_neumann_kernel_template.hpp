@@ -200,11 +200,22 @@ gdn_k1_neumann_kernel(gdn_k1_kargs kargs) {
                 ((m_base + 3) == n) ? 1.0f : 0.0f};
         }
 
-        v4f32_t C_accum = I_accum;
-        for (int iter = 0; iter < 15; iter++) {
-            C_accum = mfma_f32_16x16x16_bf16(
-                neg_A_tile, accum_to_src(C_accum), I_accum);
-        }
+        // Triangular inverse via squaring: with B = -A (16×16 strictly-lower,
+        // nilpotent B^16=0), (I+A)^{-1} = sum_{n=0}^{15} B^n
+        //   = (I+B)(I+B^2)(I+B^4)(I+B^8).
+        // 6 MFMAs (3 squarings + 3 products; I+B^8 is a free fp32 acc-add)
+        // vs 15 Horner iterations. Factors commute (all polynomials in B).
+        v4f32_t  b2   = mfma_f32_16x16x16_bf16(neg_A_tile, neg_A_tile, z4);  // B^2
+        v4bf16_t b2_o = accum_to_src(b2);
+        v4f32_t  b4   = mfma_f32_16x16x16_bf16(b2_o, b2_o, z4);              // B^4
+        v4bf16_t b4_o = accum_to_src(b4);
+        v4f32_t  b8   = mfma_f32_16x16x16_bf16(b4_o, b4_o, z4);             // B^8
+        v4bf16_t b8_o = accum_to_src(b8);
+        v4f32_t C_accum;
+        for (int n = 0; n < 4; n++) C_accum[n] = b8[n] + I_accum[n];        // I + B^8
+        C_accum = mfma_f32_16x16x16_bf16(b4_o, accum_to_src(C_accum), C_accum);        // (I+B^4)·R
+        C_accum = mfma_f32_16x16x16_bf16(b2_o, accum_to_src(C_accum), C_accum);        // (I+B^2)·R
+        C_accum = mfma_f32_16x16x16_bf16(neg_A_tile, accum_to_src(C_accum), C_accum);  // (I+B)·R
 
         // Store result and zero upper triangle
         store_fp32_tile(s_A, br, br, A_STRIDE, C_accum, lane_id);
