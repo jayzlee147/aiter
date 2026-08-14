@@ -554,3 +554,90 @@ def test_flydsl_gdr_decode_strided_inputs_and_split_state_indices(
 
     torch.testing.assert_close(output, reference_output, rtol=0, atol=0)
     torch.testing.assert_close(state, reference_state, rtol=0, atol=0)
+def test_flydsl_kda_decode():
+    """Kimi-KDA uses a per-K lower-bounded decay and fp32 beta/state."""
+    B, H, D = 1, 8, 128
+    torch.manual_seed(1)
+    q = torch.randn(B, 1, H, D, dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    a = torch.randn_like(q)
+    beta = torch.randn(B, 1, H, dtype=torch.float32)
+    dt_bias = torch.randn(H, D, dtype=torch.bfloat16)
+    A_log = torch.randn(H, dtype=torch.float32)
+    indices = torch.arange(B, dtype=torch.int32)
+    state = torch.randn(B, H, D, D, dtype=torch.float32)
+    ref_state = state.clone()
+    out = torch.empty_like(v)
+
+    qf, kf, vf, af = q.float(), k.float(), v.float(), a.float()
+    ref_out = torch.empty_like(out)
+    for batch in range(B):
+        for head in range(H):
+            qh = qf[batch, 0, head]
+            kh = kf[batch, 0, head]
+            qh *= torch.rsqrt(torch.sum(qh * qh) + 1e-6) / (D**0.5)
+            kh *= torch.rsqrt(torch.sum(kh * kh) + 1e-6)
+            decay = torch.exp(
+                -5.0
+                * torch.sigmoid(
+                    torch.exp(A_log[head])
+                    * (af[batch, 0, head] + dt_bias[head].float())
+                )
+            )
+            h = ref_state[batch, head] * decay[None, :]
+            update = (vf[batch, 0, head] - h @ kh) * torch.sigmoid(
+                beta[batch, 0, head]
+            )
+            h += update[:, None] * kh[None, :]
+            ref_state[batch, head] = h
+            ref_out[batch, 0, head] = (h @ qh).to(ref_out.dtype)
+
+    flydsl_gdr_decode(
+        q,
+        k,
+        v,
+        a,
+        beta,
+        dt_bias,
+        A_log,
+        indices,
+        state,
+        out,
+        use_qk_l2norm=True,
+        need_shuffle_state=False,
+        is_kda=True,
+        lower_bound=-5.0,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, ref_out, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(state, ref_state, atol=1e-5, rtol=1e-5)
+
+
+def test_flydsl_kda_decode_rejects_multi_token():
+    """The optimized KDA path is intentionally limited to ordinary decode."""
+    B, T, H, D = 1, 2, 8, 128
+    q = torch.empty(B, T, H, D, dtype=torch.bfloat16)
+    beta = torch.empty(B, T, H, dtype=torch.float32)
+    dt_bias = torch.empty(H, D, dtype=torch.bfloat16)
+    A_log = torch.empty(H, dtype=torch.float32)
+    indices = torch.arange(B, dtype=torch.int32)
+    state = torch.empty(B, H, D, D, dtype=torch.float32)
+    out = torch.empty_like(q)
+
+    with pytest.raises(ValueError, match="single-token decode only"):
+        flydsl_gdr_decode(
+            q,
+            q,
+            q,
+            q,
+            beta,
+            dt_bias,
+            A_log,
+            indices,
+            state,
+            out,
+            use_qk_l2norm=True,
+            need_shuffle_state=False,
+            is_kda=True,
+        )

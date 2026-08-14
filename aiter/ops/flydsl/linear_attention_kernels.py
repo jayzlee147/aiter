@@ -33,11 +33,49 @@ def get_default_kwargs(
     num_v_heads,
     head_k_dim,
     head_v_dim,
+    is_kda=False,
 ):
     d = {}
     d["NUM_BLOCKS_PER_V_DIM"] = 1
     d["NUM_WARPS"] = 4
     d["WARP_THREADS_K"] = 8
+    d["SHARE_KDA_GATE_LDS"] = False
+    # Kimi-K3 TP8 small-batch decode needs extra V parallelism. Scale the split
+    # down quickly as batch itself supplies enough workgroups; retaining the
+    # batch-1 split at larger batches increases VMEM latency and loses badly.
+    # These shapes were tuned on gfx942/MI308X.
+    if (
+        is_kda
+        and GDR_GPU_ARCH == "gfx942"
+        and state_dtype_str == "torch.float32"
+        and batch_size in (1, 2, 4)
+        and seq_length == 1
+        and num_k_heads == num_v_heads == 8
+        and head_k_dim == head_v_dim == 128
+    ):
+        if batch_size == 1:
+            d.update(NUM_BLOCKS_PER_V_DIM=16, NUM_WARPS=4, WARP_THREADS_K=32)
+        elif batch_size == 2:
+            d.update(NUM_BLOCKS_PER_V_DIM=8, NUM_WARPS=4, WARP_THREADS_K=16)
+        else:  # batch_size == 4
+            d.update(NUM_BLOCKS_PER_V_DIM=2, NUM_WARPS=4, WARP_THREADS_K=16)
+    elif (
+        is_kda
+        and GDR_GPU_ARCH == "gfx942"
+        and state_dtype_str == "torch.float32"
+        and batch_size >= 8
+        and seq_length == 1
+        and num_k_heads == num_v_heads == 8
+        and head_k_dim == head_v_dim == 128
+    ):
+        # Keep roughly 128 blocks at B8, then switch to full-V blocks once the
+        # batch supplies that grid parallelism itself. Sixteen K lanes halves
+        # the K-loop depth versus the generic 8-lane layout.
+        d.update(
+            NUM_BLOCKS_PER_V_DIM=2 if batch_size == 8 else 1,
+            NUM_WARPS=4,
+            WARP_THREADS_K=16,
+        )
     global GDR_GLOBAL_CONFIG_MAP
     if GDR_GLOBAL_CONFIG_MAP is None:
         _dict = {}
@@ -95,10 +133,17 @@ def flydsl_gdr_decode(
     out: torch.Tensor,
     use_qk_l2norm: bool,
     need_shuffle_state: bool,
+    is_kda: bool = False,
+    lower_bound: float = -5.0,
     stream: torch.cuda.Stream = None,
     read_indices: torch.Tensor | None = None,
     write_indices: torch.Tensor | None = None,
 ):
+    if is_kda and query.shape[1] != 1:
+        raise ValueError(
+            "FlyDSL KDA currently supports single-token decode only; "
+            f"got seq_length={query.shape[1]}"
+        )
     if stream is None:
         stream = torch.cuda.current_stream()
     device = query.device
@@ -119,8 +164,12 @@ def flydsl_gdr_decode(
     ]:
         assert input.device == device
     assert state.data_ptr() % 16 == 0
-    for input in [key, value, a, b, dt_bias, out]:
+    for input in [key, value, a, dt_bias, out]:
         assert input.dtype == dtype
+    if not is_kda:
+        assert b.dtype == dtype
+    else:
+        assert b.dtype in [dtype, torch.float32]
     assert state.dtype in [torch.float, torch.bfloat16]
     assert A_log.dtype in [torch.float, torch.bfloat16]
     assert read_indices.dtype == torch.int32
@@ -152,10 +201,12 @@ def flydsl_gdr_decode(
         num_v_heads,
         head_k_dim,
         head_v_dim,
+        is_kda,
     )
     exe = create_vk_gdr_decode_kernel(
         get_dtype_str(query.dtype),
         get_dtype_str(A_log.dtype),
+        get_dtype_str(b.dtype),
         get_dtype_str(state_.dtype),
         seq_length,
         num_k_heads,
@@ -169,6 +220,8 @@ def flydsl_gdr_decode(
         a.stride(),
         b.stride(),
         use_qk_l2norm,
+        is_kda=is_kda,
+        lower_bound=lower_bound,
         **kwargs_,
     )
     with torch.cuda.device(query.device.index):
