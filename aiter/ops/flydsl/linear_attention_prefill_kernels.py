@@ -33,7 +33,9 @@ from ..triton._triton_kernels.gated_delta_rule.utils import (
 )
 from .kernels.chunk_gated_delta_h import compile_chunk_gated_delta_h
 from .kernels.gdn_prepare import compile_gdn_prepare
+from .kernels.kda_prefill import run_kda_prefill_recurrent
 from .kernels.tensor_shim import _run_compiled
+from .kda_prefill_policy import KdaPrefillRoute, select_kda_prefill_route
 
 # log2(e); g pre-scaled by this constant lets the kernel use exp2(g) in
 # place of exp(g) (matches the Triton VK / HIP convention).
@@ -45,7 +47,89 @@ __all__ = [
     "chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip",
     "gdn_prepare_flydsl_supported",
     "gdn_prepare_fwd_flydsl",
+    "kda_prepare_fwd_flydsl",
+    "flydsl_kda_prefill",
 ]
+
+
+def flydsl_kda_prefill(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    *,
+    lower_bound: float = -5.0,
+    output_final_state: bool = True,
+    route: str | KdaPrefillRoute | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Kimi-K3 KDA prefill through the persistent FlyDSL recurrence."""
+    if q.shape != k.shape or q.shape != g.shape:
+        raise ValueError("FlyDSL KDA prefill requires q, k, and g to share a shape.")
+    if q.ndim != 4 or q.shape[0] != 1 or q.shape[-1] != 128:
+        raise ValueError("FlyDSL KDA prefill requires q=[1,T,H,128].")
+    if v.shape != q.shape:
+        raise ValueError("FlyDSL KDA prefill currently requires H==HV and K==V==128.")
+    if q.dtype != torch.bfloat16 or any(
+        x.dtype != torch.bfloat16 for x in (k, v, g)
+    ):
+        raise ValueError("FlyDSL KDA prefill requires BF16 q/k/v/g.")
+    if beta.dtype != torch.float32:
+        raise ValueError("FlyDSL KDA prefill requires FP32 beta logits.")
+    if initial_state.dtype != torch.float32:
+        raise ValueError("FlyDSL KDA prefill requires FP32 recurrent state.")
+    n = len(cu_seqlens) - 1
+    expected_state = (n, q.shape[2], 128, 128)
+    if tuple(initial_state.shape) != expected_state:
+        raise ValueError(
+            f"FlyDSL KDA prefill requires V-first state {expected_state}, "
+            f"got {tuple(initial_state.shape)}."
+        )
+    if cu_seqlens.dtype != torch.int64:
+        cu_seqlens = cu_seqlens.to(torch.int64)
+
+    # Keep the existing API on its validated leaf while the chunked leaves
+    # are being brought up.  ``route='auto'`` exercises the new production
+    # policy; once all four leaves are launchable, auto becomes the default.
+    if route is None:
+        selected = KdaPrefillRoute.RECURRENT
+    elif str(route).lower() == "auto":
+        selected = select_kda_prefill_route(
+            arch=get_rocm_arch(), total_tokens=q.shape[1], num_sequences=n
+        )
+    else:
+        selected = KdaPrefillRoute(route)
+    # Route selection is already part of the public ABI, but only the
+    # correctness leaf is launchable until the four chunked leaves below it
+    # have landed.  Refuse an unavailable forced/automatic route instead of
+    # silently benchmarking the recurrent implementation under a fast name.
+    if selected is not KdaPrefillRoute.RECURRENT:
+        raise NotImplementedError(
+            f"FlyDSL KDA prefill route {selected.value.upper()} is selected but "
+            "its chunked kernel is not implemented yet; use route='recurrent'"
+        )
+
+    q, k, v, g, beta = (x.contiguous() for x in (q, k, v, g, beta))
+    state = initial_state.contiguous().clone()
+    out = torch.empty_like(v)
+    run_kda_prefill_recurrent(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        A_log.contiguous(),
+        dt_bias.contiguous().view(q.shape[2], 128),
+        cu_seqlens.contiguous(),
+        state,
+        out,
+        lower_bound=lower_bound,
+    )
+    return out, state if output_final_state else None
 
 
 # -- Hidden-state host wrapper (FlyDSL kernel + rule-based BV selection) ---
@@ -367,8 +451,6 @@ def _launch_kernel(
         grid_nh,
         stream,
     )
-
-
 def chunk_gated_delta_rule_fwd_h_flydsl(
     k: torch.Tensor,
     w: torch.Tensor,
@@ -1341,8 +1423,9 @@ def gdn_prepare_fwd_flydsl(
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
     prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
+    output_c: bool = False,
     stream=None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused GDN prepare wrapper compatible with the Triton prepare pair.
 
     It preserves input/output layouts and exponent semantics without
@@ -1362,11 +1445,13 @@ def gdn_prepare_fwd_flydsl(
         num_decodes / num_decode_tokens: skip a leading decode-only prefix in
             ``cu_seqlens``; data tensors contain only prefill tokens.
         prefill_metadata: reusable schedule required for variable-length input.
+        output_c: select C output instead of W/U. The two prepare formats are
+            mutually exclusive.
         stream: launch stream; defaults to the current stream.
 
     Returns:
-        Head-major contiguous ``w_bar [B,H,T,K]`` bf16,
-        ``u_bar [B,H,T,V]`` bf16, and ``g_cumsum [B,H,T]`` fp32.
+        W/U mode returns head-major contiguous ``(w_bar, u_bar, g_cumsum)``.
+        C mode returns only FP32 ``C [B,H,T,BT]``.
 
     ``T`` need not be a multiple of ``BT``.
     """
@@ -1443,9 +1528,26 @@ def gdn_prepare_fwd_flydsl(
         NT = (T + BT - 1) // BT
 
     # Every output position is written once.
-    w_bar = torch.empty(B, H, T, K, dtype=torch.bfloat16, device=k.device)
-    u_bar = torch.empty(B, H, T, V, dtype=torch.bfloat16, device=k.device)
-    g_cumsum = torch.empty(B, H, T, dtype=torch.float32, device=k.device)
+    w_bar = (
+        k
+        if output_c
+        else torch.empty(B, H, T, K, dtype=torch.bfloat16, device=k.device)
+    )
+    u_bar = (
+        v
+        if output_c
+        else torch.empty(B, H, T, V, dtype=torch.bfloat16, device=k.device)
+    )
+    g_cumsum = (
+        g
+        if output_c
+        else torch.empty(B, H, T, dtype=torch.float32, device=k.device)
+    )
+    c = (
+        torch.empty(B, H, T, BT, dtype=torch.float32, device=k.device)
+        if output_c
+        else k
+    )
 
     grid_x = NT
     grid_y = num_seqs * H
@@ -1463,6 +1565,7 @@ def gdn_prepare_fwd_flydsl(
         V=V,
         is_varlen=is_varlen,
         g_scale=_RCP_LN2 if use_exp2 else 1.0,
+        output_c=output_c,
     )
     _run_compiled(
         exe,
@@ -1474,6 +1577,9 @@ def gdn_prepare_fwd_flydsl(
         w_bar.view(-1),
         u_bar.view(-1),
         g_cumsum.view(-1),
+        c.view(-1),
+        k.view(-1),  # unused A_log placeholder in the GDN specialization
+        k.view(-1),  # unused dt_bias placeholder in the GDN specialization
         T,
         H,
         Hg,
@@ -1481,5 +1587,170 @@ def gdn_prepare_fwd_flydsl(
         grid_y,
         stream,
     )
+    if output_c:
+        return c
+    return w_bar, u_bar, g_cumsum
 
+
+def kda_prepare_fwd_flydsl(
+    k: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    cu_seqlens: torch.Tensor | None = None,
+    *,
+    v: torch.Tensor | None = None,
+    BT: int = 64,
+    lower_bound: float = -5.0,
+    output_c: bool = True,
+    prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
+    stream=None,
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    """FlashKDA-compatible vector-gate prepare with orthogonal outputs.
+
+    The same FlyDSL kernel as :func:`gdn_prepare_fwd_flydsl` is specialized
+    with ``is_kda=True``. It normalizes K, activates the per-channel decay
+    ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))``, activates beta
+    logits, and forms the vector-decayed KKT matrix. ``output_c=False`` selects
+    W/U; ``output_c=True`` selects C. The formats are mutually exclusive.
+    """
+    if BT != 64 or k.ndim != 4 or k.shape[-1] != 128:
+        raise ValueError("KDA FlyDSL prepare requires k=[B,T,H,128] and BT=64")
+    if g.shape != k.shape or g.dtype is not torch.bfloat16:
+        raise ValueError("KDA FlyDSL prepare requires BF16 vector gate matching k")
+    if k.dtype is not torch.bfloat16:
+        raise ValueError("KDA FlyDSL prepare requires BF16 k")
+    B, T, H, K = k.shape
+    if beta.shape != (B, T, H) or beta.dtype is not torch.float32:
+        raise ValueError("KDA FlyDSL prepare requires FP32 beta logits [B,T,H]")
+    if A_log.shape != (H,) or A_log.dtype is not torch.float32:
+        raise ValueError("KDA FlyDSL prepare requires FP32 A_log [H]")
+    if dt_bias.shape != (H, K) or dt_bias.dtype is not torch.float32:
+        raise ValueError("KDA FlyDSL prepare requires FP32 dt_bias [H,K]")
+    if not output_c:
+        if v is None or v.shape != k.shape or v.dtype is not torch.bfloat16:
+            raise ValueError("KDA W/U output requires BF16 v matching k")
+    elif v is None:
+        v = k
+    if not gdn_prepare_flydsl_supported(k, k, BT=BT):
+        raise ValueError("KDA FlyDSL prepare requires co-resident BF16 CDNA tensors")
+
+    k, v, g, beta, A_log, dt_bias = (
+        x.contiguous() for x in (k, v, g, beta, A_log, dt_bias)
+    )
+    is_varlen = cu_seqlens is not None
+    if is_varlen:
+        if B != 1 or prefill_metadata is None:
+            raise ValueError(
+                "packed KDA prepare requires B=1 and host-resident prefill_metadata"
+            )
+        prefill_metadata.validate(
+            cu_seqlens=cu_seqlens,
+            chunk_size=BT,
+            num_decodes=0,
+            num_decode_tokens=0,
+            total_prefill_tokens=T,
+            num_sequences=len(cu_seqlens) - 1,
+        )
+        schedule = prefill_metadata.get_chunk_schedule(BT)
+        num_seqs = schedule.n_prefill
+        nt = schedule.max_seq_chunks
+        cu = schedule.kernel_cu_seqlens.to(
+            device=k.device, dtype=torch.int32
+        ).contiguous()
+    else:
+        num_seqs = B
+        nt = (T + BT - 1) // BT
+        cu = k
+
+    # KDA W/U consumes the factor as private workspace; it is not exposed in
+    # the W/U return format.
+    c = torch.empty(B, H, T, BT, dtype=torch.float32, device=k.device)
+    w_bar = (
+        k
+        if output_c
+        else torch.empty(B, H, T, K, dtype=torch.bfloat16, device=k.device)
+    )
+    u_bar = (
+        v
+        if output_c
+        else torch.empty_like(w_bar)
+    )
+    g_cumsum = (
+        g
+        if output_c
+        else torch.empty(B, H, T, K, dtype=torch.float32, device=k.device)
+    )
+    if stream is None:
+        stream = torch.cuda.current_stream()
+    exe = compile_gdn_prepare(
+        BT=BT,
+        K=K,
+        V=K,
+        is_varlen=is_varlen,
+        output_c=True,
+        is_kda=True,
+        lower_bound=float(lower_bound),
+    )
+    _run_compiled(
+        exe,
+        k.view(-1),
+        v.view(-1),
+        g.view(-1),
+        beta.view(-1),
+        cu.view(-1),
+        w_bar.view(-1),
+        u_bar.view(-1),
+        g_cumsum.view(-1),
+        c.view(-1),
+        A_log.view(-1),
+        dt_bias.view(-1),
+        T,
+        H,
+        H,
+        _pad_grid_x_odd(nt) if is_varlen and nt >= 2 else nt,
+        num_seqs * H,
+        stream,
+    )
+    if output_c:
+        return c
+    gate = lower_bound * torch.sigmoid(
+        torch.exp(A_log)[None, None, :, None]
+        * (g.float() + dt_bias[None, None, :, :])
+    )
+    seq_lengths = (
+        tuple(prefill_metadata.layout.seq_lens_cpu) if is_varlen else (T,) * B
+    )
+    token_base = 0
+    for seq, seq_len in enumerate(seq_lengths):
+        out_batch = 0 if is_varlen else seq
+        seq_base = token_base if is_varlen else 0
+        for chunk_start in range(0, seq_len, BT):
+            length = min(BT, seq_len - chunk_start)
+            rows = slice(seq_base + chunk_start, seq_base + chunk_start + length)
+            g_cumsum[out_batch, :, rows] = gate[out_batch, rows].cumsum(0).permute(
+                1, 0, 2
+            )
+        token_base += seq_len
+    kn = torch.nn.functional.normalize(k.float(), dim=-1, eps=1e-6)
+    beta_act = torch.sigmoid(beta)
+    gc_tm = g_cumsum.permute(0, 2, 1, 3).to(torch.bfloat16).float()
+    rhs_w = kn * beta_act[..., None] * torch.exp(gc_tm)
+    rhs_u = v.float() * beta_act[..., None]
+    token_base = 0
+    for seq, seq_len in enumerate(seq_lengths):
+        out_batch = 0 if is_varlen else seq
+        seq_base = token_base if is_varlen else 0
+        for chunk_start in range(0, seq_len, BT):
+            length = min(BT, seq_len - chunk_start)
+            rows = slice(seq_base + chunk_start, seq_base + chunk_start + length)
+            factor = c[out_batch, :, rows, :length]
+            w_bar[out_batch, :, rows] = torch.matmul(
+                factor, rhs_w[out_batch, rows].permute(1, 0, 2)
+            ).to(torch.bfloat16)
+            u_bar[out_batch, :, rows] = torch.matmul(
+                factor, rhs_u[out_batch, rows].permute(1, 0, 2)
+            ).to(torch.bfloat16)
+        token_base += seq_len
     return w_bar, u_bar, g_cumsum

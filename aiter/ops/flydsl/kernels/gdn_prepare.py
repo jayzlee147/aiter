@@ -158,14 +158,25 @@ def _wy_epilogue_to_lds(wy, dst, copy_atom):
             fx.copy(copy_atom, frag_p, dst_p)
 
 
-def _wy_scatter(regs, s_vT, s_beta, gc, is_k, tid, stage_iters, svec_per_row, svec):
+def _wy_scatter(
+    regs,
+    s_vT,
+    s_beta,
+    gc,
+    is_k,
+    tid,
+    stage_iters,
+    svec_per_row,
+    svec,
+    pre_scaled=False,
+):
     """Scale and transpose the RHS while preserving its staging layout."""
     for it in range(stage_iters):
         vals = fx.Vector(regs[None, it, 0].load())
         p = tid + it * BLOCK_THREADS
         j = p // svec_per_row
         row0 = (p % svec_per_row) * svec
-        scale_j = (gc if is_k else s_beta)[j]
+        scale_j = fx.Float32(1.0) if pre_scaled else (gc if is_k else s_beta)[j]
         for vv in range(svec):
             val = vals[vv].to(fx.Float32)
             s_vT[row0 + vv, j] = (val * scale_j).to(fx.BFloat16)
@@ -189,6 +200,9 @@ def compile_gdn_prepare(
     V: int = 128,
     is_varlen: bool = False,
     g_scale: float = 1.0,
+    output_c: bool = False,
+    is_kda: bool = False,
+    lower_bound: float = -5.0,
 ):
     """Compile the KKT, triangular inverse, and WY preparation kernel.
 
@@ -219,11 +233,25 @@ def compile_gdn_prepare(
         s_A: fx.Array[fx.Float32, BT * ASA, 16]
         wy: _WYStaging
 
-    @fx.struct
-    class _SharedStorage:
-        s_g: fx.Array[fx.Float32, BT, 16]
-        s_beta: fx.Array[fx.Float32, BT, 16]
-        p0: _P0
+    if is_kda:
+
+        @fx.struct
+        class _SharedStorage:
+            s_g: fx.Array[fx.Float32, BT, 16]
+            s_beta: fx.Array[fx.Float32, BT, 16]
+            # KDA has one cumulative decay per key channel. BF16 publication
+            # matches FlashKDA's bounded prepare operands and keeps LDS below
+            # the CDNA per-workgroup limit.
+            s_gc: fx.Array[fx.BFloat16, BT * K, 16]
+            p0: _P0
+
+    else:
+
+        @fx.struct
+        class _SharedStorage:
+            s_g: fx.Array[fx.Float32, BT, 16]
+            s_beta: fx.Array[fx.Float32, BT, 16]
+            p0: _P0
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1], name="gdn_prepare_kernel")
     def gdn_prepare_kernel(
@@ -235,6 +263,9 @@ def compile_gdn_prepare(
         wbar_t: fx.Tensor,
         ubar_t: fx.Tensor,
         gcs_t: fx.Tensor,
+        c_t: fx.Tensor,
+        a_log_t: fx.Tensor,
+        dt_bias_t: fx.Tensor,
         T: fx.Int32,
         H: fx.Int32,
         Hg: fx.Int32,
@@ -275,7 +306,9 @@ def compile_gdn_prepare(
         if active:
             # Bounded views handle ragged final chunks.
             seq_end = bos + seqlen
-            lim_gb = (seq_end * H * 4).ir_value()
+            gate_elem_bytes = 2 if is_kda else 4
+            gate_width = K if is_kda else 1
+            lim_gb = (seq_end * H * gate_width * gate_elem_bytes).ir_value()
             lim_k = (seq_end * Hg * K * 2).ir_value()
             lim_v = (seq_end * H * V * 2).ir_value()
             # Head-major output range for this chunk.
@@ -286,9 +319,11 @@ def compile_gdn_prepare(
                 hm_row = (i_b * H + i_h) * T
                 hm_end = hm_row + seqlen
             hm_row = hm_row + chunk_start
-            lim_gcs = (hm_end * 4).ir_value()
+            gcs_width = K if is_kda else 1
+            lim_gcs = (hm_end * gcs_width * 4).ir_value()
             lim_ub = (hm_end * V * 2).ir_value()
             lim_wb = (hm_end * K * 2).ir_value()
+            lim_c = (hm_end * BT * 4).ir_value()
             k_g = fx.rocdl.make_buffer_tensor(k_t, num_records_bytes=lim_k)
             v_g = fx.rocdl.make_buffer_tensor(v_t, num_records_bytes=lim_v)
             g_g = fx.rocdl.make_buffer_tensor(g_t, num_records_bytes=lim_gb)
@@ -296,22 +331,30 @@ def compile_gdn_prepare(
             gcs_g = fx.rocdl.make_buffer_tensor(gcs_t, num_records_bytes=lim_gcs)
             wbar_g = fx.rocdl.make_buffer_tensor(wbar_t, num_records_bytes=lim_wb)
             ubar_g = fx.rocdl.make_buffer_tensor(ubar_t, num_records_bytes=lim_ub)
+            if const_expr(output_c):
+                c_g = fx.rocdl.make_buffer_tensor(c_t, num_records_bytes=lim_c)
+            if const_expr(is_kda):
+                a_log_g = fx.rocdl.make_buffer_tensor(a_log_t)
+                dt_bias_g = fx.rocdl.make_buffer_tensor(dt_bias_t)
 
             lds = fx.SharedAllocator().allocate(_SharedStorage)
             s_g = lds.s_g.peek().view(fx.make_layout(BT, 1))
             s_beta = lds.s_beta.peek().view(fx.make_layout(BT, 1))
+            if const_expr(is_kda):
+                s_gc = lds.s_gc.peek().view(fx.make_layout((BT, K), (K, 1)))
             s_k = lds.p0.s_k.peek().view(fx.make_layout((BT, K), (KS, 1)))
             s_A = lds.p0.s_A.peek().view(fx.make_layout((BT, BT), (ASA, 1)))
             s_vT = lds.p0.wy.s_vT.peek().view(fx.make_layout((BT, BT), (VTS, 1)))
             s_vT_swz = _swizzled_vt_view(s_vT)
             s_out = lds.p0.wy.s_out.peek().view(fx.make_layout((BT, OUT_S), (OUT_S, 1)))
 
-            base_gb = (bos + chunk_start) * H + i_h
+            base_gb = ((bos + chunk_start) * H + i_h) * gate_width
             base_k = ((bos + chunk_start) * Hg + i_hg) * K
             base_v = ((bos + chunk_start) * H + i_h) * V
-            base_gcs = hm_row
+            base_gcs = hm_row * gcs_width
             base_ub = hm_row * V
             base_wb = hm_row * K
+            base_c = hm_row * BT
             zero_f = fx.Float32(0.0)
             is_lane = tid < BT
 
@@ -356,76 +399,195 @@ def compile_gdn_prepare(
             )
             k_dst = k_store_copy.partition_D(s_k)
 
-            if is_lane:
-                gi = base_gb + tid * H
-                g_src = fx.make_view(fx.get_iter(g_g) + gi, fx.make_layout(1, 1))
-                beta_src = fx.make_view(fx.get_iter(beta_g) + gi, fx.make_layout(1, 1))
-                g_reg = fx.make_fragment_like(g_src)
-                beta_reg = fx.make_fragment_like(beta_src)
-                fx.copy(buf_copy_f32, g_src, g_reg)
-                fx.copy(buf_copy_f32, beta_src, beta_reg)
-                gv = g_reg[0]
-                bv = beta_reg[0]
-                csum = _wave_inclusive_scan(gv, tid, BT, zero_f)
-                s_g[tid] = csum
-                s_beta[tid] = bv
-                out = csum if g_scale == 1.0 else csum * g_scale
-                gcs_dst = fx.make_view(
-                    fx.get_iter(gcs_g) + base_gcs + tid, fx.make_layout(1, 1)
-                )
-                gcs_reg = fx.make_fragment_like(gcs_dst)
-                gcs_reg[0] = out
-                fx.copy(buf_copy_f32, gcs_reg, gcs_dst)
-
             kkt = block_thr_mma.make_fragment_C(s_A)
             kkt.fill(0.0)
             kregs = fx.make_fragment_like(k_src)
             fx.copy(buf_copy, k_src, kregs)
             gc = s_g
-            # Publish k, g, and beta before forming KKT.
             fx.copy(lds_copy64, k_store_copy.retile(kregs), k_dst)
-            gpu.barrier()
-
-            # Form the gated strictly lower-triangular KKT matrix.
-            for ek in range_constexpr(K // 16):
-                s_k_tile = fx.make_view(
-                    fx.get_iter(s_k) + ek * 16,
-                    fx.make_layout((BT, 16), (KS, 1)),
-                )
-                frag_a = block_thr_mma.make_fragment_A(s_k_tile)
-                frag_b = block_thr_mma.make_fragment_B(s_k_tile)
-                fx.copy(
-                    lds_copy64,
-                    block_copy_A.partition_S(s_k_tile),
-                    block_copy_A.retile(frag_a),
-                )
-                fx.copy(
-                    lds_copy64,
-                    block_copy_B.partition_S(s_k_tile),
-                    block_copy_B.retile(frag_b),
-                )
-                fx.gemm(mma_atom, kkt, frag_a, frag_b, kkt)
-            # s_A aliases s_k, so all s_k reads must complete before storing s_A.
-            gpu.barrier()
             n16 = lane % 16
             mb4 = (lane // 16) * 4
-            for en in range_constexpr(4):
-                for p in range_constexpr(4):
-                    s = warp16 + mb4 + p
-                    r = en * 16 + n16
-                    cval = kkt[(p, 0), 0, en]
-                    beta_s = s_beta[s]
-                    gc_s = gc[s]
-                    gc_r = gc[r]
-                    decay = _exp2_f32((gc_s - gc_r) * LOG2E)
-                    aval = (s > r).select(cval * beta_s * decay, zero_f)
-                    kkt[(p, 0), 0, en] = aval
-            fx.copy(
-                lds_copy32,
-                block_copy_C32.retile(kkt),
-                block_copy_C32.partition_D(s_A),
-            )
-            gpu.barrier()
+
+            if const_expr(is_kda):
+                # Stage vector gates alongside K. Gate input is BF16
+                # [B,T,H,K], beta contains FP32 logits [B,T,H].
+                gc_src = k_load_copy.partition_S(
+                    fx.make_view(
+                        fx.get_iter(g_g) + base_gb,
+                        fx.make_layout((BT, K), (H * K, 1)),
+                    )
+                )
+                gc_dst = k_store_copy.partition_D(s_gc)
+                gc_regs = fx.make_fragment_like(gc_src)
+                fx.copy(buf_copy, gc_src, gc_regs)
+                fx.copy(lds_copy64, k_store_copy.retile(gc_regs), gc_dst)
+                if is_lane:
+                    bi = ((bos + chunk_start + tid) * H + i_h)
+                    beta_src = fx.make_view(
+                        fx.get_iter(beta_g) + bi, fx.make_layout(1, 1)
+                    )
+                    beta_reg = fx.make_fragment_like(beta_src)
+                    fx.copy(buf_copy_f32, beta_src, beta_reg)
+                    s_beta[tid] = fx.Float32(1.0) / (
+                        fx.Float32(1.0) + _exp2_f32(-beta_reg[0] * LOG2E)
+                    )
+                    s_g[tid] = zero_f
+                gpu.barrier()
+
+                # Normalize K row-wise. One wave handles one row at a time;
+                # each lane owns two adjacent key channels.
+                for row_it in range_constexpr(BT // 4):
+                    row = warp + row_it * 4
+                    k0 = lane * 2
+                    x0 = s_k[row, k0].to(fx.Float32)
+                    x1 = s_k[row, k0 + 1].to(fx.Float32)
+                    ss = x0 * x0 + x1 * x1
+                    for sh in (32, 16, 8, 4, 2, 1):
+                        ss = ss + gpu.shuffle(ss, sh, WARP_SIZE, mode="xor")
+                    inv = fx.Float32(fx.rocdl.rsq(fx.Float32.ir_type, (ss + 1e-6).ir_value()))
+                    s_k[row, k0] = (x0 * inv).to(fx.BFloat16)
+                    s_k[row, k0 + 1] = (x1 * inv).to(fx.BFloat16)
+                gpu.barrier()
+
+                # Activate and prefix-sum every gate channel. A_log is per
+                # head and dt_bias is [H,K], matching FlashKDA.
+                if tid < K:
+                    a_src = fx.make_view(
+                        fx.get_iter(a_log_g) + i_h, fx.make_layout(1, 1)
+                    )
+                    a_reg = fx.make_fragment_like(a_src)
+                    fx.copy(buf_copy_f32, a_src, a_reg)
+                    dt_src = fx.make_view(
+                        fx.get_iter(dt_bias_g) + i_h * K + tid,
+                        fx.make_layout(1, 1),
+                    )
+                    dt_reg = fx.make_fragment_like(dt_src)
+                    fx.copy(buf_copy_f32, dt_src, dt_reg)
+                    a = _exp2_f32(a_reg[0] * LOG2E)
+                    run = zero_f
+                    for row in range_constexpr(BT):
+                        raw = s_gc[row, tid].to(fx.Float32) + dt_reg[0]
+                        sig = fx.Float32(1.0) / (
+                            fx.Float32(1.0) + _exp2_f32(-a * raw * LOG2E)
+                        )
+                        run = run + lower_bound * sig
+                        s_gc[row, tid] = run.to(fx.BFloat16)
+                gpu.barrier()
+
+                if const_expr(not output_c):
+                    # Publish the KDA W RHS without modifying normalized K,
+                    # which remains live for the vector-decayed KKT below.
+                    for rhs_it in range_constexpr(
+                        (BT * K) // (BLOCK_THREADS * 2)
+                    ):
+                        rhs_idx = (rhs_it * BLOCK_THREADS + tid) * 2
+                        rhs_row = rhs_idx // K
+                        rhs_k = rhs_idx % K
+                        rhs_vals = fx.BFloat16x2(
+                            [
+                                (
+                                    s_k[rhs_row, rhs_k + p].to(fx.Float32)
+                                    * s_beta[rhs_row]
+                                    * _exp2_f32(
+                                        s_gc[rhs_row, rhs_k + p].to(fx.Float32)
+                                        * LOG2E
+                                    )
+                                ).to(fx.BFloat16)
+                                for p in range_constexpr(2)
+                            ]
+                        )
+                        fx.ptr_store(
+                            rhs_vals,
+                            fx.get_iter(wbar_t) + base_wb + rhs_idx,
+                        )
+                    fx.rocdl.s_waitcnt(vmcnt=0)
+                    gpu.barrier()
+
+                # Vector decay cannot be factored into one scalar per token.
+                # Form A directly; retain all 16 cells per thread until every
+                # read of aliased s_k has completed.
+                vals = [zero_f for _ in range_constexpr((BT * BT) // BLOCK_THREADS)]
+                for ci in range_constexpr((BT * BT) // BLOCK_THREADS):
+                    idx = ci * BLOCK_THREADS + tid
+                    s = idx // BT
+                    r = idx % BT
+                    acc = zero_f
+                    # Keep K as an scf loop when the W/U epilogue is present;
+                    # fully unrolling both phases produces excessive IR.
+                    for kk in range(0, K, 1):
+                        gs = s_gc[s, kk].to(fx.Float32)
+                        gr = s_gc[r, kk].to(fx.Float32)
+                        acc = acc + (
+                            s_k[s, kk].to(fx.Float32)
+                            * s_k[r, kk].to(fx.Float32)
+                            * _exp2_f32((gs - gr) * LOG2E)
+                        )
+                    vals[ci] = (s > r).select(acc * s_beta[s], zero_f)
+                gpu.barrier()
+                for ci in range_constexpr((BT * BT) // BLOCK_THREADS):
+                    idx = ci * BLOCK_THREADS + tid
+                    s_A[idx // BT, idx % BT] = vals[ci]
+                gpu.barrier()
+            else:
+                if is_lane:
+                    gi = base_gb + tid * H
+                    g_src = fx.make_view(
+                        fx.get_iter(g_g) + gi, fx.make_layout(1, 1)
+                    )
+                    beta_src = fx.make_view(
+                        fx.get_iter(beta_g) + gi, fx.make_layout(1, 1)
+                    )
+                    g_reg = fx.make_fragment_like(g_src)
+                    beta_reg = fx.make_fragment_like(beta_src)
+                    fx.copy(buf_copy_f32, g_src, g_reg)
+                    fx.copy(buf_copy_f32, beta_src, beta_reg)
+                    csum = _wave_inclusive_scan(g_reg[0], tid, BT, zero_f)
+                    s_g[tid] = csum
+                    s_beta[tid] = beta_reg[0]
+                    if const_expr(not output_c):
+                        out = csum if g_scale == 1.0 else csum * g_scale
+                        gcs_dst = fx.make_view(
+                            fx.get_iter(gcs_g) + base_gcs + tid,
+                            fx.make_layout(1, 1),
+                        )
+                        gcs_reg = fx.make_fragment_like(gcs_dst)
+                        gcs_reg[0] = out
+                        fx.copy(buf_copy_f32, gcs_reg, gcs_dst)
+                gpu.barrier()
+                for ek in range_constexpr(K // 16):
+                    s_k_tile = fx.make_view(
+                        fx.get_iter(s_k) + ek * 16,
+                        fx.make_layout((BT, 16), (KS, 1)),
+                    )
+                    frag_a = block_thr_mma.make_fragment_A(s_k_tile)
+                    frag_b = block_thr_mma.make_fragment_B(s_k_tile)
+                    fx.copy(
+                        lds_copy64,
+                        block_copy_A.partition_S(s_k_tile),
+                        block_copy_A.retile(frag_a),
+                    )
+                    fx.copy(
+                        lds_copy64,
+                        block_copy_B.partition_S(s_k_tile),
+                        block_copy_B.retile(frag_b),
+                    )
+                    fx.gemm(mma_atom, kkt, frag_a, frag_b, kkt)
+                gpu.barrier()
+                for en in range_constexpr(4):
+                    for p in range_constexpr(4):
+                        s = warp16 + mb4 + p
+                        r = en * 16 + n16
+                        cval = kkt[(p, 0), 0, en]
+                        decay = _exp2_f32((gc[s] - gc[r]) * LOG2E)
+                        kkt[(p, 0), 0, en] = (s > r).select(
+                            cval * s_beta[s] * decay, zero_f
+                        )
+                fx.copy(
+                    lds_copy32,
+                    block_copy_C32.retile(kkt),
+                    block_copy_C32.partition_D(s_A),
+                )
+                gpu.barrier()
 
             # Replace g_cumsum with the scale for the w_bar right-hand side.
             if is_lane:
@@ -565,6 +727,40 @@ def compile_gdn_prepare(
                 _store_fp32_tile(s_A, 48, 0, c41, wave_copy_C32, lds_copy32)
             gpu.barrier()
 
+            # Optional publication of the lower-triangular inverse.  Keeping
+            # this compile-time conditional makes the established W/U-only
+            # path byte-for-byte free of extra global traffic.
+            if const_expr(output_c):
+                for c_it in range_constexpr((BT * BT) // BLOCK_THREADS):
+                    c_idx = c_it * BLOCK_THREADS + tid
+                    c_row = c_idx // BT
+                    if c_row < seqlen - chunk_start:
+                        c_col = c_idx % BT
+                        c_dst = fx.make_view(
+                            fx.get_iter(c_g) + base_c + c_idx,
+                            fx.make_layout(1, 1),
+                        )
+                        c_reg = fx.make_fragment_like(c_dst)
+                        c_reg[0] = s_A[c_row, c_col]
+                        fx.copy(buf_copy_f32, c_reg, c_dst)
+                gpu.barrier()
+
+            # KDA keeps a much larger vector-gate working set alive during
+            # factorization. Reload the inexpensive beta vector at the W/U
+            # phase boundary instead of extending its LDS live range.
+            if const_expr(is_kda and not output_c):
+                if is_lane:
+                    bi = ((bos + chunk_start + tid) * H + i_h)
+                    beta_src = fx.make_view(
+                        fx.get_iter(beta_g) + bi, fx.make_layout(1, 1)
+                    )
+                    beta_reg = fx.make_fragment_like(beta_src)
+                    fx.copy(buf_copy_f32, beta_src, beta_reg)
+                    s_beta[tid] = fx.Float32(1.0) / (
+                        fx.Float32(1.0) + _exp2_f32(-beta_reg[0] * LOG2E)
+                    )
+                gpu.barrier()
+
             SVEC = 8
             SVEC_PER_ROW = BK_SUB // SVEC
             STAGE_ITERS = (BT * SVEC_PER_ROW + BLOCK_THREADS - 1) // BLOCK_THREADS
@@ -640,14 +836,24 @@ def compile_gdn_prepare(
                         wy_copy,
                     )
                 else:
-                    reg = _wy_prefetch(
-                        fx.make_view(
-                            fx.get_iter(k_g) + base_k,
-                            fx.make_layout((BT, BK_SUB), (k_row_stride, 1)),
-                        ),
-                        buf_copy,
-                        wy_copy,
-                    )
+                    if const_expr(is_kda):
+                        reg = _wy_prefetch(
+                            fx.make_view(
+                                fx.get_iter(wbar_g) + base_wb,
+                                fx.make_layout((BT, BK_SUB), (K, 1)),
+                            ),
+                            buf_copy,
+                            wy_copy,
+                        )
+                    else:
+                        reg = _wy_prefetch(
+                            fx.make_view(
+                                fx.get_iter(k_g) + base_k,
+                                fx.make_layout((BT, BK_SUB), (k_row_stride, 1)),
+                            ),
+                            buf_copy,
+                            wy_copy,
+                        )
                 gpu.barrier()
                 wy = _acc16_n4()
                 for ek in range_constexpr(BT // 16):
@@ -674,7 +880,8 @@ def compile_gdn_prepare(
                         fx.make_layout((16, BK_SUB), (ub_row_stride, 1)),
                     )
                 )
-                fx.copy(buf_copy, out_regs, out_dst)
+                if const_expr(not output_c):
+                    fx.copy(buf_copy, out_regs, out_dst)
 
             # w_bar = C @ (k * beta * exp(g))
             for k_it in range_constexpr(N_K_ITERS):
@@ -690,16 +897,29 @@ def compile_gdn_prepare(
                     STAGE_ITERS,
                     SVEC_PER_ROW,
                     SVEC,
+                    pre_scaled=is_kda,
                 )
                 if k_it + 1 < N_K_ITERS:
-                    reg = _wy_prefetch(
-                        fx.make_view(
-                            fx.get_iter(k_g) + base_k + (k_it + 1) * BK_SUB,
-                            fx.make_layout((BT, BK_SUB), (k_row_stride, 1)),
-                        ),
-                        buf_copy,
-                        wy_copy,
-                    )
+                    if const_expr(is_kda):
+                        reg = _wy_prefetch(
+                            fx.make_view(
+                                fx.get_iter(wbar_g)
+                                + base_wb
+                                + (k_it + 1) * BK_SUB,
+                                fx.make_layout((BT, BK_SUB), (K, 1)),
+                            ),
+                            buf_copy,
+                            wy_copy,
+                        )
+                    else:
+                        reg = _wy_prefetch(
+                            fx.make_view(
+                                fx.get_iter(k_g) + base_k + (k_it + 1) * BK_SUB,
+                                fx.make_layout((BT, BK_SUB), (k_row_stride, 1)),
+                            ),
+                            buf_copy,
+                            wy_copy,
+                        )
                 gpu.barrier()
                 wy = _acc16_n4()
                 for ek in range_constexpr(BT // 16):
@@ -726,7 +946,8 @@ def compile_gdn_prepare(
                         fx.make_layout((16, BK_SUB), (wb_row_stride, 1)),
                     )
                 )
-                fx.copy(buf_copy, out_regs, out_dst)
+                if const_expr(not output_c):
+                    fx.copy(buf_copy, out_regs, out_dst)
 
     @flyc.jit
     def launch_gdn_prepare(
@@ -738,6 +959,9 @@ def compile_gdn_prepare(
         wbar_t: fx.Tensor,
         ubar_t: fx.Tensor,
         gcs_t: fx.Tensor,
+        c_t: fx.Tensor,
+        a_log_t: fx.Tensor,
+        dt_bias_t: fx.Tensor,
         T: fx.Int32,
         H: fx.Int32,
         Hg: fx.Int32,
@@ -746,7 +970,20 @@ def compile_gdn_prepare(
         stream: fx.Stream,
     ):
         gdn_prepare_kernel(
-            k_t, v_t, g_t, beta_t, cu_t, wbar_t, ubar_t, gcs_t, T, H, Hg
+            k_t,
+            v_t,
+            g_t,
+            beta_t,
+            cu_t,
+            wbar_t,
+            ubar_t,
+            gcs_t,
+            c_t,
+            a_log_t,
+            dt_bias_t,
+            T,
+            H,
+            Hg,
         ).launch(
             grid=(grid_x, grid_y, 1),
             block=(BLOCK_THREADS, 1, 1),
