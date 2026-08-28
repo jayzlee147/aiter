@@ -7,10 +7,9 @@ The native implementation has a deliberately narrower surface than the public
 KDA wrapper.  These tests keep the production contract explicit: packed B=1
 BF16 activations, FP32 beta/gate parameters, one-dimensional ``dt_bias``, GPU
 int32 sequence metadata, and an FP32 V-first recurrent state.  The numerical
-Equal-head cases use the PR #4683 Triton FlashKDA implementation directly so
-the public ``auto`` selector cannot accidentally compare one backend with
-itself.  GVA cases use the general Triton chunk pipeline because the private
-FlashKDA entry is explicitly equal-head-only.
+tests select the Triton implementation explicitly through the public wrapper,
+so the public ``auto`` selector cannot accidentally compare one backend with
+itself.
 """
 
 from __future__ import annotations
@@ -25,9 +24,6 @@ import torch.nn.functional as F
 from aiter.ops.flash_kda import (
     flash_kda_fwd as flash_kda_native_fwd,
     flash_kda_native_supported,
-)
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.flash_kda import (
-    flash_kda_fwd as flash_kda_triton_fwd,
 )
 from op_tests.triton_tests.utils.kda_ref import chunk_kda_ref
 
@@ -176,31 +172,7 @@ def _native_support_kwargs(inputs: dict[str, object]) -> dict[str, object]:
 
 
 def _triton_call(inputs: dict[str, object]):
-    # The private FlashKDA entry below is intentionally equal-head-only.  Its
-    # public capability predicate rejects GVA, but the raw function itself does
-    # not: it sizes and launches its workspace from q.shape[2], leaving the
-    # extra value heads undefined.  Use the general Triton chunk pipeline as
-    # the long-sequence GVA oracle; the small GVA matrix below additionally
-    # checks both implementations against the token-wise fp32 reference.
-    if inputs["v"].shape[2] != inputs["q"].shape[2]:
-        return _PUBLIC_MODULE.chunk_kimi_delta_attn(
-            **inputs, backend="baseline"
-        )
-    return flash_kda_triton_fwd(
-        q=inputs["q"],
-        k=inputs["k"],
-        v=inputs["v"],
-        g=inputs["g"],
-        beta=inputs["beta"],
-        A_log=inputs["A_log"],
-        dt_bias=inputs["dt_bias"],
-        scale=inputs["scale"],
-        lower_bound=inputs["lower_bound"],
-        initial_state=inputs["initial_state"],
-        output_final_state=True,
-        state_v_first=True,
-        cu_seqlens=inputs["cu_seqlens"],
-    )
+    return _PUBLIC_MODULE.chunk_kimi_delta_attn(**inputs, backend="triton")
 
 
 def _relative_rms(actual: torch.Tensor, reference: torch.Tensor) -> float:
@@ -483,16 +455,24 @@ def test_gfx950_context_routes_match_triton_and_preserve_empty_state(
             assert torch.equal(native_ht[sequence], initial_copy[sequence])
 
 
+@pytest.mark.parametrize(
+    "value_heads",
+    [pytest.param(2, id="equal-heads"), pytest.param(4, id="gva-2x4")],
+)
 @requires_rocm_gpu
-def test_public_native_backend_reaches_real_kernel():
-    """Verify the production wrapper, allocation adapter, and native JIT together."""
+def test_public_default_backend_reaches_real_native_kernel(
+    monkeypatch, value_heads
+):
+    """Verify zero-env production routing, allocation, and native JIT together."""
 
-    inputs = _make_k3_inputs((33, 71), heads=2, resume=True, seed=11)
+    monkeypatch.delenv("AITER_KDA_BACKEND", raising=False)
+    monkeypatch.delenv("AITER_TRITON_ONLY", raising=False)
+    inputs = _make_k3_inputs(
+        (33, 71), heads=2, value_heads=value_heads, resume=True, seed=11
+    )
     _require_native(inputs)
     direct_o, direct_ht = flash_kda_native_fwd(**_native_kwargs(inputs))
-    public_o, public_ht = _PUBLIC_MODULE.chunk_kimi_delta_attn(
-        **inputs, backend="native"
-    )
+    public_o, public_ht = _PUBLIC_MODULE.chunk_kimi_delta_attn(**inputs)
     torch.cuda.synchronize()
 
     assert direct_ht is not None and public_ht is not None
