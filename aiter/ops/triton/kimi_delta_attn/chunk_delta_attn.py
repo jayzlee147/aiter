@@ -43,6 +43,7 @@ from aiter.ops.flash_kda import (
     _flash_kda_fwd_prevalidated as flash_kda_native_fwd,
     _device_arch,
     _native_rejection_reason,
+    _normalize_max_seqlen_upper_bound,
     flash_kda_native_supported,
 )
 from aiter.ops.triton._triton_kernels.chunk_delta_attn import chunk_delta_attn_fwd
@@ -50,11 +51,10 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
-# gfx942 is promoted only after the zero-environment K3 matrix passed all 11
-# shapes, two seeds, graph replay, state modes, and concurrent streams.  The
-# gfx950 code object cross-compiles, but remains explicit opt-in until it has
-# the same correctness/profiling/performance closure on real CDNA4 hardware.
-_ZERO_ENV_NATIVE_ARCHS = frozenset({"gfx942"})
+# Each architecture is promoted only after its zero-environment K3 matrix
+# passes correctness, graph replay, state modes, concurrent streams, and the
+# architecture-specific performance gate on real hardware.
+_ZERO_ENV_NATIVE_ARCHS = frozenset({"gfx942", "gfx950"})
 
 
 def chunk_kimi_delta_attn(
@@ -78,6 +78,7 @@ def chunk_kimi_delta_attn(
     chunk_size: int | None = None,
     cu_seqlens: torch.Tensor | None = None,
     backend: str | None = None,
+    max_seqlen_upper_bound: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""
     Chunked Kimi Delta Attention forward pass (Forward only).
@@ -142,12 +143,13 @@ def chunk_kimi_delta_attn(
             library choose. fla has no counterpart and pins 64 internally, so
             nothing on the shared surface sets this.
 
-            The choice is really which kernel runs. 32 is the two-kernel
-            FlashKDA path's entry ticket, and it is picked when the rest of the
-            call also qualifies for it: the fused gate, in-kernel l2norm and
-            beta sigmoid, `safe_gate`, and `K = V = 128` without GVA. Anything
-            else gets 64, which is the faster of the two inside the default
-            pipeline. Passing 32 or 64 explicitly is honoured as given.
+            The choice is really which Triton kernel runs. 32 is the Triton
+            FlashKDA path's entry ticket, and it is picked for its equal-head
+            contract when the fused gate, in-kernel l2norm, beta sigmoid,
+            `safe_gate`, and `K = V = 128` conditions also hold. Anything else
+            gets 64, which is the faster option in the general Triton pipeline.
+            Native HIP GVA is selected before this choice when ``chunk_size``
+            is ``None``. Passing 32 or 64 explicitly is honoured as given.
 
             FlashKDA agrees with the default pipeline to bf16 rather than
             exactly, as does 32 against 64 within the default pipeline itself.
@@ -164,9 +166,16 @@ def chunk_kimi_delta_attn(
             ``"baseline"`` disables both FlashKDA fast paths and runs the
             original Triton chunk pipeline. An explicit argument takes
             precedence over ``AITER_KDA_BACKEND``. With neither set, validated
-            gfx942 devices default to ``"auto"`` while other architectures
-            retain ``"triton"``; gfx950 can opt in explicitly until its real-
-            hardware validation is complete.
+            gfx942 and gfx950 devices default to ``"auto"`` while other
+            architectures retain ``"triton"``.
+        max_seqlen_upper_bound (int, optional):
+            Static upper bound for the longest packed query sequence. Native
+            HIP uses it only for host route selection; this wrapper validates
+            it, while Triton execution ignores it. CUDA/HIP graphs must pass
+            the capture bucket bound, not a replay batch's dynamic maximum.
+            A non-``None`` value must be a built-in Python ``int`` (not
+            ``bool`` or an ``int`` subclass). Dense calls always use the exact
+            shape-derived length. Default: ``None``.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor | None]:
@@ -219,12 +228,23 @@ def chunk_kimi_delta_attn(
                 f"The batch size is expected to be 1 rather than {B} when using "
                 "`cu_seqlens`. Please flatten variable-length inputs before processing."
             )
+        if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
+            raise ValueError("`cu_seqlens` must be one-dimensional with N+1 entries")
         if initial_state is not None and initial_state.shape[0] != len(cu_seqlens) - 1:
             raise ValueError(
                 "The number of initial states is expected to be equal to the number "
                 f"of input sequences, i.e., {len(cu_seqlens) - 1} rather than "
                 f"{initial_state.shape[0]}."
             )
+
+    num_seqs = int(cu_seqlens.numel() - 1) if cu_seqlens is not None else B
+    normalized_max_seqlen = _normalize_max_seqlen_upper_bound(
+        max_seqlen_upper_bound,
+        total_tokens=B * T,
+        num_seqs=num_seqs,
+        dense_seqlen=T,
+        is_varlen=cu_seqlens is not None,
+    )
     if initial_state is not None and initial_state.dtype != torch.float32:
         raise ValueError(
             f"`initial_state` must be fp32, got {initial_state.dtype}. The recurrence "
@@ -267,7 +287,8 @@ def chunk_kimi_delta_attn(
             f"scale={scale}, chunk_size={chunk_size or 'auto'}, "
             f"safe_gate={safe_gate}, lower_bound={lower_bound}, "
             f"state_v_first={state_v_first}, "
-            f"varlen={cu_seqlens is not None}, backend={backend}"
+            f"varlen={cu_seqlens is not None}, backend={backend}, "
+            f"max_seqlen_upper_bound={normalized_max_seqlen}"
         )
 
     # Match fla, which puts `@input_guard` on its autograd Function. Several
@@ -314,6 +335,7 @@ def chunk_kimi_delta_attn(
             state_v_first=state_v_first,
             chunk_size=chunk_size,
             cu_seqlens=cu_seqlens,
+            max_seqlen_upper_bound=normalized_max_seqlen,
         )
         native_supported = flash_kda_native_supported(**native_kwargs)
     if backend == "native" and not native_supported:
@@ -334,6 +356,7 @@ def chunk_kimi_delta_attn(
             output_final_state=output_final_state,
             lower_bound=lower_bound,
             cu_seqlens=cu_seqlens,
+            max_seqlen_upper_bound=normalized_max_seqlen,
         )
         # Native admission fixes q/v/output to BF16, so this is already the
         # public dtype.  Avoid an otherwise redundant dispatcher round-trip on

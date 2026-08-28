@@ -144,7 +144,8 @@ k2_kda_csplit_segment_out_x32_kernel(
 // while the current arena feeds MFMA, avoiding a global->VGPR->LDS staging
 // round trip.  The production three-arena schedule removes one more full-CTA
 // rendezvous than the exact two-arena rollback specialization.
-template <bool VL = false, bool StageSin = true, int Arenas = 2>
+template <bool VL = false, bool StageSin = true, int Arenas = 2,
+          bool CACHE_DECAY_LDS = false, bool SIN_FRAGMENT = false>
 __global__ void __launch_bounds__(512)
 k2_kda_csplit_segment_out_gll_kernel(
         const __bf16* __restrict__ cs_u,
@@ -170,6 +171,8 @@ k2_kda_csplit_segment_out_gll_kernel(
     using namespace segment_replay_detail;
     static_assert(Arenas == 2 || Arenas == 3,
                   "gfx950 GLL replay supports two or three LDS arenas");
+    static_assert(!SIN_FRAGMENT || !StageSin,
+                  "fragment-major sin must bypass the row-major LDS stage");
     const int tid = threadIdx.x;
     const int wave = tid >> 6;
     const int lane = tid & 63;
@@ -211,14 +214,27 @@ k2_kda_csplit_segment_out_gll_kernel(
     __shared__ __bf16 umat[Arenas][C * D];
     __shared__ __bf16 mqk[Arenas][C * C];
     __shared__ float gtot[Arenas][D];
-    // The incoming 128x128 state is consumed once by this segment CTA.  Stage
-    // it with a padded row pitch so the initial global traffic is coalesced and
-    // each wave can populate its FP32 register carry with conflict-light b64
-    // LDS reads.  gfx950 can retain two replay CTAs/CU at this LDS footprint.
+    // The row-major specialization stages the incoming 128x128 state with a
+    // padded pitch.  The matched fragment-major specialization instantiates
+    // the empty storage form and loads its already tiled fragments directly.
     __shared__ ReplaySinStorage<StageSin> sin_storage;
 
     float sreg[NKB][4];
-    if constexpr (!StageSin) {
+    if constexpr (SIN_FRAGMENT) {
+        const auto* sin_fragments = reinterpret_cast<const bf16x4*>(
+            cs_sin + int64_t(ss) * D * D);
+        #pragma unroll
+        for (int kt = 0; kt < NKB; ++kt) {
+            // Producer vblock == replay wave.  A wave-wide load of these 64
+            // adjacent bf16x4 values reconstructs one complete MFMA fragment
+            // tile directly in registers, with no StageSin LDS transpose.
+            const bf16x4 fragment =
+                sin_fragments[(wave * NKB + kt) * 64 + lane];
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+                sreg[kt][i] = bf16_to_f32(fragment[i]);
+        }
+    } else if constexpr (!StageSin) {
         #pragma unroll
         for (int kt = 0; kt < NKB; ++kt)
             #pragma unroll
@@ -264,6 +280,22 @@ k2_kda_csplit_segment_out_gll_kernel(
         }
     };
 
+    // CACHE_DECAY_LDS moves the exact per-chunk exp2 to the existing DMA
+    // publication points.  Wave 1 retains the original f32x4 ownership, and
+    // the following pre-existing CTA barrier publishes the in-place
+    // conversion without another rendezvous or arena.
+    auto cache_decay = [&](int arena) {
+        if constexpr (CACHE_DECAY_LDS) {
+            if (wave == 1 && lane < 32) {
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int d = lane * 4 + i;
+                    gtot[arena][d] = ex2(gtot[arena][d]);
+                }
+            }
+        }
+    };
+
     if constexpr (StageSin) {
         __bf16* sin = sin_storage.values;
         const __bf16* sin_src = cs_sin + int64_t(ss) * D * D;
@@ -277,6 +309,7 @@ k2_kda_csplit_segment_out_gll_kernel(
     }
     dma(0, ht_base);
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    cache_decay(0);
     __syncthreads();
 
     if constexpr (StageSin) {
@@ -343,14 +376,20 @@ k2_kda_csplit_segment_out_gll_kernel(
                 kr[arena], umat[arena], kt * C, v0, D, D, lane);
             const int kbase = kt * C + (lane >> 4) * 4;
             #pragma unroll
-            for (int i = 0; i < 4; ++i)
-                sreg[kt][i] =
-                    sreg[kt][i] * ex2(gtot[arena][kbase + i]) + c[i];
+            for (int i = 0; i < 4; ++i) {
+                if constexpr (CACHE_DECAY_LDS)
+                    sreg[kt][i] =
+                        sreg[kt][i] * gtot[arena][kbase + i] + c[i];
+                else
+                    sreg[kt][i] = sreg[kt][i] *
+                        ex2(gtot[arena][kbase + i]) + c[i];
+            }
         }
 
         if constexpr (Arenas == 2) {
             if (has_next) {
                 asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+                cache_decay(arena ^ 1);
                 __syncthreads();
             }
         } else {
@@ -358,6 +397,12 @@ k2_kda_csplit_segment_out_gll_kernel(
             const bool publish_reuse = j == 2 && chunks > 3;
             if (publish_prefetch || publish_reuse) {
                 asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+                if (publish_prefetch) {
+                    cache_decay(1);
+                    if (chunks > 2) cache_decay(2);
+                } else {
+                    cache_decay(0);
+                }
                 __syncthreads();
             }
         }
