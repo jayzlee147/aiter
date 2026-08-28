@@ -58,6 +58,7 @@ void launch_fwd_hip(
     float gate_scale,
     int total_tiles,
     int T_total,
+    int H_q,
     int H,
     int N,
     const void* init_state,
@@ -66,7 +67,8 @@ void launch_fwd_hip(
     bool has_state_out,
     bool state_fp32,
     const int32_t* cu_seqlens,
-    hipStream_t stream);
+    hipStream_t stream,
+    int max_seqlen_upper_bound);
 
 } // namespace flashkda_hip
 
@@ -126,5 +128,68 @@ void flash_kda_fwd_hip_raw(
     bool state_fp32,
     int64_t device_id,
     std::uintptr_t stream_ptr);
+
+// Additive raw ABI carrying a graph-safe host routing hint.  The original
+// 25-argument symbol above is retained byte-for-byte at the call boundary;
+// zero keeps its legacy policy semantics.
+void flash_kda_fwd_hip_raw_v2(
+    std::uintptr_t q_ptr,
+    std::uintptr_t k_ptr,
+    std::uintptr_t v_ptr,
+    std::uintptr_t g_ptr,
+    std::uintptr_t beta_ptr,
+    std::uintptr_t out_ptr,
+    std::uintptr_t workspace_ptr,
+    std::uintptr_t A_log_ptr,
+    std::uintptr_t dt_bias_ptr,
+    std::uintptr_t initial_state_ptr,
+    std::uintptr_t final_state_ptr,
+    std::uintptr_t cu_seqlens_ptr,
+    int64_t B,
+    int64_t T,
+    int64_t H,
+    int64_t N,
+    int64_t workspace_bytes,
+    double scale,
+    double lower_bound,
+    bool has_initial_state,
+    bool output_final_state,
+    bool is_varlen,
+    bool state_fp32,
+    int64_t device_id,
+    std::uintptr_t stream_ptr,
+    int64_t max_seqlen_upper_bound);
+
+// Additive grouped-value-attention ABI. ``H`` remains the value/gate/state
+// head count carried by raw-v1/v2; ``H_q`` is appended so the established
+// argument prefix and all equal-head callers remain source-compatible.
+void flash_kda_fwd_hip_raw_v3(
+    std::uintptr_t q_ptr,
+    std::uintptr_t k_ptr,
+    std::uintptr_t v_ptr,
+    std::uintptr_t g_ptr,
+    std::uintptr_t beta_ptr,
+    std::uintptr_t out_ptr,
+    std::uintptr_t workspace_ptr,
+    std::uintptr_t A_log_ptr,
+    std::uintptr_t dt_bias_ptr,
+    std::uintptr_t initial_state_ptr,
+    std::uintptr_t final_state_ptr,
+    std::uintptr_t cu_seqlens_ptr,
+    int64_t B,
+    int64_t T,
+    int64_t H,
+    int64_t N,
+    int64_t workspace_bytes,
+    double scale,
+    double lower_bound,
+    bool has_initial_state,
+    bool output_final_state,
+    bool is_varlen,
+    bool state_fp32,
+    int64_t device_id,
+    std::uintptr_t stream_ptr,
+    int64_t max_seqlen_upper_bound,
+    int64_t H_q);
 
 } // namespace aiter

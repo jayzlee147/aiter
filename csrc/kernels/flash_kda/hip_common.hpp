@@ -38,6 +38,9 @@ struct FwdParams {
     float gate_scale;
     int total_tiles;
     int T_total;
+    // Q/K heads may be shared by an integer group of value/gate/state heads.
+    // H remains the value-head count used by every workspace and K2 kernel.
+    int H_q;
     int H;
     int N;
     const void* init_state;
@@ -47,12 +50,20 @@ struct FwdParams {
     bool state_fp32;
     const int32_t* cu_seqlens;
     hipStream_t stream;
+    // Optional caller-provided upper bound used only by host route policy.
+    // Zero preserves the legacy packed policy.  Execution geometry continues
+    // to come from T_total/N and device prefix metadata.
+    int max_seqlen_upper_bound = 0;
 };
 
 enum class K2DefaultRoute : uint8_t {
     vsplit_rs,
     csplit64,
     csplit64_k6,
+    // Low-head, deep-sequence route.  Architecture-private launchers form
+    // affine maps for independent context ranges, scan those short maps, then
+    // replay the ranges from their true incoming state.
+    context_parallel,
     // Matched gfx942 route: a C16 fused K1 producer publishes local Mqk and
     // activated beta for the multi-wave register-state K2 consumer.
     vsplit_rs_mw_k6,
@@ -139,14 +150,29 @@ struct Bt16K1Launch {
     __bf16* kinv;
     __bf16* inv;
     __bf16* mqk;
+    // Optional tile-major [H * total_tiles, C] activated-beta cache.  Context
+    // and plain C-split reuse the existing C64 beta arena so their consumers
+    // do not repeat the producer's sigmoid work.
+    float* beta_cache;
     const int32_t* cu_seqlens;
     const int* tile_prefix;
     int N;
     int total_tiles;
     int T_seq;
     int H;
+    int H_q;
     int NT;
     bool is_varlen;
+    bool cache_context_operands;
+    // The common launcher sets this only after the selected architecture
+    // policy has promised that its fused producer will publish activated beta
+    // into beta_cache.  It is independent of the context-only ws_gt decay ABI.
+    bool publish_activated_beta;
+    // Matched packed-direct experiment: resolve the compact C16 tile mapping
+    // from cu_seqlens inside the fused gfx950 producer.  The common launcher
+    // sets this only when it also skips the prefix node and requests the
+    // matching direct K2 specialization.
+    bool packed_direct_prefixless = false;
 };
 
 using Bt16K1Launcher = void (*)(const Bt16K1Launch&);
@@ -158,6 +184,10 @@ using Bt16K1Launcher = void (*)(const Bt16K1Launch&);
 struct PlainCsplit64K1Launch {
     hipStream_t stream;
     const float* beta;
+    const float* beta_cache;
+    // Optional segment-major [H * total_segments, D, 4] FP32 suffix-decay
+    // cache backed by the otherwise-idle cs_segment_a arena on plain gfx950.
+    float* suffix_decay;
     __bf16* kd;
     const __bf16* qd;
     const __bf16* kr;
@@ -179,6 +209,16 @@ struct PlainCsplit64K1Launch {
     int H;
     int NT;
     bool is_varlen;
+    // True only when the common launcher actually ran a producer that
+    // published the per-C16 inv/mqk factors.  Architecture callbacks must
+    // consume this fact instead of re-deriving it from process environment.
+    bool pre_solved;
+    // True only when beta_cache contains the activated values published by
+    // the exact producer invocation that established pre_solved.
+    bool beta_activated;
+    // True only for the matched PRE_SOLVED fused post-preparation producer.
+    // A false value forbids both publication and the matching scan consumer.
+    bool publish_suffix_decay;
 };
 
 using PlainCsplit64K1Launcher =
@@ -187,7 +227,7 @@ using PlainCsplit64K1Launcher =
 // Host callback ABI for an architecture-private direct-RTP K1 producer that
 // replaces both split preparation and the native BT64 factorization.  The
 // common launcher still owns route selection and workspace packing; the
-// callback must publish the same persistent kd/qd/kr/gt/decay/factor/beta
+    // callback must publish the same persistent kd/qd/kr/gt/decay/factor/beta
 // arenas as the shared two-launch sequence.
 struct FusedPrepareNeumannLaunch {
     hipStream_t stream;
@@ -261,6 +301,77 @@ struct VsplitRsLaunch {
 };
 
 using VsplitRsLauncher = void (*)(const VsplitRsLaunch&);
+
+// Host callback ABI for an architecture-private context-parallel recurrence.
+// The common launcher owns routing, the ordinary C16 K1 workspace, and two
+// otherwise-unused C-split arenas repurposed as affine scratch.  A successful
+// callback produces output/final state completely; no C-split replay follows.
+struct ContextParallelLaunch {
+    hipStream_t stream;
+    const __bf16* v;
+    const float* beta;
+    __bf16* out;
+    const __bf16* kd;
+    const __bf16* qd;
+    const __bf16* kr;
+    const float* gt;
+    const __bf16* inv;
+    const __bf16* mqk;
+    const float* beta_cache;
+    __bf16* affine_a;
+    float* affine_b;
+    const void* init_state;
+    void* final_state;
+    const int32_t* cu_seqlens;
+    const int* tile_prefix;
+    int* context_prefix;
+    const int* sequence_worklist;
+    const int* sequence_count;
+    int total_tiles;
+    int T_seq;
+    int H;
+    int N;
+    int NT;
+    bool has_state_in;
+    bool has_state_out;
+    bool state_fp32;
+    bool is_varlen;
+    // Resolved once by the architecture policy before the common prefix
+    // launch.  A zero group count selects direct replay; a nonzero direct
+    // threshold selects the packed hybrid partition.
+    int context_group_chunks;
+    int context_direct_max_chunks;
+    // Nonzero only for the matched packed-hybrid prefix/K2 topology.  Each
+    // affine phase launches this many deterministic grid-stride CTAs; zero
+    // retains every established context symbol and launch shape.
+    int context_persistent_blocks;
+    // True only for the matched packed-direct two-node topology.  Consumers
+    // must derive their compact C16 workspace base from cu_seqlens and must
+    // not dereference tile_prefix when this is set.
+    bool packed_direct_prefixless = false;
+    // True only after common dispatch has proved the packed N=4, 4K-each
+    // promise and normalized the complete K1/producer/scan/replay graph to
+    // the equivalent dense layout.  This is a whole-graph ABI bit: no kernel
+    // may infer it from the now-null packed metadata in isolation.
+    bool equal_dense_n4_g64 = false;
+    // True only when common dispatch selected the matching BT16 producer and
+    // that exact invocation was asked to publish activated beta plus the
+    // context decay operands.  Consumers must use this launch-time handshake
+    // instead of independently re-reading process environment.
+    bool context_operands_cached = false;
+    // Whole-launch geometry bit used to keep grouped-value attention on the
+    // generic uncached context graph.  Context K2 itself is value-head based,
+    // but cache-dependent and metadata-eliding specializations are not yet
+    // part of the GVA producer/consumer contract.
+    bool is_gva = false;
+    // Policy-resolved routing facts.  Carry these across common dispatch so
+    // the architecture callback does not reconstruct an automatic route from
+    // an ambiguous shape after metadata or environment normalization.
+    bool automatic_gva_packed_nw4 = false;
+    bool automatic_gva_equal_n4_g16 = false;
+};
+
+using ContextParallelLauncher = void (*)(const ContextParallelLaunch&);
 
 // Host callback ABI for the plain C-split segment output replay.  The common
 // launcher owns route selection and workspace layout; an architecture policy
@@ -346,6 +457,57 @@ struct HipLaunchPolicy {
     Csplit64K6PipelineLauncher launch_k6_pipeline;
     Csplit64ScanLauncher launch_k6_persistent = nullptr;
     PersistentPrefixLauncher launch_persistent_prefix = nullptr;
+    ContextParallelLauncher launch_context_parallel = nullptr;
+    // The architecture callback publishes a complete solved C16 workspace and
+    // may replace common split preparation on the automatic plain C-split
+    // route.  Explicit diagnostic routes retain the shared stage boundaries.
+    bool use_bt16_k1_for_plain = false;
+    // Host-side producer capability used to close the plain C-split beta-cache
+    // handshake before any consumer is allowed to select the cache.
+    bool bt16_k1_plain_beta_cache = false;
+    // Separate strict opt-in capability for the PRE_SOLVED fused post-prep
+    // suffix-decay publisher.  Common dispatch still closes the route/stage
+    // handshake before setting the scan flag.
+    bool plain_k1_suffix_decay_cache = false;
+    // Architecture-private context routing is resolved while constructing the
+    // policy, then consumed by both the common prefix builder and K2 callback.
+    // Keep defaults at the aggregate tail so gfx942 initializers retain their
+    // existing ABI and ordinary routes retain the standard segment prefix.
+    int context_group_chunks = 0;
+    int context_direct_max_chunks = 0;
+    // Strict matched pair for the gfx950 packed-hybrid persistent candidate.
+    // Keeping both fields at the aggregate tail preserves gfx942 aggregate
+    // initialization and makes a zero/null policy an exact whole-graph
+    // fallback rather than a prefix-only or K2-only experiment.
+    PersistentPrefixLauncher launch_context_prefix = nullptr;
+    int context_persistent_blocks = 0;
+    // Strict whole-graph capability selected by gfx950 policy construction.
+    // The common launcher still rechecks the packed pure-direct shape before
+    // it removes k1_build_tile_prefix.
+    bool context_direct_prefixless = false;
+    // Strict whole-graph capability for the packed equal-length N=4/G64
+    // dense-normalization candidate.  Appending this field preserves every
+    // existing aggregate initializer, including gfx942's shorter prefix.
+    bool context_equal_dense_n4_g64 = false;
+    // The architecture BT16 callback may consume grouped-value q/k heads and
+    // publish the ordinary per-value-head workspace.  Downstream routes still
+    // need their own whole-graph capability; keep this false by default so a
+    // raw-input producer that assumes H_q == H cannot be selected for GVA.
+    bool bt16_k1_supports_gva = false;
+    // Host-side producer capability for the context operand cache.  Common
+    // dispatch combines it with the actually selected BT16 callback and
+    // forwards the resulting per-launch fact to the context K2 consumer.
+    bool bt16_k1_context_operand_cache = false;
+    // Whole-graph capability for the automatic plain C-split route.  GVA may
+    // select it only when the architecture supplies both the grouped-head
+    // BT16 raw-input producer and the workspace-only plain post-preparation
+    // callback.  Common dispatch still closes skip-stage/cache handshakes for
+    // each launch before enabling the route.
+    bool plain_csplit_supports_gva = false;
+    // Exact automatic GVA context recipes resolved while the original packed
+    // length bound and route environment are still available.
+    bool context_automatic_gva_packed_nw4 = false;
+    bool context_automatic_gva_equal_n4_g16 = false;
 };
 
 struct LaunchShape {

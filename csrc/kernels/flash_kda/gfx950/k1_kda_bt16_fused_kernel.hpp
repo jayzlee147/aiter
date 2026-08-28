@@ -11,6 +11,7 @@
 #pragma once
 
 #include "k1_kda_common.hpp"
+#include "packed_direct_prefixless.hpp"
 
 namespace flashkda_hip::gfx950 {
 
@@ -80,10 +81,12 @@ struct alignas(16) ExactPrepStorage {
     float kinv[C];
 };
 
+template <int SD>
 struct alignas(16) SolveStorage {
-    __bf16 kd[TILE_ELEMS];
-    __bf16 qd[TILE_ELEMS];
-    __bf16 ki[TILE_ELEMS];
+    static_assert(SD >= D, "solve operand pitch must cover logical D");
+    __bf16 kd[C * SD];
+    __bf16 qd[C * SD];
+    __bf16 ki[C * SD];
     __bf16 mqk[FACTOR_ELEMS];
     float beta[C];
     _Float16 lm[FACTOR_ELEMS];
@@ -91,35 +94,86 @@ struct alignas(16) SolveStorage {
     _Float16 lk[FACTOR_ELEMS];
 };
 
-template <bool EXACT_PREP>
+template <bool EXACT_PREP, int SD = D>
 union alignas(16) SharedStorage;
 
-template <>
-union alignas(16) SharedStorage<false> {
+template <int SD>
+union alignas(16) SharedStorage<false, SD> {
     VectorPrepStorage prep;
-    SolveStorage solve;
+    SolveStorage<SD> solve;
 };
 
-template <>
-union alignas(16) SharedStorage<true> {
+template <int SD>
+union alignas(16) SharedStorage<true, SD> {
     ExactPrepStorage prep;
-    SolveStorage solve;
+    SolveStorage<SD> solve;
 };
 
 static_assert(sizeof(VectorPrepStorage) == 8704,
               "unexpected vector-prep BT16 scratch size");
 static_assert(sizeof(ExactPrepStorage) == 17024,
               "unexpected exact-prep BT16 scratch size");
-static_assert(sizeof(SolveStorage) == 14400,
+static_assert(sizeof(SolveStorage<D>) == 14400,
               "unexpected fused BT16 solve scratch size");
-static_assert(sizeof(SharedStorage<false>) == sizeof(SolveStorage),
+static_assert(sizeof(SolveStorage<D + 4>) == 14784,
+              "unexpected padded fused BT16 solve scratch size");
+static_assert(sizeof(SharedStorage<false, D>) == sizeof(SolveStorage<D>),
               "vector-prep phase union must reuse solve LDS");
-static_assert(sizeof(SharedStorage<true>) == sizeof(ExactPrepStorage),
+static_assert(sizeof(SharedStorage<false, D + 4>) ==
+                  sizeof(SolveStorage<D + 4>),
+              "padded vector-prep phase union must reuse solve LDS");
+static_assert(sizeof(SharedStorage<true, D>) == sizeof(ExactPrepStorage),
               "exact-prep phase union must reuse solve LDS");
+static_assert(sizeof(SharedStorage<true, D + 4>) == sizeof(ExactPrepStorage),
+              "padded solve must not grow exact-prep LDS");
 
 }  // namespace k1_bt16_fused_detail
 
-template <bool VL, bool EXACT_PREP, bool USE_X32>
+// The optimization axes are deliberately default-off so existing launch sites
+// retain their byte-for-byte workspace contract and established instruction
+// schedule.  The plain C-split PRE_SOLVED route may opt into the first three:
+//
+//   * OMIT_TRANSIENT_OUTPUTS drops tmp_kinv, which the merge-only consumer never
+//     reads, and the temporary decay publication in ws_mqk, which this kernel
+//     overwrites with the final local Mqk factor before it completes.
+//   * SPLIT_CONTRACTIONS assigns Kd@Ki to wave 0 and Qd@Ki to wave 1.  The two
+//     contractions are independent; wave 1 publishes Mqk directly while wave 0
+//     continues down the triangular-inverse dependency chain.
+//   * REUSE_POWER_CHAIN retains the rounded L^2 and L^4 tiles across the
+//     corresponding inv@power products.  Those products never modify lk, so
+//     this removes three exactly redundant MFMA/store/sync sequences without
+//     changing any arithmetic or rounding point.
+//
+// Callers must set OMIT_TRANSIENT_OUTPUTS only when their next K1 stage is
+// explicitly PRE_SOLVED.  Keeping that fact a template contract prevents an
+// environment-derived mismatch from exposing uninitialized tmp_kinv data.
+// CACHE_CHUNK_DECAY changes ws_gt from its ordinary log2 ABI to complete-chunk
+// FP32 decay and is therefore context-only.  PUBLISH_ACTIVATED_BETA is a
+// separate contract: both context and plain C-split may publish the already
+// computed FP32 sigmoid result without changing ws_gt.  Its default follows
+// CACHE_CHUNK_DECAY so existing context launch sites retain both publications.
+// DENSE_N1_ALL_FULL_C16 is a shape proof supplied by the gfx950 launcher: the
+// dense grid contains one sequence, every tile is a complete C16 tile, and
+// gridDim.y is exactly H.  It removes the batch/head divmod and every tail
+// predicate without changing any arithmetic or workspace publication.
+// PADDED_SOLVE changes only the LDS row pitch of kd/qd/ki from D to D+4.  The
+// global workspace remains compact D=128, and the logical contraction length
+// and MFMA accumulation order remain unchanged.
+// EARLY_DENSE_BETA assigns the dense vector-prep beta sigmoid to wave 3 while
+// waves 0 and 1 perform the prefix scan.  The value remains register-resident
+// until the prep/solve phase union has switched, so both LDS and global beta
+// publication stay at their established location and ordering point.
+template <bool VL, bool EXACT_PREP, bool USE_X32,
+          bool OMIT_TRANSIENT_OUTPUTS = false,
+          bool SPLIT_CONTRACTIONS = false,
+          bool REUSE_POWER_CHAIN = false,
+          bool CACHE_CHUNK_DECAY = false,
+          bool PUBLISH_ACTIVATED_BETA = CACHE_CHUNK_DECAY,
+          bool PACKED_DIRECT_PREFIXLESS = false,
+          bool DENSE_N1_ALL_FULL_C16 = false,
+          bool PADDED_SOLVE = false,
+          bool EARLY_DENSE_BETA = false,
+          bool GVA = false>
 __global__ void __launch_bounds__(256)
 k1_kda_bt16_fused_kernel(
         const __bf16* __restrict__ q_g,
@@ -128,7 +182,7 @@ k1_kda_bt16_fused_kernel(
         const float* __restrict__ beta_g,
         const float* __restrict__ A_log,
         const float* __restrict__ dt_bias,
-        float scale, float gate_scale, int T_seq, int H,
+        float scale, float gate_scale, int T_seq, int H, int H_q,
         __bf16* __restrict__ ws_kd,
         __bf16* __restrict__ ws_qd,
         __bf16* __restrict__ ws_kr,
@@ -136,38 +190,70 @@ k1_kda_bt16_fused_kernel(
         __bf16* __restrict__ tmp_kinv,
         __bf16* __restrict__ ws_inv,
         __bf16* __restrict__ ws_mqk,
+        float* __restrict__ beta_cache,
         const int32_t* __restrict__ cu_seqlens,
         const int* __restrict__ tile_prefix,
         int N, int total_tiles) {
     using namespace k1_bt16_fused_detail;
+    static_assert(!PACKED_DIRECT_PREFIXLESS || VL,
+                  "prefixless K1 mapping is packed-only");
+    static_assert(!DENSE_N1_ALL_FULL_C16 || !VL,
+                  "dense-N1 full-C16 K1 mapping is dense-only");
+    static_assert(!DENSE_N1_ALL_FULL_C16 || !PACKED_DIRECT_PREFIXLESS,
+                  "dense-N1 full-C16 and packed-prefixless are exclusive");
+    static_assert(!PADDED_SOLVE || DENSE_N1_ALL_FULL_C16,
+                  "padded solve requires the dense-N1 full-C16 proof");
+    static_assert(!PADDED_SOLVE || USE_X32,
+                  "padded solve requires the gfx950 X32 contraction");
+    static_assert(!EARLY_DENSE_BETA ||
+                      (!EXACT_PREP && DENSE_N1_ALL_FULL_C16),
+                  "early dense beta requires vector-prep full-C16 proof");
+    constexpr int SD = PADDED_SOLVE ? D + 4 : D;
     const int tid = threadIdx.x;
     const int row_lane = tid & 15;
     int h, ht, t0, alen;
     if constexpr (VL) {
         const int gti = blockIdx.x;
         h = blockIdx.y;
-        int lo = 0, hi = N;
-        while (hi - lo > 1) {
-            const int mid = (lo + hi) >> 1;
-            if (tile_prefix[mid] <= gti) lo = mid; else hi = mid;
+        if constexpr (PACKED_DIRECT_PREFIXLESS) {
+            const PackedC16TileMapping mapping =
+                packed_c16_tile_mapping(cu_seqlens, N, gti);
+            if (!mapping.valid)
+                return;
+            ht = h * total_tiles + gti;
+            t0 = mapping.token_base + mapping.local_tile * C;
+            alen = min(C, mapping.token_length - mapping.local_tile * C);
+        } else {
+            int lo = 0, hi = N;
+            while (hi - lo > 1) {
+                const int mid = (lo + hi) >> 1;
+                if (tile_prefix[mid] <= gti) lo = mid; else hi = mid;
+            }
+            const int local = gti - tile_prefix[lo];
+            const int64_t bos = cu_seqlens[lo];
+            const int len = int(cu_seqlens[lo + 1] - bos);
+            if (local >= (len + C - 1) / C) return;
+            ht = h * total_tiles + gti;
+            t0 = int(bos) + local * C;
+            alen = min(C, len - local * C);
         }
-        const int local = gti - tile_prefix[lo];
-        const int64_t bos = cu_seqlens[lo];
-        const int len = int(cu_seqlens[lo + 1] - bos);
-        if (local >= (len + C - 1) / C) return;
-        ht = h * total_tiles + gti;
-        t0 = int(bos) + local * C;
-        alen = min(C, len - local * C);
     } else {
         const int nt = blockIdx.x, bh = blockIdx.y;
-        const int b = bh / H;
-        h = bh % H;
-        ht = bh * gridDim.x + nt;
-        t0 = b * T_seq + nt * C;
-        alen = min(C, T_seq - nt * C);
+        if constexpr (DENSE_N1_ALL_FULL_C16) {
+            h = bh;
+            ht = h * gridDim.x + nt;
+            t0 = nt * C;
+            alen = C;
+        } else {
+            const int b = bh / H;
+            h = bh % H;
+            ht = bh * gridDim.x + nt;
+            t0 = b * T_seq + nt * C;
+            alen = min(C, T_seq - nt * C);
+        }
     }
 
-    __shared__ SharedStorage<EXACT_PREP> smem;
+    __shared__ SharedStorage<EXACT_PREP, SD> smem;
     float* const gc = smem.prep.gc;
 
     const int vec_m = tid >> 4;
@@ -176,12 +262,18 @@ k1_kda_bt16_fused_kernel(
     const float a = ex2(A_log[h] * KDA_LOG2E);
     bf16x8 qv{}, kv{}, gv{};
     f32x4 gcv0{}, gcv1{};
-    if (vec_m < alen) {
-        const int64_t off =
+    if (DENSE_N1_ALL_FULL_C16 || vec_m < alen) {
+        const int64_t vg_off =
             (int64_t(t0 + vec_m) * H + h) * D + vec_d0;
-        qv = *reinterpret_cast<const bf16x8*>(q_g + off);
-        kv = *reinterpret_cast<const bf16x8*>(k_g + off);
-        gv = *reinterpret_cast<const bf16x8*>(g_g + off);
+        int64_t qk_off = vg_off;
+        if constexpr (GVA) {
+            const int hq = h / (H / H_q);
+            qk_off =
+                (int64_t(t0 + vec_m) * H_q + hq) * D + vec_d0;
+        }
+        qv = *reinterpret_cast<const bf16x8*>(q_g + qk_off);
+        kv = *reinterpret_cast<const bf16x8*>(k_g + qk_off);
+        gv = *reinterpret_cast<const bf16x8*>(g_g + vg_off);
         const f32x4 db0 =
             *reinterpret_cast<const f32x4*>(dt_bias + h * D + vec_d0);
         const f32x4 db1 =
@@ -249,9 +341,9 @@ k1_kda_bt16_fused_kernel(
         }
     }
     float balanced_beta = 0.0f;
-    if constexpr (EXACT_PREP) {
+    if constexpr (EXACT_PREP || EARLY_DENSE_BETA) {
         if (tid >= 3 * 64 && tid < 3 * 64 + C) {
-            balanced_beta = row_lane < alen
+            balanced_beta = (DENSE_N1_ALL_FULL_C16 || row_lane < alen)
                 ? sigmoid_tanh(beta_g[int64_t(t0 + row_lane) * H + h])
                 : 0.0f;
         }
@@ -267,8 +359,13 @@ k1_kda_bt16_fused_kernel(
         const float decay = ex2(acc);
         gc[(C - 1) * D + tid] = acc;
         smem.prep.decay[tid] = decay;
-        ws_gt[int64_t(ht) * D + tid] = acc;
-        reinterpret_cast<float*>(ws_mqk)[int64_t(ht) * D + tid] = decay;
+        // Context B/A/replay all need the same complete-chunk decay.  Publish
+        // the value already formed here so those six V-half CTAs do not each
+        // repeat an exp2.  Other routes retain the established log2 ABI.
+        ws_gt[int64_t(ht) * D + tid] =
+            CACHE_CHUNK_DECAY ? decay : acc;
+        if constexpr (!OMIT_TRANSIENT_OUTPUTS)
+            reinterpret_cast<float*>(ws_mqk)[int64_t(ht) * D + tid] = decay;
     }
     __syncthreads();
 
@@ -317,37 +414,70 @@ k1_kda_bt16_fused_kernel(
     // BF16 values to both the global ABI and LDS, avoiding the second kernel's
     // HBM-to-LDS replay.
     __syncthreads();
-    SolveStorage& solve = smem.solve;
+    SolveStorage<SD>& solve = smem.solve;
     const int64_t ws_vec_off = int64_t(ht) * TILE_ELEMS + vec_idx;
     *reinterpret_cast<bf16x8*>(ws_kd + ws_vec_off) = kd_v;
     *reinterpret_cast<bf16x8*>(ws_qd + ws_vec_off) = qd_v;
     *reinterpret_cast<bf16x8*>(ws_kr + ws_vec_off) = kr_v;
-    *reinterpret_cast<bf16x8*>(tmp_kinv + ws_vec_off) = ki_v;
-    *reinterpret_cast<bf16x8*>(solve.kd + vec_idx) = kd_v;
-    *reinterpret_cast<bf16x8*>(solve.qd + vec_idx) = qd_v;
-    *reinterpret_cast<bf16x8*>(solve.ki + vec_idx) = ki_v;
-    if constexpr (EXACT_PREP) {
-        if (tid >= 3 * 64 && tid < 3 * 64 + C)
+    if constexpr (!OMIT_TRANSIENT_OUTPUTS)
+        *reinterpret_cast<bf16x8*>(tmp_kinv + ws_vec_off) = ki_v;
+    const int solve_vec_idx = vec_m * SD + vec_d0;
+    *reinterpret_cast<bf16x8*>(solve.kd + solve_vec_idx) = kd_v;
+    *reinterpret_cast<bf16x8*>(solve.qd + solve_vec_idx) = qd_v;
+    *reinterpret_cast<bf16x8*>(solve.ki + solve_vec_idx) = ki_v;
+    if constexpr (EXACT_PREP || EARLY_DENSE_BETA) {
+        if (tid >= 3 * 64 && tid < 3 * 64 + C) {
             solve.beta[row_lane] = balanced_beta;
+            if constexpr (PUBLISH_ACTIVATED_BETA)
+                beta_cache[int64_t(ht) * C + row_lane] = balanced_beta;
+        }
     } else if (tid < C) {
-        solve.beta[tid] = tid < alen
+        const float activated_beta = (DENSE_N1_ALL_FULL_C16 || tid < alen)
             ? sigmoid_tanh(beta_g[int64_t(t0 + tid) * H + h]) : 0.0f;
+        solve.beta[tid] = activated_beta;
+        if constexpr (PUBLISH_ACTIVATED_BETA)
+            beta_cache[int64_t(ht) * C + tid] = activated_beta;
     }
     __syncthreads();
 
-    // Only wave 0 consumes the solve phase.  No other wave touches the union
-    // after the block-wide publication above, so the established wave-local
-    // barriers are sufficient for every remaining LDS dependency.
-    if (tid >= 64) return;
-    const int lane = tid;
+    // The legacy specialization keeps both contractions on wave 0.  The
+    // opt-in split specialization lets wave 1 form and publish local Mqk while
+    // wave 0 forms L and immediately enters the dependent inverse chain.  The
+    // block-wide publication above makes kd/qd/ki visible to both waves; no
+    // cross-wave result is consumed, so all remaining fences stay wave-local.
+    constexpr int ACTIVE_SOLVE_THREADS = SPLIT_CONTRACTIONS ? 128 : 64;
+    if (tid >= ACTIVE_SOLVE_THREADS) return;
+    const int lane = tid & 63;
+    if constexpr (SPLIT_CONTRACTIONS) {
+        if (tid >= 64) {
+            f32x4 cm;
+            if constexpr (USE_X32)
+                cm = contract_last_x32<D, SD, SD>(solve.qd, solve.ki, lane);
+            else
+                cm = gemm_contract_last<__bf16, D, SD>(
+                    solve.qd, solve.ki, lane);
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int m = (lane >> 4) * 4 + i, n = lane & 15;
+                ws_mqk[int64_t(ht) * FACTOR_ELEMS + m * C + n] = m >= n
+                    ? f32_to_bf16(cm[i]) : (__bf16)0.0f;
+            }
+            return;
+        }
+    }
+
     f32x4 cl;
-    f32x4 cm;
-    if constexpr (USE_X32) {
-        cl = contract_last_x32<D, D, D>(solve.kd, solve.ki, lane);
-        cm = contract_last_x32<D, D, D>(solve.qd, solve.ki, lane);
-    } else {
-        cl = gemm_contract_last<__bf16, D>(solve.kd, solve.ki, lane);
-        cm = gemm_contract_last<__bf16, D>(solve.qd, solve.ki, lane);
+    if constexpr (USE_X32)
+        cl = contract_last_x32<D, SD, SD>(solve.kd, solve.ki, lane);
+    else
+        cl = gemm_contract_last<__bf16, D, SD>(solve.kd, solve.ki, lane);
+    f32x4 cm{};
+    if constexpr (!SPLIT_CONTRACTIONS) {
+        if constexpr (USE_X32)
+            cm = contract_last_x32<D, SD, SD>(solve.qd, solve.ki, lane);
+        else
+            cm = gemm_contract_last<__bf16, D, SD>(
+                solve.qd, solve.ki, lane);
     }
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -355,57 +485,94 @@ k1_kda_bt16_fused_kernel(
         solve.lm[m * C + n] = m > n
             ? f32_to_f16(cl[i]) * f32_to_f16(solve.beta[m])
             : (_Float16)0.0f;
-        solve.mqk[m * C + n] = m >= n
-            ? f32_to_bf16(cm[i]) : (__bf16)0.0f;
+        if constexpr (!SPLIT_CONTRACTIONS)
+            solve.mqk[m * C + n] = m >= n
+                ? f32_to_bf16(cm[i]) : (__bf16)0.0f;
         solve.inv[m * C + n] =
             (_Float16)(m == n ? 1.0f : 0.0f) - solve.lm[m * C + n];
     }
     __syncwarp();
 
-    { f32x4 c = gemm_std_f16_tr(solve.lm, solve.lm, lane);
-      store_acc_16x16(solve.lk, c, lane); }
-    __syncwarp();
-    { f32x4 c = gemm_std_f16_tr(solve.inv, solve.lk, lane); __syncwarp();
-      #pragma unroll
-      for (int i = 0; i < 4; ++i) {
-          const int m = (lane >> 4) * 4 + i, n = lane & 15;
-          solve.inv[m * C + n] += f32_to_f16(c[i]);
-      } }
-    __syncwarp();
-    { f32x4 c = gemm_std_f16_tr(solve.lm, solve.lm, lane);
-      store_acc_16x16(solve.lk, c, lane); }
-    __syncwarp();
-    { f32x4 c = gemm_std_f16_tr(solve.lk, solve.lk, lane); __syncwarp();
-      store_acc_16x16(solve.lk, c, lane); }
-    __syncwarp();
-    { f32x4 c = gemm_std_f16_tr(solve.inv, solve.lk, lane); __syncwarp();
-      #pragma unroll
-      for (int i = 0; i < 4; ++i) {
-          const int m = (lane >> 4) * 4 + i, n = lane & 15;
-          solve.inv[m * C + n] += f32_to_f16(c[i]);
-      } }
-    __syncwarp();
-    { f32x4 c = gemm_std_f16_tr(solve.lm, solve.lm, lane);
-      store_acc_16x16(solve.lk, c, lane); }
-    __syncwarp();
-    { f32x4 c = gemm_std_f16_tr(solve.lk, solve.lk, lane); __syncwarp();
-      store_acc_16x16(solve.lk, c, lane); }
-    __syncwarp();
-    { f32x4 c = gemm_std_f16_tr(solve.lk, solve.lk, lane); __syncwarp();
-      store_acc_16x16(solve.lk, c, lane); }
-    __syncwarp();
-    { f32x4 c = gemm_std_f16_tr(solve.inv, solve.lk, lane); __syncwarp();
-      #pragma unroll
-      for (int i = 0; i < 4; ++i) {
-          const int m = (lane >> 4) * 4 + i, n = lane & 15;
-          solve.inv[m * C + n] += f32_to_f16(c[i]);
-      } }
-    __syncwarp();
+    if constexpr (REUSE_POWER_CHAIN) {
+        // lk progresses L^2 -> L^4 -> L^8.  inv@lk is read-only in lk, so the
+        // rounded power remains valid for the next square.
+        { f32x4 c = gemm_std_f16_tr(solve.lm, solve.lm, lane);
+          store_acc_16x16(solve.lk, c, lane); }
+        __syncwarp();
+        { f32x4 c = gemm_std_f16_tr(solve.inv, solve.lk, lane); __syncwarp();
+          #pragma unroll
+          for (int i = 0; i < 4; ++i) {
+              const int m = (lane >> 4) * 4 + i, n = lane & 15;
+              solve.inv[m * C + n] += f32_to_f16(c[i]);
+          } }
+        __syncwarp();
+        { f32x4 c = gemm_std_f16_tr(solve.lk, solve.lk, lane); __syncwarp();
+          store_acc_16x16(solve.lk, c, lane); }
+        __syncwarp();
+        { f32x4 c = gemm_std_f16_tr(solve.inv, solve.lk, lane); __syncwarp();
+          #pragma unroll
+          for (int i = 0; i < 4; ++i) {
+              const int m = (lane >> 4) * 4 + i, n = lane & 15;
+              solve.inv[m * C + n] += f32_to_f16(c[i]);
+          } }
+        __syncwarp();
+        { f32x4 c = gemm_std_f16_tr(solve.lk, solve.lk, lane); __syncwarp();
+          store_acc_16x16(solve.lk, c, lane); }
+        __syncwarp();
+        { f32x4 c = gemm_std_f16_tr(solve.inv, solve.lk, lane); __syncwarp();
+          #pragma unroll
+          for (int i = 0; i < 4; ++i) {
+              const int m = (lane >> 4) * 4 + i, n = lane & 15;
+              solve.inv[m * C + n] += f32_to_f16(c[i]);
+          } }
+        __syncwarp();
+    } else {
+        { f32x4 c = gemm_std_f16_tr(solve.lm, solve.lm, lane);
+          store_acc_16x16(solve.lk, c, lane); }
+        __syncwarp();
+        { f32x4 c = gemm_std_f16_tr(solve.inv, solve.lk, lane); __syncwarp();
+          #pragma unroll
+          for (int i = 0; i < 4; ++i) {
+              const int m = (lane >> 4) * 4 + i, n = lane & 15;
+              solve.inv[m * C + n] += f32_to_f16(c[i]);
+          } }
+        __syncwarp();
+        { f32x4 c = gemm_std_f16_tr(solve.lm, solve.lm, lane);
+          store_acc_16x16(solve.lk, c, lane); }
+        __syncwarp();
+        { f32x4 c = gemm_std_f16_tr(solve.lk, solve.lk, lane); __syncwarp();
+          store_acc_16x16(solve.lk, c, lane); }
+        __syncwarp();
+        { f32x4 c = gemm_std_f16_tr(solve.inv, solve.lk, lane); __syncwarp();
+          #pragma unroll
+          for (int i = 0; i < 4; ++i) {
+              const int m = (lane >> 4) * 4 + i, n = lane & 15;
+              solve.inv[m * C + n] += f32_to_f16(c[i]);
+          } }
+        __syncwarp();
+        { f32x4 c = gemm_std_f16_tr(solve.lm, solve.lm, lane);
+          store_acc_16x16(solve.lk, c, lane); }
+        __syncwarp();
+        { f32x4 c = gemm_std_f16_tr(solve.lk, solve.lk, lane); __syncwarp();
+          store_acc_16x16(solve.lk, c, lane); }
+        __syncwarp();
+        { f32x4 c = gemm_std_f16_tr(solve.lk, solve.lk, lane); __syncwarp();
+          store_acc_16x16(solve.lk, c, lane); }
+        __syncwarp();
+        { f32x4 c = gemm_std_f16_tr(solve.inv, solve.lk, lane); __syncwarp();
+          #pragma unroll
+          for (int i = 0; i < 4; ++i) {
+              const int m = (lane >> 4) * 4 + i, n = lane & 15;
+              solve.inv[m * C + n] += f32_to_f16(c[i]);
+          } }
+        __syncwarp();
+    }
 
     for (int idx = lane; idx < FACTOR_ELEMS; idx += 64) {
         ws_inv[int64_t(ht) * FACTOR_ELEMS + idx] =
             f32_to_bf16(f16_to_f32(solve.inv[idx]));
-        ws_mqk[int64_t(ht) * FACTOR_ELEMS + idx] = solve.mqk[idx];
+        if constexpr (!SPLIT_CONTRACTIONS)
+            ws_mqk[int64_t(ht) * FACTOR_ELEMS + idx] = solve.mqk[idx];
     }
 }
 

@@ -53,6 +53,15 @@ k2_kda_csplit_scan_mw_kernel(
         t0_base = b * T_seq;
     }
 
+    // The standard varlen prefix launch has already published the recurrent
+    // identity for an empty owner.  Return before loading/staging state: a
+    // BF16 -> FP32 -> BF16 round trip is not bitwise neutral for subnormals
+    // under the backend's FTZ mode, and the first speculative stage otherwise
+    // reads an unused gap tile.
+    if constexpr (VL) {
+        if (nt_eff == 0) return;
+    }
+
     __shared__ __bf16 kd[C * SD], kr[C * D];
     __shared__ __bf16 vmat[C * BV], umat[C * BV], inv[C * C];
     __shared__ float gtot[D], beta[C];
@@ -273,6 +282,12 @@ k2_kda_csplit_scan_kernel(
         nt_eff = NT;
         ht_base = bh * NT;
         t0_base = b * T_seq;
+    }
+
+    // Empty packed sequences are initialized by k1_build_tile_prefix.  Avoid
+    // both the unused speculative stage and a lossy FTZ state round trip.
+    if constexpr (VL) {
+        if (nt_eff == 0) return;
     }
 
     __shared__ __bf16 kd[C * SD];
