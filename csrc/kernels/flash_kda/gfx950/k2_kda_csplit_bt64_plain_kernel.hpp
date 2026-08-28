@@ -11,6 +11,8 @@
 #pragma once
 #include <hip/hip_runtime.h>
 #include "mfma.hpp"
+#include "mfma_gfx950.hpp"
+#include "plain_suffix_decay.hpp"
 
 namespace flashkda_hip::gfx950 {
 
@@ -18,9 +20,32 @@ __device__ __forceinline__ constexpr int plain_bt64_tri_tile(int r, int c) {
     return r * (r + 1) / 2 + c;
 }
 
+// Standard 16x16 MFMA with B already stored in its native per-lane fragment
+// layout.  `rhs_fragment[lane][i]` is exactly the value that ds_read_tr16 would
+// return for row-major B[(lane>>4)*4+i][lane&15], so this changes only the LDS
+// representation between the RHS correction and triangular solve.
+__device__ __forceinline__ f32x4 plain_bt64_mm_std_16_fragment_rhs(
+        const __bf16* __restrict__ a,
+        const __bf16* __restrict__ rhs_fragment,
+        int lane) {
+    const int row = lane & 15;
+    const int kb = (lane >> 4) * 4;
+    bf16x4 af;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i)
+        af[i] = a[row * 16 + kb + i];
+    const bf16x4 bf = reinterpret_cast<const bf16x4*>(rhs_fragment)[lane];
+    const f32x4 zero = {0.f, 0.f, 0.f, 0.f};
+    return mfma_bf16(af, bf, zero);
+}
+
 template <int NW = 4, bool HI = false, bool HO = false,
           bool SFP32 = false, bool VL = false, int ARENAS = 1,
-          bool PAD_PARTIAL = false, bool TILED_KR = false>
+          bool PAD_PARTIAL = false, bool TILED_KR = false,
+          bool REGB_X32 = false, bool STATE_XCHG = false,
+          bool SIN_FRAGMENT = false,
+          bool BETA_ACTIVATED = false, bool DECAY_CACHED = false,
+          bool RHS_FRAGMENT_XCHG = false>
 __global__ void __launch_bounds__(NW * 64)
 k2_kda_csplit_bt64_plain_kernel(
         const __bf16* __restrict__ v_g,
@@ -28,6 +53,7 @@ k2_kda_csplit_bt64_plain_kernel(
         const __bf16* __restrict__ ws_kd,
         const __bf16* __restrict__ ws_kr,
         const float* __restrict__ ws_gt,
+        const float* __restrict__ suffix_decay_g,
         const __bf16* __restrict__ ws_inv,
         const __bf16* __restrict__ cross32,
         const __bf16* __restrict__ cross64,
@@ -59,13 +85,17 @@ k2_kda_csplit_bt64_plain_kernel(
                   "gfx950 partial padding requires NW4");
     static_assert(!TILED_KR || NW == 4,
                   "gfx950 tiled kr carry requires NW4");
+    static_assert(!STATE_XCHG || NW == 4,
+                  "gfx950 state exchange requires NW4");
+    static_assert(!RHS_FRAGMENT_XCHG || STATE_XCHG,
+                  "gfx950 fragment RHS requires state exchange");
     constexpr int KTW = 8 / NW;
     constexpr int NTH = NW * 64;
     constexpr int RW = ((BT * D) / 8 + NTH - 1) / NTH;
     constexpr int VR = (BT * BV + NTH - 1) / NTH;
     constexpr int CIR = ((10 * C * C) / 8 + NTH - 1) / NTH;
     const int tid = threadIdx.x, wave = tid >> 6, lane = tid & 63;
-    const int bh = blockIdx.x, v0 = blockIdx.y * BV;
+    const int bh = blockIdx.x, vblock = blockIdx.y, v0 = vblock * BV;
 
     int h, seq_len, ns, ht_base, xp_base, xs_base, t0_base;
     if constexpr (VL) {
@@ -103,15 +133,20 @@ k2_kda_csplit_bt64_plain_kernel(
     __shared__ __bf16 cinv_storage[NBUF * 10 * C * C];
     __shared__ float decay_storage[NBUF * 4 * D];
     __shared__ float beta_storage[NBUF * BT];
-    // The baseline layouts reserve 16 KiB.  NW=4 keeps four K32 partials in FP32;
-    // NW=8 keeps eight K16 partials in BF16 so all 64 rows can be staged and
-    // reduced with one CTA barrier instead of synchronizing per row tile.  A
-    // gfx950 diagnostic pads FP32 rows to 20 elements: rows four apart then
+    // The baseline layouts reserve 16 KiB.  NW=4 keeps four K32 partials in
+    // FP32; NW=8 keeps eight K16 partials in BF16 so all 64 rows can be staged
+    // and reduced with one CTA barrier instead of synchronizing per row tile.
+    // A gfx950 diagnostic pads FP32 rows to 20 elements: rows four apart then
     // start 16 banks apart, avoiding the exact half-wave alias at pitch 16.
+    // The opt-in NW4 state exchange instead publishes the four waves' K32
+    // BF16 fragments in 4 KiB and assigns each wave only its output row tile.
     constexpr int PARTIAL_PITCH = PAD_PARTIAL ? 20 : BV;
     constexpr int PARTIAL_WORDS = NW == 4
         ? NW * BT * PARTIAL_PITCH : (NW * BT * BV) / 2;
-    __shared__ uint32_t partial_storage[PARTIAL_WORDS];
+    constexpr int STATE_XCHG_WORDS = NW * C * C;
+    constexpr int REDUCTION_WORDS = STATE_XCHG
+        ? STATE_XCHG_WORDS : PARTIAL_WORDS;
+    __shared__ __align__(16) uint32_t reduction_storage[REDUCTION_WORDS];
 
     float sreg[KTW][4];
     const int64_t state_base = int64_t(bh) * D * D;
@@ -202,25 +237,44 @@ k2_kda_csplit_bt64_plain_kernel(
             }
         }
         if (tid < D) {
-            gt_r = f32x4{
-                ws_gt[int64_t(ht0) * D + tid],
-                nch > 1 ? ws_gt[int64_t(ht0 + 1) * D + tid] : 0.0f,
-                nch > 2 ? ws_gt[int64_t(ht0 + 2) * D + tid] : 0.0f,
-                nch > 3 ? ws_gt[int64_t(ht0 + 3) * D + tid] : 0.0f};
+            if constexpr (DECAY_CACHED) {
+                gt_r = load_plain_bt64_suffix_decay(
+                    suffix_decay_g, xs, tid);
+            } else {
+                gt_r = f32x4{
+                    ws_gt[int64_t(ht0) * D + tid],
+                    nch > 1 ? ws_gt[int64_t(ht0 + 1) * D + tid] : 0.0f,
+                    nch > 2 ? ws_gt[int64_t(ht0 + 2) * D + tid] : 0.0f,
+                    nch > 3 ? ws_gt[int64_t(ht0 + 3) * D + tid] : 0.0f};
+            }
         }
-        if (tid < BT)
-            beta_r = tid < alen
-                ? sigmoid_tanh(beta_g[int64_t(t0 + tid) * H + h]) : 0.0f;
+        if (tid < BT) {
+            if (tid >= alen) {
+                beta_r = 0.0f;
+            } else if constexpr (BETA_ACTIVATED) {
+                // The fused C16 producer publishes one contiguous FP32 value
+                // per token at the same head-major tile offset as kd/kr.
+                beta_r = beta_g[int64_t(ht0) * C + tid];
+            } else {
+                beta_r = sigmoid_tanh(
+                    beta_g[int64_t(t0 + tid) * H + h]);
+            }
+        }
     };
     auto commit_meta = [&](int slot) {
         float* decay = decay_storage + slot * 4 * D;
         float* beta = beta_storage + slot * BT;
         __bf16* cinv = cinv_storage + slot * 10 * C * C;
         if (tid < D) {
-            decay[tid]         = ex2(gt_r[0] + gt_r[1] + gt_r[2] + gt_r[3]);
-            decay[D + tid]     = ex2(gt_r[1] + gt_r[2] + gt_r[3]);
-            decay[2 * D + tid] = ex2(gt_r[2] + gt_r[3]);
-            decay[3 * D + tid] = ex2(gt_r[3]);
+            f32x4 suffix;
+            if constexpr (DECAY_CACHED)
+                suffix = gt_r;
+            else
+                suffix = plain_bt64_suffix_decay(gt_r);
+            decay[tid] = suffix[0];
+            decay[D + tid] = suffix[1];
+            decay[2 * D + tid] = suffix[2];
+            decay[3 * D + tid] = suffix[3];
         }
         #pragma unroll
         for (int j = 0; j < CIR; ++j) {
@@ -295,16 +349,47 @@ k2_kda_csplit_bt64_plain_kernel(
         const int alen = min(BT, seq_len - s * BT);
         const int nch = (alen + C - 1) / C;
 
-        // Save the BT64 entry state for the chunk-parallel output pass.
+        // Save the BT64 entry state for the chunk-parallel output pass.  The
+        // exchange path reuses these exact BF16 conversions for its LDS
+        // publication instead of rounding the FP32 state a second time.
+        bf16x8 packed_entry_state{};
         #pragma unroll
         for (int kt = 0; kt < KTW; ++kt) {
+            const int gkt = wave * KTW + kt;
             const int vv = v0 + (lane & 15);
-            const int kk = (wave * KTW + kt) * C + (lane >> 4) * 4;
+            const int kk = gkt * C + (lane >> 4) * 4;
             bf16x4 x;
             #pragma unroll
-            for (int i = 0; i < 4; ++i) x[i] = f32_to_bf16(sreg[kt][i]);
-            *reinterpret_cast<bf16x4*>(
-                cs_sin + (int64_t(xs) * D + vv) * D + kk) = x;
+            for (int i = 0; i < 4; ++i) {
+                x[i] = f32_to_bf16(sreg[kt][i]);
+                if constexpr (STATE_XCHG)
+                    packed_entry_state[kt * 4 + i] = x[i];
+            }
+            if constexpr (SIN_FRAGMENT) {
+                // Tile the segment entry state exactly as the matched GLL
+                // replay consumes its MFMA B fragments.  Each 16x16 (V,K)
+                // tile is one contiguous wave of bf16x4 lane fragments.
+                __bf16* sin_base = cs_sin + int64_t(xs) * D * D;
+                reinterpret_cast<bf16x4*>(sin_base)[
+                    (vblock * 8 + gkt) * 64 + lane] = x;
+            } else {
+                *reinterpret_cast<bf16x4*>(
+                    cs_sin + (int64_t(xs) * D + vv) * D + kk) = x;
+            }
+        }
+
+        if constexpr (STATE_XCHG) {
+            // Each row holds four 16-byte producer fragments.  XOR the lane
+            // group with two middle row bits: for every fixed 16-lane group,
+            // the b128 requests visit all eight four-bank quads exactly twice,
+            // which is the minimum possible bank pressure for 64 dwords.
+            auto* state_exchange =
+                reinterpret_cast<bf16x8*>(reduction_storage);
+            const int vv = lane & 15;
+            const int group = lane >> 4;
+            const int swizzled_group = group ^ ((vv >> 1) & 3);
+            state_exchange[(wave * C + vv) * 4 + swizzled_group] =
+                packed_entry_state;
         }
 
         const bool has_next = s + 1 < ns;
@@ -316,16 +401,88 @@ k2_kda_csplit_bt64_plain_kernel(
             }
         }
 
-        if constexpr (NW == 4) {
-            float* partial = reinterpret_cast<float*>(partial_storage);
+        if constexpr (STATE_XCHG) {
+            // The first existing reduction barrier now fences the compact
+            // state publication.  Wave r consumes all four K32 fragments but
+            // computes only token-row block r.  Both MFMA modes retain the
+            // w0..w3 FP32 reduction order; x16 also retains the two-instruction
+            // K16 reduction tree of the original register-B contraction.
+            __syncthreads();
+            auto* state_exchange =
+                reinterpret_cast<const bf16x8*>(reduction_storage);
+            const int vv = lane & 15;
+            const int group = lane >> 4;
+            const int swizzled_group = group ^ ((vv >> 1) & 3);
+            f32x4 p[NW];
             #pragma unroll
-            for (int rb = 0; rb < 4; ++rb) {
-                f32x4 p = gemm_regB<SD, KTW>(
-                    kd + rb * C * SD + wave * KTW * C, sreg, lane);
+            for (int w = 0; w < NW; ++w) {
+                const bf16x8 packed_state = state_exchange[
+                    (w * C + vv) * 4 + swizzled_group];
+                if constexpr (REGB_X32) {
+                    p[w] = gemm_packed_k32_x32<SD>(
+                        kd + wave * C * SD + w * KTW * C,
+                        packed_state, lane);
+                } else {
+                    p[w] = gemm_packed_k32_x16<SD>(
+                        kd + wave * C * SD + w * KTW * C,
+                        packed_state, lane);
+                }
+            }
+            if constexpr (RHS_FRAGMENT_XCHG) {
+                // Read the original row-major V tile directly in the MFMA-D
+                // fragment mapping, then publish the corrected RHS in that
+                // same mapping.  The following solve can consume it without
+                // a transpose read.  rmat remains untouched until it becomes
+                // the row-major U destination after the reduction barrier.
+                const bf16x4 v_fragment = ds_read_tr16(
+                    rmat + wave * C * BV, lane);
+                bf16x4 rhs_fragment;
                 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
-                    const int r = (lane >> 4) * 4 + i, vv = lane & 15;
-                    partial[(wave * BT + rb * C + r) * PARTIAL_PITCH + vv] = p[i];
+                    const int r = group * 4 + i;
+                    float sum = 0.0f;
+                    #pragma unroll
+                    for (int w = 0; w < NW; ++w) sum += p[w][i];
+                    rhs_fragment[i] = f32_to_bf16(
+                        (bf16_to_f32(v_fragment[i]) - sum)
+                        * beta[wave * C + r]);
+                }
+                reinterpret_cast<bf16x4*>(
+                    umat + wave * C * BV)[lane] = rhs_fragment;
+            } else {
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int r = group * 4 + i;
+                    float sum = 0.0f;
+                    #pragma unroll
+                    for (int w = 0; w < NW; ++w) sum += p[w][i];
+                    rmat[(wave * C + r) * BV + vv] = f32_to_bf16(
+                        (bf16_to_f32(
+                            rmat[(wave * C + r) * BV + vv]) - sum)
+                        * beta[wave * C + r]);
+                }
+            }
+            __syncthreads();
+        } else if constexpr (NW == 4) {
+            float* partial = reinterpret_cast<float*>(reduction_storage);
+            bf16x8 packed_state{};
+            if constexpr (REGB_X32)
+                packed_state = pack_regb_k32_x32(sreg, lane);
+            #pragma unroll
+            for (int rb = 0; rb < 4; ++rb) {
+                f32x4 p = REGB_X32
+                    ? gemm_regb_k32_x32<SD>(
+                        kd + rb * C * SD + wave * KTW * C,
+                        sreg, packed_state, lane)
+                    : gemm_regB<SD, KTW>(
+                        kd + rb * C * SD + wave * KTW * C,
+                        sreg, lane);
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int r = (lane >> 4) * 4 + i;
+                    const int vv = lane & 15;
+                    partial[(wave * BT + rb * C + r) * PARTIAL_PITCH + vv] =
+                        p[i];
                 }
             }
             __syncthreads();
@@ -335,7 +492,8 @@ k2_kda_csplit_bt64_plain_kernel(
                 float sum = 0.0f;
                 #pragma unroll
                 for (int w = 0; w < NW; ++w)
-                    sum += partial[(w * BT + wave * C + r) * PARTIAL_PITCH + vv];
+                    sum += partial[
+                        (w * BT + wave * C + r) * PARTIAL_PITCH + vv];
                 rmat[(wave * C + r) * BV + vv] = f32_to_bf16(
                     (bf16_to_f32(rmat[(wave * C + r) * BV + vv]) - sum)
                     * beta[wave * C + r]);
@@ -343,7 +501,7 @@ k2_kda_csplit_bt64_plain_kernel(
             __syncthreads();
         } else {
             // K16/wave: stage all four token tiles, then reduce them at once.
-            __bf16* partial = reinterpret_cast<__bf16*>(partial_storage);
+            __bf16* partial = reinterpret_cast<__bf16*>(reduction_storage);
             #pragma unroll
             for (int rb = 0; rb < 4; ++rb) {
                 f32x4 p = gemm_regB<SD, KTW>(
@@ -379,9 +537,16 @@ k2_kda_csplit_bt64_plain_kernel(
             #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 if (j <= wave) {
-                    f32x4 x = mm_std_16_tr(
-                        cinv + plain_bt64_tri_tile(wave, j) * C * C,
-                        rmat + j * C * BV, lane);
+                    f32x4 x;
+                    if constexpr (RHS_FRAGMENT_XCHG) {
+                        x = plain_bt64_mm_std_16_fragment_rhs(
+                            cinv + plain_bt64_tri_tile(wave, j) * C * C,
+                            umat + j * C * BV, lane);
+                    } else {
+                        x = mm_std_16_tr(
+                            cinv + plain_bt64_tri_tile(wave, j) * C * C,
+                            rmat + j * C * BV, lane);
+                    }
                     #pragma unroll
                     for (int i = 0; i < 4; ++i) u[i] += x[i];
                 }
@@ -390,7 +555,10 @@ k2_kda_csplit_bt64_plain_kernel(
             for (int i = 0; i < 4; ++i) {
                 const int r = (lane >> 4) * 4 + i, vv = lane & 15;
                 const __bf16 x = f32_to_bf16(u[i]);
-                umat[(wave * C + r) * BV + vv] = x;
+                if constexpr (RHS_FRAGMENT_XCHG)
+                    rmat[(wave * C + r) * BV + vv] = x;
+                else
+                    umat[(wave * C + r) * BV + vv] = x;
                 if (wave * C < alen)
                     cs_u[(int64_t(ht0 + wave) * C + r) * D + v0 + vv] = x;
             }
@@ -404,13 +572,23 @@ k2_kda_csplit_bt64_plain_kernel(
                 if constexpr (TILED_KR) {
                     const bf16x4 a = ds_read_tr16(
                         kr + rb * C * D + gkt * C * C, lane);
-                    const bf16x4 b = ds_read_tr16(umat + rb * C * BV, lane);
+                    bf16x4 b;
+                    if constexpr (RHS_FRAGMENT_XCHG)
+                        b = ds_read_tr16(rmat + rb * C * BV, lane);
+                    else
+                        b = ds_read_tr16(umat + rb * C * BV, lane);
                     const f32x4 zero = {0.f, 0.f, 0.f, 0.f};
                     return mfma_bf16(a, b, zero);
                 } else {
-                    return mm_cf_trB(
-                        kr + rb * C * D, D, gkt * C,
-                        umat + rb * C * BV, lane);
+                    if constexpr (RHS_FRAGMENT_XCHG) {
+                        return mm_cf_trB(
+                            kr + rb * C * D, D, gkt * C,
+                            rmat + rb * C * BV, lane);
+                    } else {
+                        return mm_cf_trB(
+                            kr + rb * C * D, D, gkt * C,
+                            umat + rb * C * BV, lane);
+                    }
                 }
             };
             f32x4 c0 = carry(0);
@@ -458,7 +636,8 @@ k2_kda_csplit_bt64_plain_kernel(
             #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 const int vv = v0 + (lane & 15);
-                const int kk = (wave * KTW + kt) * C + (lane >> 4) * 4 + i;
+                const int kk = (wave * KTW + kt) * C +
+                    (lane >> 4) * 4 + i;
                 const int64_t idx = state_base + int64_t(vv) * D + kk;
                 if constexpr (SFP32)
                     reinterpret_cast<float*>(final_state)[idx] = sreg[kt][i];

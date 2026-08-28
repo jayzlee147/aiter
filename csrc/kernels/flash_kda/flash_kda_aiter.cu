@@ -179,29 +179,39 @@ void flash_kda_fwd_hip(
 
     AITER_CHECK(q.dim() == 4, "q must have shape [B,T,H,128]");
     check_same_shape(k, q, "k");
-    check_same_shape(v, q, "v");
-    check_same_shape(g, q, "g");
-    check_same_shape(out, q, "out");
+    AITER_CHECK(v.dim() == 4, "v must have shape [B,T,HV,128]");
+    check_same_shape(g, v, "g");
+    check_same_shape(out, v, "out");
 
     const int64_t B = q.size(0);
     const int64_t T = q.size(1);
-    const int64_t H = q.size(2);
-    const int64_t D = q.size(3);
-    AITER_CHECK(B > 0 && T > 0 && H > 0, "B, T and H must all be positive");
-    AITER_CHECK(D == flashkda_hip::WorkspaceSizes::D,
+    const int64_t H_q = q.size(2);
+    const int64_t H = v.size(2);
+    const int64_t K = q.size(3);
+    const int64_t V = v.size(3);
+    AITER_CHECK(B > 0 && T > 0 && H_q > 0 && H > 0,
+                "B, T, H_q and H_v must all be positive");
+    AITER_CHECK(v.size(0) == B && v.size(1) == T,
+                "v must match q's batch and token dimensions");
+    AITER_CHECK(H >= H_q && H % H_q == 0,
+                "native FlashKDA requires H_v >= H_q and H_v divisible by H_q");
+    AITER_CHECK(K == flashkda_hip::WorkspaceSizes::D &&
+                    V == flashkda_hip::WorkspaceSizes::D,
                 "native FlashKDA requires K=V=128, got ",
-                D);
+                K,
+                " and ",
+                V);
     AITER_CHECK(beta.dim() == 3 && beta.size(0) == B && beta.size(1) == T &&
                     beta.size(2) == H,
                 "beta must have shape [B,T,H]");
     AITER_CHECK(A_log.dim() == 1 && A_log.size(0) == H,
                 "A_log must have shape [H]");
     AITER_CHECK((dt_bias.dim() == 1 || dt_bias.dim() == 2) &&
-                    static_cast<int64_t>(dt_bias.numel()) == H * D,
+                    static_cast<int64_t>(dt_bias.numel()) == H * K,
                 "dt_bias must be contiguous float32 [H*128] or [H,128]");
     if(dt_bias.dim() == 2)
     {
-        AITER_CHECK(dt_bias.size(0) == H && dt_bias.size(1) == D,
+        AITER_CHECK(dt_bias.size(0) == H && dt_bias.size(1) == K,
                     "2D dt_bias must have shape [H,128]");
     }
 
@@ -215,6 +225,7 @@ void flash_kda_fwd_hip(
 
     AITER_CHECK(B <= std::numeric_limits<int>::max() &&
                     T <= std::numeric_limits<int>::max() &&
+                    H_q <= std::numeric_limits<int>::max() &&
                     H <= std::numeric_limits<int>::max() &&
                     B <= std::numeric_limits<int64_t>::max() / T,
                 "FlashKDA dimensions exceed the native launch ABI");
@@ -238,6 +249,11 @@ void flash_kda_fwd_hip(
     }
     AITER_CHECK(N > 0 && N <= std::numeric_limits<int>::max(),
                 "number of sequences exceeds the native launch ABI");
+    AITER_CHECK(H <= std::numeric_limits<int>::max() / N,
+                "N*H_v exceeds the native launch-grid ABI");
+    constexpr int64_t max_grid_y = 65535;
+    AITER_CHECK(is_varlen ? H <= max_grid_y : H <= max_grid_y / N,
+                "FlashKDA dense N*H_v (or packed H_v) exceeds grid.y limit");
 
     bool state_fp32 = false;
     if(has_initial_state)
@@ -317,6 +333,7 @@ void flash_kda_fwd_hip(
         gate_scale,
         static_cast<int>(total_tiles64),
         static_cast<int>(total_tokens),
+        static_cast<int>(H_q),
         static_cast<int>(H),
         static_cast<int>(N),
         has_initial_state ? initial_state.data_ptr() : nullptr,
@@ -325,11 +342,12 @@ void flash_kda_fwd_hip(
         output_final_state,
         state_fp32,
         single_sequence_packed ? nullptr : cu_seqlens_ptr,
-        stream);
+        stream,
+        0);
     HIP_CALL_LAUNCH(hipGetLastError());
 }
 
-void flash_kda_fwd_hip_raw(
+void flash_kda_fwd_hip_raw_v3(
     std::uintptr_t q_ptr,
     std::uintptr_t k_ptr,
     std::uintptr_t v_ptr,
@@ -354,7 +372,9 @@ void flash_kda_fwd_hip_raw(
     bool is_varlen,
     bool state_fp32,
     int64_t device_id,
-    std::uintptr_t stream_ptr)
+    std::uintptr_t stream_ptr,
+    int64_t max_seqlen_upper_bound,
+    int64_t H_q)
 {
     raw_check_pointer(q_ptr, "q_ptr", alignof(uint16_t));
     raw_check_pointer(k_ptr, "k_ptr", alignof(uint16_t));
@@ -378,13 +398,21 @@ void flash_kda_fwd_hip_raw(
                           state_fp32 ? alignof(float) : alignof(uint16_t));
     }
 
-    raw_check(B > 0 && T > 0 && H > 0 && N > 0,
-              "B, T, H, and N must all be positive");
+    raw_check(B > 0 && T > 0 && H_q > 0 && H > 0 && N > 0,
+              "B, T, H_q, H_v, and N must all be positive");
+    raw_check(H >= H_q && H % H_q == 0,
+              "H_v must be an integer multiple of H_q");
     raw_check(B <= std::numeric_limits<int>::max() &&
                   T <= std::numeric_limits<int>::max() &&
+                  H_q <= std::numeric_limits<int>::max() &&
                   H <= std::numeric_limits<int>::max() &&
                   N <= std::numeric_limits<int>::max(),
-              "B, T, H, or N exceeds the native int launch ABI");
+              "B, T, H_q, H_v, or N exceeds the native int launch ABI");
+    raw_check(H <= std::numeric_limits<int>::max() / N,
+              "N*H_v exceeds the native launch-grid ABI");
+    constexpr int64_t max_grid_y = 65535;
+    raw_check(is_varlen ? H <= max_grid_y : H <= max_grid_y / N,
+              "FlashKDA dense N*H_v (or packed H_v) exceeds grid.y limit");
     raw_check(B <= std::numeric_limits<int64_t>::max() / T,
               "B*T overflows int64_t");
     const int64_t total_tokens = B * T;
@@ -407,6 +435,27 @@ void flash_kda_fwd_hip_raw(
     else
     {
         raw_check(N == B, "dense mode requires N == B");
+    }
+    raw_check(max_seqlen_upper_bound >= 0,
+              "max_seqlen_upper_bound must be nonnegative");
+    raw_check(max_seqlen_upper_bound <= std::numeric_limits<int>::max(),
+              "max_seqlen_upper_bound exceeds the native int policy ABI");
+    if(max_seqlen_upper_bound > 0)
+    {
+        if(is_varlen)
+        {
+            const int64_t minimum_upper = total_tokens / N +
+                                          (total_tokens % N != 0 ? 1 : 0);
+            raw_check(max_seqlen_upper_bound >= minimum_upper &&
+                          max_seqlen_upper_bound <= total_tokens,
+                      "packed max_seqlen_upper_bound must be in "
+                      "[ceil(B*T/N), B*T]");
+        }
+        else
+        {
+            raw_check(max_seqlen_upper_bound == T,
+                      "dense max_seqlen_upper_bound must be zero or equal T");
+        }
     }
 
     constexpr int64_t chunk = flashkda_hip::WorkspaceSizes::CHUNK;
@@ -461,6 +510,7 @@ void flash_kda_fwd_hip_raw(
         gate_scale,
         static_cast<int>(launch_tiles),
         static_cast<int>(total_tokens),
+        static_cast<int>(H_q),
         static_cast<int>(H),
         static_cast<int>(N),
         has_initial_state ? reinterpret_cast<const void*>(initial_state_ptr) : nullptr,
@@ -470,8 +520,121 @@ void flash_kda_fwd_hip_raw(
         state_fp32,
         single_sequence_packed ? nullptr
                                : reinterpret_cast<const int32_t*>(cu_seqlens_ptr),
-        stream);
+        stream,
+        static_cast<int>(max_seqlen_upper_bound));
     raw_check_hip(hipGetLastError(), "hipGetLastError");
+}
+
+void flash_kda_fwd_hip_raw_v2(
+    std::uintptr_t q_ptr,
+    std::uintptr_t k_ptr,
+    std::uintptr_t v_ptr,
+    std::uintptr_t g_ptr,
+    std::uintptr_t beta_ptr,
+    std::uintptr_t out_ptr,
+    std::uintptr_t workspace_ptr,
+    std::uintptr_t A_log_ptr,
+    std::uintptr_t dt_bias_ptr,
+    std::uintptr_t initial_state_ptr,
+    std::uintptr_t final_state_ptr,
+    std::uintptr_t cu_seqlens_ptr,
+    int64_t B,
+    int64_t T,
+    int64_t H,
+    int64_t N,
+    int64_t workspace_bytes,
+    double scale,
+    double lower_bound,
+    bool has_initial_state,
+    bool output_final_state,
+    bool is_varlen,
+    bool state_fp32,
+    int64_t device_id,
+    std::uintptr_t stream_ptr,
+    int64_t max_seqlen_upper_bound)
+{
+    flash_kda_fwd_hip_raw_v3(q_ptr,
+                             k_ptr,
+                             v_ptr,
+                             g_ptr,
+                             beta_ptr,
+                             out_ptr,
+                             workspace_ptr,
+                             A_log_ptr,
+                             dt_bias_ptr,
+                             initial_state_ptr,
+                             final_state_ptr,
+                             cu_seqlens_ptr,
+                             B,
+                             T,
+                             H,
+                             N,
+                             workspace_bytes,
+                             scale,
+                             lower_bound,
+                             has_initial_state,
+                             output_final_state,
+                             is_varlen,
+                             state_fp32,
+                             device_id,
+                             stream_ptr,
+                             max_seqlen_upper_bound,
+                             H);
+}
+
+void flash_kda_fwd_hip_raw(
+    std::uintptr_t q_ptr,
+    std::uintptr_t k_ptr,
+    std::uintptr_t v_ptr,
+    std::uintptr_t g_ptr,
+    std::uintptr_t beta_ptr,
+    std::uintptr_t out_ptr,
+    std::uintptr_t workspace_ptr,
+    std::uintptr_t A_log_ptr,
+    std::uintptr_t dt_bias_ptr,
+    std::uintptr_t initial_state_ptr,
+    std::uintptr_t final_state_ptr,
+    std::uintptr_t cu_seqlens_ptr,
+    int64_t B,
+    int64_t T,
+    int64_t H,
+    int64_t N,
+    int64_t workspace_bytes,
+    double scale,
+    double lower_bound,
+    bool has_initial_state,
+    bool output_final_state,
+    bool is_varlen,
+    bool state_fp32,
+    int64_t device_id,
+    std::uintptr_t stream_ptr)
+{
+    flash_kda_fwd_hip_raw_v2(q_ptr,
+                             k_ptr,
+                             v_ptr,
+                             g_ptr,
+                             beta_ptr,
+                             out_ptr,
+                             workspace_ptr,
+                             A_log_ptr,
+                             dt_bias_ptr,
+                             initial_state_ptr,
+                             final_state_ptr,
+                             cu_seqlens_ptr,
+                             B,
+                             T,
+                             H,
+                             N,
+                             workspace_bytes,
+                             scale,
+                             lower_bound,
+                             has_initial_state,
+                             output_final_state,
+                             is_varlen,
+                             state_fp32,
+                             device_id,
+                             stream_ptr,
+                             0);
 }
 
 } // namespace aiter

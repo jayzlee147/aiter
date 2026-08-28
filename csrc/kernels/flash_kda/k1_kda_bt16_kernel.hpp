@@ -10,24 +10,77 @@ namespace flashkda_hip {
 
 // Build the varlen tile prefix-sum: tile_prefix[i] = sum_{j<i} ceil(seq_len_j/16).
 // tile_prefix[N] is the exact total chunk-tile count (<= total_tiles upper bound).
-// Single block, one thread walks the (small) N-length cu_seqlens.
+// The context affine/hybrid route repurposes segment_prefix as its filtered
+// GROUP_CHUNKS prefix; direct and all non-context routes retain the ordinary
+// C64 segment prefix.  Single block, one thread walks the small cu_seqlens once.
 __global__ void k1_build_tile_prefix(
         const int32_t* __restrict__ cu_seqlens, int N,
         int* __restrict__ tile_prefix, int* __restrict__ pair_prefix,
-        int* __restrict__ segment_prefix) {
+        int* __restrict__ segment_prefix,
+        int context_group_chunks,
+        int context_direct_max_chunks,
+        const void* __restrict__ init_state,
+        void* __restrict__ final_state,
+        int H,
+        bool initialize_empty_state,
+        bool has_state_in,
+        bool has_state_out,
+        bool state_fp32) {
     if (threadIdx.x == 0) {
-        int acc = 0, pair_acc = 0, seg_acc = 0;
+        int acc = 0, pair_acc = 0, seg_acc = 0, context_acc = 0;
         tile_prefix[0] = 0;
         pair_prefix[0] = 0;
         segment_prefix[0] = 0;
         for (int i = 0; i < N; i++) {
-            int slen = int(cu_seqlens[i + 1] - cu_seqlens[i]);
-            acc += (slen + 16 - 1) / 16;
-            pair_acc += (slen + 32 - 1) / 32;
-            seg_acc += (slen + 64 - 1) / 64;
+            const int64_t slen = int64_t(cu_seqlens[i + 1]) -
+                                 int64_t(cu_seqlens[i]);
+            const int chunks = int((slen + 16 - 1) / 16);
+            acc += chunks;
+            pair_acc += (chunks + 1) / 2;
+            seg_acc += (chunks + 3) / 4;
+            if (context_group_chunks > 0 &&
+                (context_direct_max_chunks == 0 ||
+                 chunks > context_direct_max_chunks)) {
+                context_acc +=
+                    (chunks + context_group_chunks - 1) /
+                    context_group_chunks;
+            }
             tile_prefix[i + 1] = acc;
             pair_prefix[i + 1] = pair_acc;
-            segment_prefix[i + 1] = seg_acc;
+            segment_prefix[i + 1] = context_group_chunks > 0
+                ? context_acc : seg_acc;
+        }
+    }
+
+    // C-split grids retain one sequence-owned scan CTA even when that
+    // sequence has zero segments, but the scan returns before its state
+    // load/store.  Fuse the recurrent identity into this already-required
+    // prefix launch instead of adding a memset/copy launch or inflating every
+    // hot C-split specialization.  Non-C-split routes keep this branch off.
+    if (!initialize_empty_state || !has_state_out)
+        return;
+    constexpr int D = 128;
+    const int tid = int(threadIdx.x);
+    const int threads = int(blockDim.x);
+    for (int seq = 0; seq < N; ++seq) {
+        if (cu_seqlens[seq] != cu_seqlens[seq + 1])
+            continue;
+        const int64_t elements = int64_t(H) * D * D;
+        const int64_t base = int64_t(seq) * elements;
+        if (state_fp32) {
+            const auto* source =
+                reinterpret_cast<const uint32_t*>(init_state);
+            auto* destination = reinterpret_cast<uint32_t*>(final_state);
+            for (int64_t local = tid; local < elements; local += threads)
+                destination[base + local] =
+                    has_state_in ? source[base + local] : uint32_t{0};
+        } else {
+            const auto* source =
+                reinterpret_cast<const uint16_t*>(init_state);
+            auto* destination = reinterpret_cast<uint16_t*>(final_state);
+            for (int64_t local = tid; local < elements; local += threads)
+                destination[base + local] =
+                    has_state_in ? source[base + local] : uint16_t{0};
         }
     }
 }
@@ -37,17 +90,17 @@ __global__ void k1_build_tile_prefix(
 // Varlen    (VL=true):  grid (total_tiles, H); global tile blockIdx.x is mapped
 //   to (seq_idx, local_t) via a binary search on tile_prefix; ht = h*total_tiles
 //   + global_tile_idx. Gap tiles (>= tile_prefix[N]) early-return.
-template <bool VL = false>
+template <bool VL = false, bool GVA = false>
 __global__ void __launch_bounds__(64)
 k1_kda_bt16_kernel(
-        const __bf16* __restrict__ q_g,     // [T_total, H, D]
+        const __bf16* __restrict__ q_g,     // [T_total, H_q, D]
         const __bf16* __restrict__ k_g,
-        const __bf16* __restrict__ g_g,
+        const __bf16* __restrict__ g_g,     // [T_total, H, D]
         const float*  __restrict__ beta_g,  // [T_total, H]
         const float*  __restrict__ A_log_g, // [H]
         const float*  __restrict__ dt_bias_g, // [H, D]
         float scale, float gate_scale,
-        int T_seq, int H,
+        int T_seq, int H, int H_q,
         __bf16* __restrict__ ws_kd,   // [n_ht, 16, 128]
         __bf16* __restrict__ ws_qd,
         __bf16* __restrict__ ws_kr,
@@ -91,6 +144,7 @@ k1_kda_bt16_kernel(
         t0 = b * T_seq + nt * C;
         alen = min(C, T_seq - nt * C);   // rows with real data
     }
+    const int qh = GVA ? h / (H / H_q) : h;
 
     __shared__ __bf16   knorm[C * D];
     __shared__ __bf16   qd[C * D];      // q_norm -> q_decayed
@@ -110,10 +164,13 @@ k1_kda_bt16_kernel(
     for (int idx = lane; idx < C * D; idx += 64) {
         int m = idx / D, d = idx % D;
         if (m < alen) {
-            int go = (t0 + m) * H * D + h * D + d;
-            knorm[idx] = k_g[go];
-            qd[idx]    = q_g[go];
-            float gf = bf16_to_f32(g_g[go]) + dt_bias_g[h * D + d];
+            const int64_t qk_offset =
+                (int64_t(t0 + m) * H_q + qh) * D + d;
+            const int64_t vg_offset =
+                (int64_t(t0 + m) * H + h) * D + d;
+            knorm[idx] = k_g[qk_offset];
+            qd[idx]    = q_g[qk_offset];
+            float gf = bf16_to_f32(g_g[vg_offset]) + dt_bias_g[h * D + d];
             gc[idx]  = gate_scale * sigmoid_tanh(a_head * gf);
         } else {
             knorm[idx] = (__bf16)0.0f; qd[idx] = (__bf16)0.0f; gc[idx] = 0.0f;

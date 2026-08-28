@@ -34,6 +34,7 @@ namespace flashkda_hip {
 // routes share the existing beta pointer without adding another 64-bit arg.
 constexpr unsigned kCs64ScanUseDecayTable = 1u << 0;
 constexpr unsigned kCs64ScanBetaActivated = 1u << 1;
+constexpr unsigned kCs64ScanSuffixDecayCached = 1u << 2;
 
 void launch_fwd_common(
         const FwdParams& p,
@@ -50,7 +51,9 @@ void launch_fwd_common(
     const float* dt_bias_ptr = p.dt_bias_ptr;
     const float gate_scale = p.gate_scale;
     const int total_tiles = p.total_tiles;
+    const int H_q = p.H_q;
     const int H = p.H;
+    const bool is_gva = H_q != H;
     const int N = p.N;
     const void* init_state = p.init_state;
     void* final_state = p.final_state;
@@ -68,7 +71,12 @@ void launch_fwd_common(
     const int total_pairs = shape.total_pairs;
     const int64_t n_ht = shape.n_ht;
 
-    const char* k2env = getenv("FLASH_KDA_K2");
+    // Most C-split producers still assume one Q/K head per value head.  GVA may
+    // use only a policy-advertised fused BT16 producer, followed by either the
+    // register-state K2, the generic uncached context graph, or a separately
+    // advertised whole plain C-split graph.  Keep route overrides from
+    // selecting any other producer/consumer ABI.
+    const char* k2env = is_gva ? nullptr : getenv("FLASH_KDA_K2");
     const bool cs_skip_k1_solve =
         getenv("FLASH_KDA_CS_SKIP_K1_SOLVE") != nullptr;
     const bool cs_skip_k1_prep =
@@ -76,7 +84,7 @@ void launch_fwd_common(
     // Matched gfx942 route: the fused BT64 producer publishes the exact C16
     // local-Mqk/activated-beta ABI consumed by the register-state scan.  The
     // default and explicit spellings share the same callback/skip guard.
-    const bool default_vsplit_rs_mw_k6 = !k2env &&
+    const bool default_vsplit_rs_mw_k6 = !is_gva && !k2env &&
         policy.default_k2_route == K2DefaultRoute::vsplit_rs_mw_k6;
     const bool request_vsplit_rs_mw_k6 =
         default_vsplit_rs_mw_k6 ||
@@ -91,13 +99,84 @@ void launch_fwd_common(
         k2env && strcmp(k2env, "csplit64wide") == 0;
     const bool use_csplit64_plain_nw8 = policy.launch_plain_nw8 &&
         k2env && strcmp(k2env, "csplit64nw8") == 0;
+    // Close the complete GVA plain producer/post-preparation handshake before
+    // admitting C-split.  In particular, either K1 skip knob would otherwise
+    // expose the legacy split producer, whose raw q/k indexing assumes H_q==H.
+    // A disabled fused BT16 mode is reflected in bt16_k1_supports_gva and must
+    // likewise retain the established V-split fallback.
+    const bool use_gva_plain_csplit = is_gva &&
+        policy.plain_csplit_supports_gva &&
+        policy.bt16_k1_supports_gva &&
+        policy.launch_bt16_k1 != nullptr &&
+        policy.use_bt16_k1_for_plain &&
+        policy.launch_plain_k1 != nullptr &&
+        !cs_skip_k1_prep && !cs_skip_k1_solve;
     const bool use_default_csplit64 = !k2env &&
-        policy.default_k2_route == K2DefaultRoute::csplit64;
-    const bool use_csplit64_k6_auto =
-        (!k2env &&
+        policy.default_k2_route == K2DefaultRoute::csplit64 &&
+        (!is_gva || use_gva_plain_csplit);
+    const bool use_context_parallel = !k2env &&
+        policy.default_k2_route == K2DefaultRoute::context_parallel &&
+        policy.launch_context_parallel != nullptr &&
+        (!is_gva || (policy.launch_bt16_k1 != nullptr &&
+                     policy.bt16_k1_supports_gva));
+    // Close the producer/consumer cache ABI before either callback runs.  GVA
+    // deliberately stays on raw beta/ws_gt: keeping a single uncached GVA K1
+    // specialization avoids a large compile-time/code-size expansion.
+    const bool request_context_operand_cache =
+        use_context_parallel && !is_gva &&
+        policy.launch_bt16_k1 != nullptr &&
+        policy.bt16_k1_context_operand_cache;
+    // The raw-v2 maximum is a caller promise: every packed sequence is no
+    // longer than max_seqlen_upper_bound.  If their sum is exactly N times
+    // that bound, every sequence must therefore have the same length.  The
+    // measured N=4/G64 affine bucket can use the cheaper dense K1/K2 index
+    // mapping and omit the prefix node entirely.  The architecture policy
+    // publishes this whole-graph capability only for a canonical exact-"1"
+    // recipe; repeat every geometry check here before erasing metadata.
+    const int equal_dense_nt = p.max_seqlen_upper_bound > 0
+        ? int((int64_t(p.max_seqlen_upper_bound) +
+               WorkspaceSizes::CHUNK - 1) / WorkspaceSizes::CHUNK)
+        : 0;
+    const int64_t equal_dense_total_tiles =
+        int64_t(N) * int64_t(equal_dense_nt);
+    const bool use_context_equal_dense_n4_g64 =
+        !is_gva && policy.context_equal_dense_n4_g64 &&
+        use_context_parallel && is_varlen && N == 4 && H > 0 &&
+        p.max_seqlen_upper_bound == 4096 &&
+        int64_t(p.max_seqlen_upper_bound) * int64_t(N) ==
+            int64_t(p.T_total) &&
+        policy.launch_bt16_k1 != nullptr &&
+        policy.context_group_chunks == 64 &&
+        policy.context_direct_max_chunks == 0 && equal_dense_nt > 0 &&
+        equal_dense_total_tiles == int64_t(4 * 256) &&
+        int64_t(total_tiles) == equal_dense_total_tiles + N &&
+        !policy.context_direct_prefixless &&
+        policy.launch_context_prefix == nullptr &&
+        policy.context_persistent_blocks == 0;
+    // A prefix node may be removed only as a matched K1/K2 topology.  The
+    // gfx950 policy capability is already strict opt-in; repeat the structural
+    // guards here before suppressing architecture-neutral work so a partial or
+    // future policy cannot expose uninitialized prefix storage.
+    const bool use_context_direct_prefixless =
+        use_context_parallel && !is_gva && is_varlen &&
+        !use_context_equal_dense_n4_g64 &&
+        policy.context_direct_prefixless &&
+        policy.launch_bt16_k1 != nullptr &&
+        policy.context_group_chunks == 0 &&
+        policy.context_direct_max_chunks == 0 &&
+        N > 0 && N <= 16;
+    // The packed-hybrid grid-stride candidate is a matched prefix/K2 graph.
+    // A partial policy must retain the established prefix and every established
+    // context kernel rather than silently enabling only half of the topology.
+    const bool use_context_persistent = use_context_parallel && !is_gva &&
+        is_varlen &&
+        policy.launch_context_prefix != nullptr &&
+        policy.context_persistent_blocks > 0;
+    const bool use_csplit64_k6_auto = !is_gva &&
+        ((!k2env &&
          (policy.default_k2_route == K2DefaultRoute::csplit64_k6 ||
           (default_vsplit_rs_mw_k6 && !use_vsplit_rs_mw_k6))) ||
-        (k2env && strcmp(k2env, "csplit64rtpk6auto") == 0);
+        (k2env && strcmp(k2env, "csplit64rtpk6auto") == 0));
     // Persistent P3 is exposed only as a matched builder/consumer pair.  The
     // architecture policy applies its strict environment and shape guards;
     // explicit non-auto K2 selections continue to take precedence.
@@ -154,6 +233,11 @@ void launch_fwd_common(
         (use_csplit64_k6 || use_vsplit_rs_mw_k6) &&
         policy.launch_fused_prepare_neumann != nullptr &&
         !cs_skip_k1_prep && !cs_skip_k1_solve;
+    const bool use_csplit_bt16_k1 = use_default_csplit64 &&
+        policy.launch_bt16_k1 != nullptr &&
+        policy.use_bt16_k1_for_plain &&
+        (!is_gva || use_gva_plain_csplit) &&
+        !cs_skip_k1_prep && !cs_skip_k1_solve;
     // Only the architecture-selected production plain route may replace all
     // three K1 factorization stages.  Explicit routes and skip-stage timing
     // knobs retain the shared implementation as a stable diagnostic baseline.
@@ -161,9 +245,23 @@ void launch_fwd_common(
         policy.launch_plain_k1 != nullptr &&
         !cs_skip_k1_prep && !cs_skip_k1_solve;
     // Only the production K6 specialization publishes activated beta.  The
-    // legacy/plain BV16 route and the skip-K1 timing knob must read logits.
-    const bool use_csplit64_beta_cache =
+    // legacy BV16 route and the skip-K1 timing knob must read logits.
+    const bool use_csplit64_k6_beta_cache =
         use_csplit64_k6 && !cs_skip_k1_solve;
+    // Plain scan consumers are enabled only after the common launcher has
+    // selected the solved BT16 producer and the policy has promised that this
+    // exact callback specialization publishes activated beta.  This is kept
+    // separate from the context-only decay/cache contract.
+    const bool use_plain_beta_cache =
+        use_csplit_bt16_k1 && use_plain_k1_callback &&
+        policy.bt16_k1_plain_beta_cache && !is_gva;
+    // The suffix cache is legal only when this exact automatic plain route
+    // launches the PRE_SOLVED fused post-preparation callback that publishes
+    // it.  Explicit, skipped, fallback, K6, context and other-architecture
+    // routes therefore cannot observe stale cs_segment_a contents.
+    const bool use_plain_suffix_decay_cache =
+        use_csplit_bt16_k1 && use_plain_k1_callback &&
+        policy.plain_k1_suffix_decay_cache;
     const WorkspaceLayout ws = carve_workspace(p.workspace_ptr, shape, H, N);
     auto* ws_kd = ws.kd;
     auto* ws_qd = ws.qd;
@@ -186,16 +284,40 @@ void launch_fwd_common(
     int* sequence_worklist = ws.sequence_worklist;
     int* sequence_count = ws.sequence_count;
     unsigned int* task_counter = ws.task_counter;
-    if (is_varlen) {
+    if (is_varlen && !use_context_direct_prefixless &&
+        !use_context_equal_dense_n4_g64) {
         if (use_csplit64_k6_persistent) {
             const PersistentPrefixLaunch args{
                 stream, cu_seqlens, N, tile_prefix, pair_prefix,
                 segment_prefix, sequence_worklist, sequence_count,
                 task_counter};
             policy.launch_persistent_prefix(args);
+        } else if (use_context_persistent) {
+            const PersistentPrefixLaunch args{
+                stream, cu_seqlens, N, tile_prefix, pair_prefix,
+                segment_prefix, sequence_worklist, sequence_count,
+                task_counter};
+            policy.launch_context_prefix(args);
         } else {
+            const int context_group_chunks = use_context_parallel
+                ? policy.context_group_chunks : 0;
+            const int context_direct_max_chunks = use_context_parallel
+                ? policy.context_direct_max_chunks : 0;
+            // Plain/common C-split scan kernels retain an owner CTA for an
+            // empty sequence but return before publishing its final state.
+            // Fold the recurrent identity (copy initial state, or write zero)
+            // into this already-required prefix launch so no hot K2
+            // specialization or launch topology changes.
+            // gfx942's vsplit_rs_mw_k6 reuses C-split preparation but its
+            // V-split consumer already publishes the empty-sequence state.
+            // Keep that established default free of this extra state walk.
+            const bool initialize_empty_state =
+                use_csplit && !use_vsplit_rs_mw_k6;
             k1_build_tile_prefix<<<1, 64, 0, stream>>>(
-                cu_seqlens, N, tile_prefix, pair_prefix, segment_prefix);
+                cu_seqlens, N, tile_prefix, pair_prefix, segment_prefix,
+                context_group_chunks, context_direct_max_chunks,
+                init_state, final_state, H, initialize_empty_state,
+                has_state_in, has_state_out, state_fp32);
         }
     }
     if (use_csplit) {
@@ -238,7 +360,8 @@ void launch_fwd_common(
         };
         if (is_varlen) {
             dim3 grid(total_tiles, H);
-            if (!cs_skip_k1_prep && !use_fused_prepare_neumann)
+            if (!cs_skip_k1_prep && !use_fused_prepare_neumann &&
+                !use_csplit_bt16_k1)
                 dispatch_split_prep.template operator()<true>(grid);
             if (!cs_skip_k1_solve && need_split_solve &&
                 !use_plain_k1_callback) k1_kda_split_solve_kernel<true><<<grid, kSplitSolveThreads, 0, stream>>>(
@@ -247,13 +370,28 @@ void launch_fwd_common(
                 cu_seqlens, tile_prefix, N, total_tiles, T_seq, H);
         } else {
             dim3 grid(NT, N * H);
-            if (!cs_skip_k1_prep && !use_fused_prepare_neumann)
+            if (!cs_skip_k1_prep && !use_fused_prepare_neumann &&
+                !use_csplit_bt16_k1)
                 dispatch_split_prep.template operator()<false>(grid);
             if (!cs_skip_k1_solve && need_split_solve &&
                 !use_plain_k1_callback) k1_kda_split_solve_kernel<false><<<grid, kSplitSolveThreads, 0, stream>>>(
                 reinterpret_cast<const float*>(beta_ptr),
                 ws_kd, ws_qd, cs_u, ws_inv, ws_mqk,
                 nullptr, nullptr, N, total_tiles, T_seq, H);
+        }
+        if (use_csplit_bt16_k1) {
+            const Bt16K1Launch args{
+                stream,
+                reinterpret_cast<const __bf16*>(q_ptr),
+                reinterpret_cast<const __bf16*>(k_ptr),
+                reinterpret_cast<const __bf16*>(g_ptr),
+                reinterpret_cast<const float*>(beta_ptr),
+                A_log_ptr, dt_bias_ptr, scale, gate_scale,
+                ws_kd, ws_qd, ws_kr, ws_gt, cs_u, ws_inv, ws_mqk,
+                cs_beta,
+                cu_seqlens, tile_prefix, N, total_tiles, T_seq, H, H_q, NT,
+                is_varlen, false, use_plain_beta_cache, false};
+            policy.launch_bt16_k1(args);
         }
         if (use_fused_prepare_neumann) {
             // The ordinary K6 producer stores its per-token decay table in
@@ -282,11 +420,15 @@ void launch_fwd_common(
             policy.launch_fused_prepare_neumann(args);
         } else if (use_plain_k1_callback) {
             const PlainCsplit64K1Launch args{
-                stream, reinterpret_cast<const float*>(beta_ptr), ws_kd,
+                stream, reinterpret_cast<const float*>(beta_ptr), cs_beta,
+                reinterpret_cast<float*>(cs_segment_a),
+                ws_kd,
                 ws_qd, ws_kr, ws_gt, cs_u, ws_inv, ws_mqk,
                 cs_cross_inv, cs_cross64, cu_seqlens, tile_prefix,
                 pair_prefix, segment_prefix, N, total_tiles, total_pairs,
-                total_segments, T_seq, H, NT, is_varlen};
+                total_segments, T_seq, H, NT, is_varlen,
+                use_csplit_bt16_k1, use_plain_beta_cache,
+                use_plain_suffix_decay_cache};
             policy.launch_plain_k1(args);
         } else if (use_bt32_factor && !cs_skip_k1_solve) {
             if (is_varlen) {
@@ -388,8 +530,17 @@ void launch_fwd_common(
     }
 
     const bool use_bt16_k1_callback = !use_csplit && !k2env &&
-        policy.launch_bt16_k1 != nullptr;
+        policy.launch_bt16_k1 != nullptr &&
+        (!is_gva || policy.bt16_k1_supports_gva);
+    const bool context_operands_cached =
+        request_context_operand_cache && use_bt16_k1_callback;
     if (use_bt16_k1_callback) {
+        const bool k1_is_varlen =
+            is_varlen && !use_context_equal_dense_n4_g64;
+        const int k1_total_tiles = use_context_equal_dense_n4_g64
+            ? int(equal_dense_total_tiles) : total_tiles;
+        const int k1_nt = use_context_equal_dense_n4_g64
+            ? equal_dense_nt : NT;
         const Bt16K1Launch args{
             stream,
             reinterpret_cast<const __bf16*>(q_ptr),
@@ -398,33 +549,61 @@ void launch_fwd_common(
             reinterpret_cast<const float*>(beta_ptr),
             A_log_ptr, dt_bias_ptr, scale, gate_scale,
             ws_kd, ws_qd, ws_kr, ws_gt, cs_u, ws_inv, ws_mqk,
-            cu_seqlens, tile_prefix, N, total_tiles, T_seq, H, NT,
-            is_varlen};
+            cs_beta,
+            k1_is_varlen ? cu_seqlens : nullptr,
+            use_context_direct_prefixless ? nullptr
+                                          : (k1_is_varlen ? tile_prefix
+                                                          : nullptr),
+            N, k1_total_tiles, T_seq, H, H_q, k1_nt,
+            k1_is_varlen, context_operands_cached, false,
+            use_context_direct_prefixless};
         policy.launch_bt16_k1(args);
     } else if (!use_csplit && is_varlen) {
         // Grid over the global tile upper bound; each block resolves its
         // (seq, chunk) via tile_prefix and drops gap tiles.
         dim3 grid(total_tiles, H);
-        k1_kda_bt16_kernel<true><<<grid, 64, 0, stream>>>(
-            reinterpret_cast<const __bf16*>(q_ptr),
-            reinterpret_cast<const __bf16*>(k_ptr),
-            reinterpret_cast<const __bf16*>(g_ptr),
-            reinterpret_cast<const float*>(beta_ptr),
-            A_log_ptr, dt_bias_ptr,
-            scale, gate_scale, T_seq, H,
-            ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk,
-            cu_seqlens, tile_prefix, N, total_tiles);
+        if (is_gva)
+            k1_kda_bt16_kernel<true, true><<<grid, 64, 0, stream>>>(
+                reinterpret_cast<const __bf16*>(q_ptr),
+                reinterpret_cast<const __bf16*>(k_ptr),
+                reinterpret_cast<const __bf16*>(g_ptr),
+                reinterpret_cast<const float*>(beta_ptr),
+                A_log_ptr, dt_bias_ptr,
+                scale, gate_scale, T_seq, H, H_q,
+                ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk,
+                cu_seqlens, tile_prefix, N, total_tiles);
+        else
+            k1_kda_bt16_kernel<true, false><<<grid, 64, 0, stream>>>(
+                reinterpret_cast<const __bf16*>(q_ptr),
+                reinterpret_cast<const __bf16*>(k_ptr),
+                reinterpret_cast<const __bf16*>(g_ptr),
+                reinterpret_cast<const float*>(beta_ptr),
+                A_log_ptr, dt_bias_ptr,
+                scale, gate_scale, T_seq, H, H,
+                ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk,
+                cu_seqlens, tile_prefix, N, total_tiles);
     } else if (!use_csplit) {
         dim3 grid(NT, N * H);
-        k1_kda_bt16_kernel<false><<<grid, 64, 0, stream>>>(
-            reinterpret_cast<const __bf16*>(q_ptr),
-            reinterpret_cast<const __bf16*>(k_ptr),
-            reinterpret_cast<const __bf16*>(g_ptr),
-            reinterpret_cast<const float*>(beta_ptr),
-            A_log_ptr, dt_bias_ptr,
-            scale, gate_scale, T_seq, H,
-            ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk,
-            nullptr, nullptr, N, total_tiles);
+        if (is_gva)
+            k1_kda_bt16_kernel<false, true><<<grid, 64, 0, stream>>>(
+                reinterpret_cast<const __bf16*>(q_ptr),
+                reinterpret_cast<const __bf16*>(k_ptr),
+                reinterpret_cast<const __bf16*>(g_ptr),
+                reinterpret_cast<const float*>(beta_ptr),
+                A_log_ptr, dt_bias_ptr,
+                scale, gate_scale, T_seq, H, H_q,
+                ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk,
+                nullptr, nullptr, N, total_tiles);
+        else
+            k1_kda_bt16_kernel<false, false><<<grid, 64, 0, stream>>>(
+                reinterpret_cast<const __bf16*>(q_ptr),
+                reinterpret_cast<const __bf16*>(k_ptr),
+                reinterpret_cast<const __bf16*>(g_ptr),
+                reinterpret_cast<const float*>(beta_ptr),
+                A_log_ptr, dt_bias_ptr,
+                scale, gate_scale, T_seq, H, H,
+                ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk,
+                nullptr, nullptr, N, total_tiles);
     }
 
     // ---- K2: recurrence. Default V-split (one block per (seq,head,V-group));
@@ -432,11 +611,18 @@ void launch_fwd_common(
     // Env knobs for measurement: FLASH_KDA_K2=baseline|vsplit, FLASH_KDA_BV=16|32|64.
     auto* v_bf   = reinterpret_cast<const __bf16*>(v_ptr);
     auto* beta_f = reinterpret_cast<const float*>(beta_ptr);
-    auto* scan_beta_f = use_csplit64_beta_cache ? cs_beta : beta_f;
+    const bool use_csplit64_scan_beta_cache =
+        use_csplit64_k6_beta_cache || use_plain_beta_cache;
+    auto* scan_beta_f = use_csplit64_scan_beta_cache ? cs_beta : beta_f;
+    auto* scan_decay_f = use_plain_suffix_decay_cache
+        ? reinterpret_cast<const float*>(cs_segment_a)
+        : reinterpret_cast<const float*>(ws_mqk);
     auto* out_bf = reinterpret_cast<__bf16*>(out_ptr);
     const unsigned csplit64_scan_flags =
         (use_csplit64_k6 ? kCs64ScanUseDecayTable : 0u) |
-        (use_csplit64_beta_cache ? kCs64ScanBetaActivated : 0u);
+        (use_csplit64_scan_beta_cache ? kCs64ScanBetaActivated : 0u) |
+        (use_plain_suffix_decay_cache
+            ? kCs64ScanSuffixDecayCached : 0u);
 
     const bool use_baseline = k2env && strcmp(k2env, "baseline") == 0;
     const bool use_splitscan = k2env && strcmp(k2env, "splitscan") == 0;
@@ -453,8 +639,8 @@ void launch_fwd_common(
     const bool use_vsplit_rs_mw =
         (k2env && strcmp(k2env, "vsplit_rs_mw") == 0) ||
         use_vsplit_rs_mw_k6;
-    const bool use_default_vsplit_rs = !k2env &&
-        policy.default_k2_route == K2DefaultRoute::vsplit_rs;
+    const bool use_default_vsplit_rs = is_gva ||
+        (!k2env && policy.default_k2_route == K2DefaultRoute::vsplit_rs);
 
     // Plain C-split segment output is architecture-neutral by default.  A
     // policy may substitute an architecture-private kernel through the typed
@@ -502,10 +688,71 @@ void launch_fwd_common(
 
     // State (M4) / varlen (M4): only the register-resident rs kernel carries
     // initial/final state AND handles variable-length sequences. Either takes
-    // priority over experimental env selection (those are zero-state, batched
-    // only). gfx942 uses the same occupancy-aware BV=16/32 policy as dense;
-    // gfx950 retains its tuned BV=16 configuration.
-    if (use_vsplit_rs_mw) {
+    // priority over experimental env selection. gfx942 uses the same
+    // occupancy-aware BV=16/32 policy as dense; gfx950 retains its tuned BV=16
+    // configuration, including its state-aware context-parallel callback.
+    if (use_context_parallel) {
+        // The ordinary affine ABI stores BF16 A in cs_sin and FP32 b in
+        // cs_u. At G8 cs_u is too small for b, while an aligned dense single
+        // sequence admits an exact role swap:
+        //
+        //   cs_u   : NT C16 tiles * 4 KiB == (NT/8) A maps * 32 KiB
+        //   cs_sin : (NT/4) C64 slots * 32 KiB
+        //          == (NT/8) b maps * 64 KiB.
+        //
+        // Repeat every structural policy guard here because these pointers
+        // are an architecture-neutral ABI. In particular, a partial G8 tail
+        // would need complete extra A/b maps; the policy must reject it, and
+        // common must not silently apply the shape-specific alias contract.
+        static_assert(
+            8 * WorkspaceSizes::kCsplitU ==
+                WorkspaceSizes::D * WorkspaceSizes::D *
+                    int(sizeof(__bf16)),
+            "G8 cs_u/affine_a capacity contract changed");
+        static_assert(
+            2 * WorkspaceSizes::kCsplitSin ==
+                WorkspaceSizes::D * WorkspaceSizes::D * int(sizeof(float)),
+            "G8 cs_sin/affine_b capacity contract changed");
+        const bool swap_g8_dense_single_affine_arenas =
+            policy.context_group_chunks == 8 &&
+            policy.context_direct_max_chunks == 0 &&
+            !is_varlen && N == 1 && NT > 0 && total_tiles == NT &&
+            (NT % 8) == 0;
+        auto* const context_affine_a = swap_g8_dense_single_affine_arenas
+            ? cs_u : cs_sin;
+        auto* const context_affine_b = swap_g8_dense_single_affine_arenas
+            ? reinterpret_cast<float*>(cs_sin)
+            : reinterpret_cast<float*>(cs_u);
+        const bool context_is_varlen =
+            is_varlen && !use_context_equal_dense_n4_g64;
+        const int context_total_tiles = use_context_equal_dense_n4_g64
+            ? int(equal_dense_total_tiles) : total_tiles;
+        const int context_nt = use_context_equal_dense_n4_g64
+            ? equal_dense_nt : NT;
+        const ContextParallelLaunch args{
+            stream, v_bf, beta_f, out_bf, ws_kd, ws_qd, ws_kr, ws_gt,
+            ws_inv, ws_mqk, cs_beta, context_affine_a, context_affine_b,
+            init_state, final_state,
+            context_is_varlen ? cu_seqlens : nullptr,
+            use_context_direct_prefixless ? nullptr
+                                          : (context_is_varlen ? tile_prefix
+                                                               : nullptr),
+            context_is_varlen ? segment_prefix : nullptr,
+            context_is_varlen ? sequence_worklist : nullptr,
+            context_is_varlen ? sequence_count : nullptr,
+            context_total_tiles, T_seq, H, N, context_nt,
+            has_state_in, has_state_out, state_fp32, context_is_varlen,
+            policy.context_group_chunks,
+            policy.context_direct_max_chunks,
+            use_context_persistent ? policy.context_persistent_blocks : 0,
+            use_context_direct_prefixless,
+            use_context_equal_dense_n4_g64,
+            context_operands_cached,
+            is_gva,
+            policy.context_automatic_gva_packed_nw4,
+            policy.context_automatic_gva_equal_n4_g16};
+        policy.launch_context_parallel(args);
+    } else if (use_vsplit_rs_mw) {
         // Strict opt-in probe: pack two or four independent register-state V16
         // waves into one CTA so they share the V-independent chunk workspace.
         // NW1 intentionally calls the established kernel as the A/B control.
@@ -577,8 +824,9 @@ void launch_fwd_common(
             ? dim3(persistent_blocks)
             : dim3(N * H, D / (use_csplit64_wide ? 32 : 16));
         const Csplit64ScanLaunch private_scan_args{
-            scan_grid, stream, v_bf, beta_f, ws_qd, out_bf, ws_kd, ws_kr, ws_gt,
-            reinterpret_cast<const float*>(ws_mqk), ws_inv, cs_cross_inv,
+            scan_grid, stream, v_bf, scan_beta_f, ws_qd, out_bf, ws_kd,
+            ws_kr, ws_gt,
+            scan_decay_f, ws_inv, cs_cross_inv,
             cs_cross64, cs_u, cs_sin, init_state, final_state, cu_seqlens,
             tile_prefix, pair_prefix, segment_prefix, sequence_worklist,
             sequence_count, task_counter, total_tiles, total_pairs,

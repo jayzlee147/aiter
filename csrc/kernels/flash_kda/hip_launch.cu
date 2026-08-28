@@ -72,6 +72,7 @@ void launch_fwd_hip(
     float gate_scale,
     int total_tiles,
     int T_total,
+    int H_q,
     int H,
     int N,
     const void* init_state,
@@ -80,12 +81,13 @@ void launch_fwd_hip(
     bool has_state_out,
     bool state_fp32,
     const int32_t* cu_seqlens,
-    hipStream_t stream) {
+    hipStream_t stream,
+    int max_seqlen_upper_bound) {
     const FwdParams params{
         q_ptr, k_ptr, v_ptr, g_ptr, beta_ptr, scale, out_ptr, workspace_ptr,
-        A_log_ptr, dt_bias_ptr, gate_scale, total_tiles, T_total, H, N,
+        A_log_ptr, dt_bias_ptr, gate_scale, total_tiles, T_total, H_q, H, N,
         init_state, final_state, has_state_in, has_state_out, state_fp32,
-        cu_seqlens, stream};
+        cu_seqlens, stream, max_seqlen_upper_bound};
     const DetectedDevice device = current_device();
 
     switch (device.info.architecture) {
