@@ -6,14 +6,14 @@
 All backends receive the same Kimi-K3 TP8-style packed tensors in one process:
 
 * ``native`` calls :func:`aiter.ops.flash_kda.flash_kda_fwd` directly;
-* ``triton`` calls the PR #4683 Triton FlashKDA function directly; and
-* ``baseline`` forces the original Triton chunk pipeline at BT=64.
+* ``triton`` selects the PR #4683 Triton path through the public wrapper; and
+* ``baseline`` selects the original Triton chunk pipeline through that wrapper.
 
-The default mode calls each implementation directly so an eligibility change
-cannot silently turn a comparison into the same kernel on both sides.  Pass
-``--public-k3`` for the final production-routing gate: its ``native`` row uses
-the zero-environment public K3 default, proves it is bitwise equal to explicit
-native, and compares it with the same public wrapper forced to Triton.
+The default mode calls the native public operator and selects both Triton
+implementations through the public KDA wrapper.  Pass ``--public-k3`` for the
+final production-routing gate: its ``native`` row uses the zero-environment
+public K3 default, proves it is bitwise equal to explicit native, and compares
+it with the same public wrapper forced to Triton.
 Pass ``--execution graph`` to compile and check every backend eagerly, capture
 each backend in its own ROCm graph, verify replay against that backend's eager
 result, and time only steady-state ``graph.replay()``.
@@ -37,6 +37,15 @@ Examples::
 
     python op_tests/op_benchmarks/triton/bench_flash_kda_native.py \
         --case resume-4x4k --execution graph --backend native --backend triton
+
+    python op_tests/op_benchmarks/triton/bench_flash_kda_native.py \
+        --suite core --heads 2 --value-heads 4 \
+        --execution graph --public-k3 --backend native --backend triton \
+        --min-speedup 1.0 --min-geomean-speedup 1.05 \
+        --min-paired-win-fraction 0.75
+
+For the complete gfx950 GVA correctness and performance acceptance matrix, run
+``scripts/run_flash_kda_gva_acceptance.sh`` from a clean checkout.
 """
 
 from __future__ import annotations
@@ -66,10 +75,6 @@ import torch.nn.functional as F
 from aiter.ops.flash_kda import (
     flash_kda_fwd as flash_kda_native_fwd,
     flash_kda_native_supported,
-)
-from aiter.ops.triton._triton_kernels.chunk_delta_attn import chunk_delta_attn_fwd
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.flash_kda import (
-    flash_kda_fwd as flash_kda_triton_fwd,
 )
 from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
 
@@ -448,54 +453,10 @@ def _build_backends(
         )
 
     def triton_flash():
-        # The dedicated PR #4683 FlashKDA fast path is equal-head only.  For
-        # GVA, use the public Triton dispatcher so the row remains a valid
-        # optimized Triton comparison instead of calling an unsupported ABI.
-        if public_k3 or inputs["q"].shape[2] != inputs["v"].shape[2]:
-            return public("triton")
-        return flash_kda_triton_fwd(
-            q=inputs["q"],
-            k=inputs["k"],
-            v=inputs["v"],
-            g=inputs["g"],
-            beta=inputs["beta"],
-            A_log=inputs["A_log"],
-            dt_bias=inputs["dt_bias"],
-            scale=inputs["scale"],
-            lower_bound=LOWER_BOUND,
-            initial_state=inputs["initial_state"],
-            output_final_state=True,
-            state_v_first=True,
-            cu_seqlens=inputs["cu_seqlens"],
-        )
+        return public("triton")
 
     def baseline():
-        if public_k3:
-            return public("baseline")
-        output, final_state, *_ = chunk_delta_attn_fwd(
-            q=inputs["q"],
-            k=inputs["k"],
-            v=inputs["v"],
-            g=inputs["g"],
-            beta=inputs["beta"],
-            A_log=inputs["A_log"],
-            dt_bias=inputs["dt_bias"],
-            scale=inputs["scale"],
-            initial_state=inputs["initial_state"],
-            output_final_state=True,
-            cu_seqlens=inputs["cu_seqlens"],
-            chunk_size=64,
-            safe_gate=True,
-            lower_bound=LOWER_BOUND,
-            use_gate_in_kernel=True,
-            use_qk_l2norm_in_kernel=True,
-            use_beta_sigmoid_in_kernel=True,
-            state_v_first=True,
-            # This is the important isolation switch: BT64 must never enter
-            # either FlashKDA path even if process-wide defaults change.
-            allow_flash_kda=False,
-        )
-        return output, final_state
+        return public("baseline")
 
     implementations = {
         "native": native,
@@ -949,6 +910,18 @@ def _print_environment(heads: int, value_heads: int) -> dict[str, object]:
         roots = (
             _REPO_ROOT / "csrc" / "kernels" / "flash_kda",
             _REPO_ROOT / "aiter" / "ops" / "triton" / "kimi_delta_attn",
+            _REPO_ROOT
+            / "aiter"
+            / "ops"
+            / "triton"
+            / "_triton_kernels"
+            / "chunk_delta_attn",
+            _REPO_ROOT
+            / "aiter"
+            / "ops"
+            / "triton"
+            / "_triton_kernels"
+            / "gated_delta_rule",
         )
         files = [
             _REPO_ROOT / "aiter" / "ops" / "flash_kda.py",
@@ -1099,6 +1072,95 @@ def _print_rows(rows: list[dict[str, object]]) -> None:
         )
 
 
+def _check_performance_gate(
+    rows: list[dict[str, object]],
+    *,
+    min_speedup: float | None,
+    min_geomean_speedup: float | None,
+    min_paired_win_fraction: float | None,
+) -> None:
+    """Fail when native misses an explicitly requested Triton-relative gate."""
+
+    if all(
+        threshold is None
+        for threshold in (
+            min_speedup,
+            min_geomean_speedup,
+            min_paired_win_fraction,
+        )
+    ):
+        return
+
+    native_rows = [row for row in rows if row["backend"] == "native"]
+    if not native_rows:
+        raise RuntimeError("performance gate has no native result rows")
+
+    errors: list[str] = []
+    speedups: list[float] = []
+    win_fractions: list[float] = []
+    for row in native_rows:
+        label = (
+            f"{row['case']} (Hq={row['heads']}, HV={row['value_heads']}, "
+            f"seed={row['seed']})"
+        )
+        speedup_value = row.get("speedup_vs_triton")
+        if not isinstance(speedup_value, (int, float)) or not math.isfinite(
+            speedup_value
+        ):
+            errors.append(f"{label}: missing finite speedup versus Triton")
+        else:
+            speedup = float(speedup_value)
+            speedups.append(speedup)
+            if min_speedup is not None and speedup < min_speedup:
+                errors.append(
+                    f"{label}: speedup {speedup:.4f}x is below "
+                    f"{min_speedup:.4f}x"
+                )
+
+        win_value = row.get("paired_win_fraction")
+        if not isinstance(win_value, (int, float)) or not math.isfinite(
+            win_value
+        ):
+            errors.append(f"{label}: missing finite paired win fraction")
+        else:
+            win_fraction = float(win_value)
+            win_fractions.append(win_fraction)
+            if (
+                min_paired_win_fraction is not None
+                and win_fraction < min_paired_win_fraction
+            ):
+                errors.append(
+                    f"{label}: paired win fraction {win_fraction:.1%} is below "
+                    f"{min_paired_win_fraction:.1%}"
+                )
+
+    geomean = (
+        math.exp(
+            math.fsum(math.log(speedup) for speedup in speedups) / len(speedups)
+        )
+        if speedups and all(speedup > 0.0 for speedup in speedups)
+        else math.nan
+    )
+    if min_geomean_speedup is not None and (
+        not math.isfinite(geomean) or geomean < min_geomean_speedup
+    ):
+        errors.append(
+            f"geometric-mean speedup {geomean:.4f}x is below "
+            f"{min_geomean_speedup:.4f}x"
+        )
+
+    minimum_speedup = min(speedups, default=math.nan)
+    minimum_win_fraction = min(win_fractions, default=math.nan)
+    print(
+        "Performance gate: "
+        f"minimum speedup={minimum_speedup:.4f}x, "
+        f"geomean speedup={geomean:.4f}x, "
+        f"minimum paired win fraction={minimum_win_fraction:.1%}"
+    )
+    if errors:
+        raise RuntimeError("performance gate failed:\n  - " + "\n  - ".join(errors))
+
+
 def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = sorted({key for row in rows for key in row})
@@ -1147,6 +1209,11 @@ def _write_json(
             "tolerance": args.tolerance,
             "backends": list(args.backend),
             "public_k3": args.public_k3,
+            "min_speedup": args.min_speedup,
+            "min_geomean_speedup": args.min_geomean_speedup,
+            "min_paired_win_fraction": args.min_paired_win_fraction,
+            "require_arch": args.require_arch,
+            "require_compute_units": args.require_compute_units,
         },
         "cases": [
             {
@@ -1245,6 +1312,30 @@ def _parse_args(argv=None) -> argparse.Namespace:
         help="Maximum output/state relative RMS versus Triton FlashKDA.",
     )
     parser.add_argument(
+        "--min-speedup",
+        type=float,
+        help="Fail if any native median speedup versus Triton is smaller.",
+    )
+    parser.add_argument(
+        "--min-geomean-speedup",
+        type=float,
+        help="Fail if the native geometric-mean speedup is smaller.",
+    )
+    parser.add_argument(
+        "--min-paired-win-fraction",
+        type=float,
+        help="Fail if any native paired-round win fraction is smaller.",
+    )
+    parser.add_argument(
+        "--require-arch",
+        help="Fail before timing unless the visible GPU has this GCN arch.",
+    )
+    parser.add_argument(
+        "--require-compute-units",
+        type=int,
+        help="Fail before timing unless the visible GPU has this CU count.",
+    )
+    parser.add_argument(
         "--csv",
         type=Path,
         nargs="?",
@@ -1290,6 +1381,28 @@ def _parse_args(argv=None) -> argparse.Namespace:
             "--public-k3 requires correctness checking to prove that the "
             "default resolver selected native"
         )
+    gate_values = (args.min_speedup, args.min_geomean_speedup)
+    if any(
+        value is not None and (not math.isfinite(value) or value <= 0.0)
+        for value in gate_values
+    ):
+        parser.error("speedup thresholds must be positive and finite")
+    if args.min_paired_win_fraction is not None and (
+        not math.isfinite(args.min_paired_win_fraction)
+        or not 0.0 <= args.min_paired_win_fraction <= 1.0
+    ):
+        parser.error("--min-paired-win-fraction must be in [0, 1]")
+    if args.require_compute_units is not None and args.require_compute_units <= 0:
+        parser.error("--require-compute-units must be positive")
+    if any(
+        value is not None
+        for value in (
+            args.min_speedup,
+            args.min_geomean_speedup,
+            args.min_paired_win_fraction,
+        )
+    ) and not {"native", "triton"}.issubset(args.backend):
+        parser.error("performance gates require --backend native and --backend triton")
     return args
 
 
@@ -1319,6 +1432,18 @@ def main(argv=None) -> None:
         cases = list(CASE_SUITES[args.suite])
 
     metadata = _print_environment(args.heads, args.value_heads)
+    if args.require_arch is not None and metadata["arch"] != args.require_arch:
+        raise SystemExit(
+            f"required GPU arch {args.require_arch}, got {metadata['arch_detail']}"
+        )
+    if (
+        args.require_compute_units is not None
+        and metadata["compute_units"] != args.require_compute_units
+    ):
+        raise SystemExit(
+            f"required {args.require_compute_units} compute units, "
+            f"got {metadata['compute_units']}"
+        )
     rows: list[dict[str, object]] = []
     raw_rows: list[dict[str, object]] = []
     selected_backends = tuple(args.backend)
@@ -1355,6 +1480,12 @@ def main(argv=None) -> None:
         _write_json(
             args.json, metadata=metadata, args=args, cases=cases, rows=rows
         )
+    _check_performance_gate(
+        rows,
+        min_speedup=args.min_speedup,
+        min_geomean_speedup=args.min_geomean_speedup,
+        min_paired_win_fraction=args.min_paired_win_fraction,
+    )
 
 
 if __name__ == "__main__":
