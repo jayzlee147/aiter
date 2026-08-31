@@ -46,12 +46,15 @@ Examples::
 
 For the complete gfx950 GVA correctness and performance acceptance matrix, run
 ``scripts/run_flash_kda_gva_acceptance.sh`` from a clean checkout.
+For the three-seed Hq=HV=12 public-K3 promotion matrix, run
+``scripts/run_flash_kda_public_k3_perf_acceptance.sh``.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import ctypes
 import gc
 import hashlib
 import json
@@ -121,6 +124,25 @@ class _CapturedBackend:
 
     def replay(self) -> None:
         self.graph.replay()
+
+
+class _Dim3(ctypes.Structure):
+    _fields_ = (
+        ("x", ctypes.c_uint),
+        ("y", ctypes.c_uint),
+        ("z", ctypes.c_uint),
+    )
+
+
+class _HipKernelNodeParams(ctypes.Structure):
+    _fields_ = (
+        ("block_dim", _Dim3),
+        ("extra", ctypes.POINTER(ctypes.c_void_p)),
+        ("func", ctypes.c_void_p),
+        ("grid_dim", _Dim3),
+        ("kernel_params", ctypes.POINTER(ctypes.c_void_p)),
+        ("shared_mem_bytes", ctypes.c_uint),
+    )
 
 
 # Shapes used by the K3 integration study.  Every case is packed B=1, including
@@ -230,6 +252,128 @@ def _errors(actual: torch.Tensor, reference: torch.Tensor) -> tuple[float, float
         / reference.square().mean().sqrt().clamp_min(1e-8)
     )
     return float(relative_rms.item()), float(difference.abs().max().item())
+
+
+def _storage_bytes_equal(left: torch.Tensor, right: torch.Tensor) -> bool:
+    """Compare exact logical tensor bytes without a dtype conversion."""
+
+    if (
+        left.shape != right.shape
+        or left.dtype != right.dtype
+        or left.device != right.device
+    ):
+        return False
+    return bool(
+        torch.equal(
+            left.detach().contiguous().view(torch.uint8),
+            right.detach().contiguous().view(torch.uint8),
+        )
+    )
+
+
+def _assert_output_contract(
+    case: Case,
+    backend: str,
+    output_pair: tuple[torch.Tensor, torch.Tensor | None],
+    inputs: dict[str, object],
+) -> dict[str, object]:
+    """Fail closed on the public output dtype, shape, and device contract."""
+
+    output, final_state = output_pair
+    q = inputs["q"]
+    k = inputs["k"]
+    v = inputs["v"]
+    assert isinstance(q, torch.Tensor)
+    assert isinstance(k, torch.Tensor)
+    assert isinstance(v, torch.Tensor)
+    if final_state is None:
+        raise RuntimeError(
+            f"{case.name}/{backend}: output_final_state=True returned None"
+        )
+    expected_output_shape = (*q.shape[:-1], v.shape[-1])
+    expected_state_shape = (
+        len(case.seq_lens),
+        v.shape[-2],
+        v.shape[-1],
+        k.shape[-1],
+    )
+    failures = []
+    if output.dtype != q.dtype:
+        failures.append(f"output dtype {output.dtype} != q dtype {q.dtype}")
+    if final_state.dtype != torch.float32:
+        failures.append(f"final-state dtype {final_state.dtype} != torch.float32")
+    if tuple(output.shape) != expected_output_shape:
+        failures.append(
+            f"output shape {tuple(output.shape)} != {expected_output_shape}"
+        )
+    if tuple(final_state.shape) != expected_state_shape:
+        failures.append(
+            "final-state shape "
+            f"{tuple(final_state.shape)} != {expected_state_shape}"
+        )
+    if output.device != q.device or final_state.device != q.device:
+        failures.append(
+            f"output/state device {output.device}/{final_state.device} "
+            f"!= q device {q.device}"
+        )
+    if failures:
+        raise RuntimeError(
+            f"{case.name}/{backend}: public output contract failed: "
+            + "; ".join(failures)
+        )
+    return {
+        "output_dtype": str(output.dtype),
+        "final_state_dtype": str(final_state.dtype),
+        "output_shape": list(output.shape),
+        "final_state_shape": list(final_state.shape),
+        "output_contract_verified": True,
+    }
+
+
+def _assert_initial_state_contract(
+    case: Case,
+    initial_state: torch.Tensor | None,
+    *,
+    literal_none: bool,
+) -> dict[str, object]:
+    """Verify fresh, resume, and mixed state presence/content semantics."""
+
+    expected_mask = _case_resume_mask(case)
+    if literal_none:
+        if initial_state is not None or any(expected_mask):
+            raise RuntimeError(
+                f"{case.name}: literal initial_state=None contract failed"
+            )
+        return {
+            "input_initial_state_literal_none": True,
+            "input_initial_state_dtype": None,
+            "input_resume_mask_verified": True,
+        }
+    if initial_state is None:
+        raise RuntimeError(f"{case.name}: materialized initial state is missing")
+    if initial_state.dtype != torch.float32:
+        raise RuntimeError(
+            f"{case.name}: initial-state dtype {initial_state.dtype} != "
+            "torch.float32"
+        )
+    if initial_state.shape[0] != len(expected_mask):
+        raise RuntimeError(
+            f"{case.name}: initial-state batch {initial_state.shape[0]} != "
+            f"{len(expected_mask)}"
+        )
+    actual_mask = tuple(
+        bool(torch.count_nonzero(sequence).item()) for sequence in initial_state
+    )
+    if actual_mask != expected_mask:
+        raise RuntimeError(
+            f"{case.name}: initial-state nonzero mask {actual_mask} != "
+            f"{expected_mask}"
+        )
+    return {
+        "input_initial_state_literal_none": False,
+        "input_initial_state_dtype": str(initial_state.dtype),
+        "input_resume_mask_verified": True,
+    }
 
 
 def _max_sequence_relative_rms(
@@ -460,6 +604,9 @@ def _build_backends(
 
     implementations = {
         "native": native,
+        # Internal witness used by the formal public-K3 runner.  The ordinary
+        # CLI intentionally keeps its historical backend choices unchanged.
+        "explicit-native": lambda: public("native"),
         "triton": triton_flash,
         "baseline": baseline,
     }
@@ -536,7 +683,7 @@ def _check_graph_replay_matches_eager(
                 f"{case_name}/{backend}: eager reference produced non-finite "
                 f"{tensor_name}"
             )
-        equal = bool(torch.equal(replay_tensor, eager_tensor))
+        equal = _storage_bytes_equal(replay_tensor, eager_tensor)
         matches[f"graph_eager_{tensor_name}_bitwise_equal"] = equal
         if not equal:
             relative_rms, max_abs = _errors(replay_tensor, eager_tensor)
@@ -556,6 +703,7 @@ def _capture_backends(
     eager_outputs: dict[str, tuple[torch.Tensor, torch.Tensor | None]],
     *,
     keep_graph: bool = False,
+    input_state_guard: Callable[[str], None] | None = None,
 ) -> tuple[dict[str, _CapturedBackend], dict[str, dict[str, bool]]]:
     """Capture each backend independently after eager compilation/checking."""
 
@@ -572,25 +720,243 @@ def _capture_backends(
         torch.cuda.current_stream().wait_stream(stream)
         torch.cuda.synchronize()
         del side_stream_output
+        if input_state_guard is not None:
+            input_state_guard(f"after_{name}_side_stream_warmup")
 
         graph = torch.cuda.CUDAGraph(keep_graph=keep_graph)
         with torch.cuda.graph(graph, stream=stream):
             captured_output = fn()
         torch.cuda.synchronize()
+        if input_state_guard is not None:
+            input_state_guard(f"after_{name}_graph_capture")
 
         captured = _CapturedBackend(
             graph=graph, output=captured_output, stream=stream
         )
-        # Validate an actual replay, not merely the execution performed while
-        # the graph was being captured.
+        # Poison both static outputs before replay.  Comparing capture-time
+        # buffers without doing this cannot detect an empty/incomplete graph:
+        # stale output would otherwise satisfy the eager comparison.
+        for tensor in captured.output:
+            if tensor is not None:
+                tensor.fill_(float("nan"))
         captured.replay()
         torch.cuda.synchronize()
+        if input_state_guard is not None:
+            input_state_guard(f"after_{name}_poison_graph_replay")
         replay_correctness[name] = _check_graph_replay_matches_eager(
             case_name, name, captured.output, eager_outputs[name]
         )
         captured_backends[name] = captured
 
     return captured_backends, replay_correctness
+
+
+def _graph_records(
+    captured: _CapturedBackend, device: torch.device
+) -> list[dict[str, object]]:
+    """Return HIP graph nodes and launch data for formal route auditing."""
+
+    hip = ctypes.CDLL("libamdhip64.so")
+    hip.hipGraphGetNodes.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_size_t),
+    )
+    hip.hipGraphGetNodes.restype = ctypes.c_int
+    hip.hipGraphNodeGetType.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_int),
+    )
+    hip.hipGraphNodeGetType.restype = ctypes.c_int
+    hip.hipGraphKernelNodeGetParams.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(_HipKernelNodeParams),
+    )
+    hip.hipGraphKernelNodeGetParams.restype = ctypes.c_int
+    hip.hipKernelNameRef.argtypes = (ctypes.c_void_p,)
+    hip.hipKernelNameRef.restype = ctypes.c_char_p
+    hip.hipKernelNameRefByPtr.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+    hip.hipKernelNameRefByPtr.restype = ctypes.c_char_p
+
+    def check(status: int, operation: str) -> None:
+        if status != 0:
+            raise RuntimeError(f"{operation} failed with HIP status {status}")
+
+    graph_handle = ctypes.c_void_p(captured.graph.raw_cuda_graph())
+    count = ctypes.c_size_t()
+    check(
+        hip.hipGraphGetNodes(graph_handle, None, ctypes.byref(count)),
+        "hipGraphGetNodes(count)",
+    )
+    nodes = (ctypes.c_void_p * int(count.value))()
+    check(
+        hip.hipGraphGetNodes(graph_handle, nodes, ctypes.byref(count)),
+        "hipGraphGetNodes(nodes)",
+    )
+    stream = ctypes.c_void_p(torch.cuda.current_stream(device).cuda_stream)
+    records: list[dict[str, object]] = []
+    for index, node in enumerate(nodes[: int(count.value)]):
+        node_type = ctypes.c_int()
+        check(
+            hip.hipGraphNodeGetType(node, ctypes.byref(node_type)),
+            f"hipGraphNodeGetType({index})",
+        )
+        record: dict[str, object] = {
+            "index": index,
+            "node_type": int(node_type.value),
+        }
+        if node_type.value == 0:
+            params = _HipKernelNodeParams()
+            check(
+                hip.hipGraphKernelNodeGetParams(node, ctypes.byref(params)),
+                f"hipGraphKernelNodeGetParams({index})",
+            )
+            encoded_name = hip.hipKernelNameRefByPtr(params.func, stream)
+            if encoded_name is None:
+                encoded_name = hip.hipKernelNameRef(params.func)
+            record.update(
+                {
+                    "name": (
+                        encoded_name.decode(errors="replace")
+                        if encoded_name is not None
+                        else "<unknown>"
+                    ),
+                    "grid": [
+                        int(params.grid_dim.x),
+                        int(params.grid_dim.y),
+                        int(params.grid_dim.z),
+                    ],
+                    "block": [
+                        int(params.block_dim.x),
+                        int(params.block_dim.y),
+                        int(params.block_dim.z),
+                    ],
+                    "shared_mem_bytes": int(params.shared_mem_bytes),
+                }
+            )
+        records.append(record)
+    return records
+
+
+def _canonical_graph_signature(
+    records: list[dict[str, object]],
+) -> tuple[tuple[object, ...], ...]:
+    entries = [
+        (
+            record.get("node_type"),
+            record.get("name"),
+            tuple(record.get("grid", [])),
+            tuple(record.get("block", [])),
+            record.get("shared_mem_bytes"),
+        )
+        for record in records
+    ]
+    return tuple(sorted(entries, key=repr))
+
+
+def _classify_graph_route(
+    backend: str, records: list[dict[str, object]]
+) -> dict[str, object]:
+    kernels = [record for record in records if record.get("node_type") == 0]
+    names = [str(record.get("name", "")) for record in kernels]
+    lowered = [name.lower() for name in names]
+    unresolved = [name for name in names if name in ("", "<unknown>")]
+    native_k1 = [name for name, low in zip(names, lowered) if "k1_kda_" in low]
+    native_k2 = [name for name, low in zip(names, lowered) if "k2_kda_" in low]
+    triton_prepare = [
+        name for name, low in zip(names, lowered) if "flash_kda_prepare" in low
+    ]
+    triton_segment = [
+        name
+        for name, low in zip(names, lowered)
+        if "flash_kda_segment" in low or "flash_kda_seg_scan" in low
+    ]
+    native_route = backend in ("native", "explicit-native")
+    verified = (
+        not unresolved
+        and bool(native_k1 and native_k2)
+        and not (triton_prepare or triton_segment)
+        if native_route
+        else not unresolved
+        and bool(triton_prepare and triton_segment)
+        and not (native_k1 or native_k2)
+    )
+    if not verified:
+        raise RuntimeError(
+            f"{backend}: graph route verification failed; "
+            f"native_k1={len(native_k1)}, native_k2={len(native_k2)}, "
+            f"triton_prepare={len(triton_prepare)}, "
+            f"triton_segment={len(triton_segment)}, "
+            f"unresolved={len(unresolved)}, names={names}"
+        )
+    for record in kernels:
+        for field in ("grid", "block"):
+            dimensions = record.get(field)
+            if not isinstance(dimensions, list) or len(dimensions) != 3 or any(
+                type(value) is not int or value <= 0 for value in dimensions
+            ):
+                raise RuntimeError(
+                    f"{backend}: invalid {field} for {record.get('name')}: "
+                    f"{dimensions}"
+                )
+    return {
+        "route": "native-hip-k1-k2"
+        if native_route
+        else "triton-flash-kda-prepare-segment",
+        "route_verified": True,
+        "node_count": len(records),
+        "kernel_node_count": len(kernels),
+        "kernel_names": names,
+        "records": records,
+    }
+
+
+def _audit_captured_routes(
+    captured_backends: dict[str, _CapturedBackend],
+) -> dict[str, object]:
+    required = {"native", "explicit-native", "triton"}
+    if set(captured_backends) != required:
+        raise RuntimeError(
+            f"formal route audit requires {sorted(required)}, got "
+            f"{sorted(captured_backends)}"
+        )
+    graph_ids = [
+        int(captured.graph.raw_cuda_graph())
+        for captured in captured_backends.values()
+    ]
+    stream_ids = [
+        int(captured.stream.cuda_stream) for captured in captured_backends.values()
+    ]
+    if len(set(graph_ids)) != len(graph_ids) or len(set(stream_ids)) != len(
+        stream_ids
+    ):
+        raise RuntimeError("formal route audit found aliased graphs or streams")
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    records = {
+        name: _graph_records(captured, device)
+        for name, captured in captured_backends.items()
+    }
+    routes = {
+        name: _classify_graph_route(name, backend_records)
+        for name, backend_records in records.items()
+    }
+    signatures_equal = _canonical_graph_signature(
+        records["native"]
+    ) == _canonical_graph_signature(records["explicit-native"])
+    if not signatures_equal:
+        raise RuntimeError(
+            "public default and explicit native graph signatures differ"
+        )
+    return {
+        "all_routes_verified": True,
+        "graphs_independent": True,
+        "streams_independent": True,
+        "public_explicit_graph_signatures_equal": True,
+        "graph_handles": graph_ids,
+        "stream_handles": stream_ids,
+        "backends": routes,
+    }
 
 
 @torch.inference_mode()
@@ -607,10 +973,27 @@ def _benchmark_case(
     tolerance: float,
     execution: str = "eager",
     public_k3: bool = False,
+    initial_state_none: bool = False,
+    check_input_state_immutability: bool = False,
+    timed_selected: tuple[str, ...] | None = None,
+    audit_graph_routes: bool = False,
     raw_rows: list[dict[str, object]] | None = None,
 ) -> list[dict[str, object]]:
     if execution not in EXECUTION_MODES:
         raise ValueError(f"unsupported execution mode: {execution}")
+    if timed_selected is not None and (
+        not timed_selected or not set(timed_selected).issubset(selected)
+    ):
+        raise ValueError("timed_selected must be a nonempty subset of selected")
+    if audit_graph_routes and (
+        execution != "graph"
+        or not public_k3
+        or set(selected) != {"native", "explicit-native", "triton"}
+    ):
+        raise ValueError(
+            "route audit requires public graph execution with native, "
+            "explicit-native, and triton"
+        )
     inputs = _make_inputs(
         case,
         heads=heads,
@@ -618,6 +1001,65 @@ def _benchmark_case(
         seed=seed,
         device=torch.device("cuda"),
     )
+    if initial_state_none:
+        if any(_case_resume_mask(case)):
+            raise ValueError(
+                f"{case.name}: literal initial_state=None is only valid for "
+                "a fully fresh case"
+            )
+        # The general benchmark materializes a zero FP32 state so it can
+        # compare fresh and resume allocations uniformly.  Formal public-K3
+        # coverage also needs the production call contract where fresh state
+        # is absent, not merely numerically zero.
+        inputs["initial_state"] = None
+
+    original_initial_state = inputs["initial_state"]
+    assert original_initial_state is None or isinstance(
+        original_initial_state, torch.Tensor
+    )
+    initial_state_contract = _assert_initial_state_contract(
+        case,
+        original_initial_state,
+        literal_none=initial_state_none,
+    )
+    initial_state_snapshot = (
+        original_initial_state.detach().clone()
+        if check_input_state_immutability and original_initial_state is not None
+        else None
+    )
+    input_state_checks: list[str] = []
+
+    def check_input_state(phase: str) -> None:
+        if not check_input_state_immutability:
+            return
+        current = inputs["initial_state"]
+        if original_initial_state is None:
+            if current is not None:
+                raise RuntimeError(
+                    f"{case.name}/{phase}: initial_state=None was replaced"
+                )
+        else:
+            if current is not original_initial_state:
+                raise RuntimeError(
+                    f"{case.name}/{phase}: initial_state object was replaced"
+                )
+            assert initial_state_snapshot is not None
+            if (
+                current.shape != initial_state_snapshot.shape
+                or current.stride() != initial_state_snapshot.stride()
+                or current.dtype != initial_state_snapshot.dtype
+                or current.device != initial_state_snapshot.device
+            ):
+                raise RuntimeError(
+                    f"{case.name}/{phase}: initial_state metadata changed"
+                )
+            if not _storage_bytes_equal(current, initial_state_snapshot):
+                raise RuntimeError(
+                    f"{case.name}/{phase}: initial_state storage bytes changed"
+                )
+        input_state_checks.append(phase)
+
+    check_input_state("before_backend_setup")
     if "native" in selected and not _native_supported(inputs):
         raise RuntimeError(
             "native FlashKDA rejected the exact K3 inputs; check gfx942/gfx950, "
@@ -628,11 +1070,17 @@ def _benchmark_case(
     # Graph capture must never be the first call: finish compilation and retain
     # a same-backend eager reference even when cross-backend checking is
     # explicitly skipped.
-    eager_outputs = (
-        {name: fn() for name, fn in backends.items()}
-        if check or execution == "graph"
-        else None
-    )
+    eager_outputs = None
+    output_contracts: dict[str, dict[str, object]] = {}
+    if check or execution == "graph":
+        eager_outputs = {}
+        for name, fn in backends.items():
+            eager_outputs[name] = fn()
+            torch.cuda.synchronize()
+            output_contracts[name] = _assert_output_contract(
+                case, name, eager_outputs[name], inputs
+            )
+            check_input_state(f"after_{name}_eager")
     if eager_outputs is not None:
         torch.cuda.synchronize()
 
@@ -644,33 +1092,39 @@ def _benchmark_case(
         if public_k3 and "native" in outputs:
             # Prove that the zero-env default actually selected native rather
             # than merely producing a numerically close Triton result.
-            explicit_native = chunk_kimi_delta_attn(
-                q=inputs["q"],
-                k=inputs["k"],
-                v=inputs["v"],
-                g=inputs["g"],
-                beta=inputs["beta"],
-                A_log=inputs["A_log"],
-                dt_bias=inputs["dt_bias"],
-                initial_state=inputs["initial_state"],
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-                use_gate_in_kernel=True,
-                use_beta_sigmoid_in_kernel=True,
-                safe_gate=True,
-                lower_bound=LOWER_BOUND,
-                state_v_first=True,
-                cu_seqlens=inputs["cu_seqlens"],
-                max_seqlen_upper_bound=inputs["max_seqlen_upper_bound"],
-                backend="native",
-            )
+            explicit_native = outputs.get("explicit-native")
+            if explicit_native is None:
+                explicit_native = chunk_kimi_delta_attn(
+                    q=inputs["q"],
+                    k=inputs["k"],
+                    v=inputs["v"],
+                    g=inputs["g"],
+                    beta=inputs["beta"],
+                    A_log=inputs["A_log"],
+                    dt_bias=inputs["dt_bias"],
+                    initial_state=inputs["initial_state"],
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=True,
+                    use_gate_in_kernel=True,
+                    use_beta_sigmoid_in_kernel=True,
+                    safe_gate=True,
+                    lower_bound=LOWER_BOUND,
+                    state_v_first=True,
+                    cu_seqlens=inputs["cu_seqlens"],
+                    max_seqlen_upper_bound=inputs[
+                        "max_seqlen_upper_bound"
+                    ],
+                    backend="native",
+                )
+                torch.cuda.synchronize()
+                check_input_state("after_explicit_native_eager")
             default_o, default_state = outputs["native"]
             explicit_o, explicit_state = explicit_native
             if not (
-                torch.equal(default_o, explicit_o)
+                _storage_bytes_equal(default_o, explicit_o)
                 and default_state is not None
                 and explicit_state is not None
-                and torch.equal(default_state, explicit_state)
+                and _storage_bytes_equal(default_state, explicit_state)
             ):
                 raise RuntimeError(
                     f"{case.name}: zero-env K3 default is not bitwise native"
@@ -710,6 +1164,7 @@ def _benchmark_case(
                 "state_max_abs": state_max,
                 "state_max_sequence_relative_rms": state_max_sequence_rms,
             }
+            metrics.update(output_contracts[name])
             if name == "native" and public_default_bitwise_native is not None:
                 metrics["public_default_bitwise_native"] = (
                     public_default_bitwise_native
@@ -753,13 +1208,36 @@ def _benchmark_case(
         del decode_output, reference_decode_output
 
     captured_backends: dict[str, _CapturedBackend] = {}
+    route_audit: dict[str, object] | None = None
     if execution == "graph":
         assert eager_outputs is not None
         captured_backends, graph_correctness = _capture_backends(
-            case.name, backends, eager_outputs
+            case.name,
+            backends,
+            eager_outputs,
+            keep_graph=audit_graph_routes,
+            input_state_guard=check_input_state,
         )
         for name, metrics in graph_correctness.items():
             correctness.setdefault(name, {}).update(metrics)
+        if audit_graph_routes:
+            route_audit = _audit_captured_routes(captured_backends)
+            public_output = captured_backends["native"].output
+            explicit_output = captured_backends["explicit-native"].output
+            for tensor_name, public_tensor, explicit_tensor in (
+                ("output", public_output[0], explicit_output[0]),
+                ("final_state", public_output[1], explicit_output[1]),
+            ):
+                if public_tensor is None or explicit_tensor is None:
+                    raise RuntimeError(
+                        f"{case.name}: graph {tensor_name} witness is missing"
+                    )
+                if not _storage_bytes_equal(public_tensor, explicit_tensor):
+                    raise RuntimeError(
+                        f"{case.name}: public and explicit native graph "
+                        f"{tensor_name} bytes differ"
+                    )
+            check_input_state("after_graph_route_audit")
         # Keep captured_backends alive for the static outputs and streams, but
         # time the graph object's replay method directly: no Python operator
         # call or output allocation occurs inside the timed interval.
@@ -769,11 +1247,14 @@ def _benchmark_case(
         }
     else:
         timed_backends = dict(backends)
-    del eager_outputs
 
-    peak_memory = {
-        name: _peak_memory_mib(fn) for name, fn in timed_backends.items()
-    }
+    if timed_selected is not None:
+        timed_backends = {name: timed_backends[name] for name in timed_selected}
+
+    peak_memory = {}
+    for name, fn in timed_backends.items():
+        peak_memory[name] = _peak_memory_mib(fn)
+        check_input_state(f"after_{name}_peak_memory_replay")
 
     # Rotate the first backend in every round.  This prevents one implementation
     # from always measuring at the same clock/temperature point.
@@ -784,6 +1265,7 @@ def _benchmark_case(
             result = timed_backends[name]()
             del result
     torch.cuda.synchronize()
+    check_input_state("after_timing_warmup")
 
     samples: dict[str, list[float]] = {name: [] for name in names}
     for index in range(repeat):
@@ -816,6 +1298,35 @@ def _benchmark_case(
                 f"{case.name}/{name}: CUDA event produced a nonpositive or "
                 "nonfinite latency sample"
             )
+    check_input_state("after_measured_timing")
+
+    if audit_graph_routes:
+        assert eager_outputs is not None
+        for name, captured in captured_backends.items():
+            captured.replay()
+            torch.cuda.synchronize()
+            check_input_state(f"after_{name}_final_graph_replay")
+            final_checks = _check_graph_replay_matches_eager(
+                case.name, name, captured.output, eager_outputs[name]
+            )
+            correctness.setdefault(name, {}).update(
+                {
+                    key.replace("graph_eager_", "final_graph_eager_"): value
+                    for key, value in final_checks.items()
+                }
+            )
+        final_public = captured_backends["native"].output
+        final_explicit = captured_backends["explicit-native"].output
+        if any(
+            left is None
+            or right is None
+            or not _storage_bytes_equal(left, right)
+            for left, right in zip(final_public, final_explicit)
+        ):
+            raise RuntimeError(
+                f"{case.name}: final public and explicit native graph bytes differ"
+            )
+    del eager_outputs
 
     medians = {name: statistics.median(values) for name, values in samples.items()}
     triton_median = medians.get("triton")
@@ -889,6 +1400,12 @@ def _benchmark_case(
         }
         row.update(paired_vs_triton.get(name, {}))
         row.update(correctness.get(name, {}))
+        if check_input_state_immutability:
+            row["input_initial_state_unchanged"] = True
+            row["input_state_immutability_checks"] = len(input_state_checks)
+        row.update(initial_state_contract)
+        if name == "native" and route_audit is not None:
+            row["graph_route_audit"] = route_audit
         rows.append(row)
 
     del timed_backends, captured_backends, backends, inputs
@@ -970,6 +1487,30 @@ def _print_environment(heads: int, value_heads: int) -> dict[str, object]:
         if module_path is not None and module_path.is_file()
         else None
     )
+    loaded_module_identities: dict[str, dict[str, object]] = {}
+    if jit_dir_value:
+        jit_dir = Path(jit_dir_value).resolve()
+        for module_name in ("module_aiter_core", "module_flash_kda_hip"):
+            module = sys.modules.get(module_name)
+            if module is None:
+                continue
+            loaded_raw = getattr(module, "__file__", None)
+            if not loaded_raw:
+                raise RuntimeError(
+                    f"loaded {module_name} does not expose its file path"
+                )
+            loaded_path = Path(loaded_raw).resolve()
+            expected_path = jit_dir / f"{module_name}.so"
+            if loaded_path != expected_path:
+                raise RuntimeError(
+                    f"loaded {module_name} from {loaded_path}, expected "
+                    f"{expected_path}"
+                )
+            loaded_module_identities[module_name] = {
+                "path": str(loaded_path),
+                "sha256": sha256_file(loaded_path),
+                "matches_expected_jit_path": True,
+            }
     controlled_environment = {
         name: value
         for name, value in sorted(os.environ.items())
@@ -978,6 +1519,7 @@ def _print_environment(heads: int, value_heads: int) -> dict[str, object]:
         in {
             "AITER_JIT_DIR",
             "AITER_KDA_BACKEND",
+            "AITER_AOT_IMPORT",
             "AITER_REBUILD",
             "AITER_TRITON_ONLY",
             "ROCR_VISIBLE_DEVICES",
@@ -986,8 +1528,12 @@ def _print_environment(heads: int, value_heads: int) -> dict[str, object]:
             "OMP_NUM_THREADS",
             "OPENBLAS_NUM_THREADS",
             "MKL_NUM_THREADS",
+            "MAX_JOBS",
             "NUMEXPR_NUM_THREADS",
             "GPU_ARCHS",
+            "PYTHONNOUSERSITE",
+            "PYTHONPATH",
+            "TRITON_CACHE_DIR",
         }
     }
     metadata = {
@@ -1003,6 +1549,7 @@ def _print_environment(heads: int, value_heads: int) -> dict[str, object]:
         "tp_size": K3_TP_SIZE,
         "module_path": str(module_path) if module_path is not None else None,
         "module_sha256": module_sha256,
+        "loaded_module_identities": loaded_module_identities,
         "source_fingerprint_sha256": source_fingerprint(),
         "benchmark_sha256": sha256_file(Path(__file__).resolve()),
         "git_head": git_output("rev-parse", "HEAD"),
