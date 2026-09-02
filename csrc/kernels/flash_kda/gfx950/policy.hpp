@@ -35,6 +35,11 @@ namespace flashkda_hip::gfx950 {
 struct LaunchPolicy {
 private:
     static constexpr int kHybridDirectMaxChunks = 64;
+    // The K3 TP8 N8/16K no-hint aggregate needs one device-side split that
+    // keeps equal 2K sequences on direct replay while sending a deep skewed
+    // tail to affine replay.  Keep this independent of the established N>=9
+    // hybrid threshold and its persistent graph contract.
+    static constexpr int kK3N8NoHintDirectMaxChunks = 128;
     static_assert(
         WorkspaceSizes::kCsplitSegmentA >=
             4 * 128 * int(sizeof(float)),
@@ -1505,14 +1510,16 @@ private:
             group_env == nullptr &&
             !force_direct && !force_affine && !force_hybrid;
         // The ATOM call also omits the hint for its 16K token-budget batches.
-        // These predicates select only a packed affine schedule.  They do not
-        // claim equal sequence lengths and therefore cannot enable the dense
-        // metadata-elision capability below.
+        // N4 uses a distribution-independent packed affine schedule.  N8
+        // keeps up to 128 C16 chunks on direct replay and sends only longer
+        // sequences through G32 affine replay; the device prefix, not this
+        // aggregate predicate, decides each sequence's side.  Neither route
+        // claims equal lengths or enables dense metadata elision.
         const bool automatic_k3_n4_16k_g64 =
             is_k3_n4_16k_nohint_aggregate(p) &&
             group_env == nullptr &&
             !force_direct && !force_affine && !force_hybrid;
-        const bool automatic_k3_n8_16k_g64 =
+        const bool automatic_k3_n8_16k_hybrid_g32 =
             is_k3_n8_16k_nohint_aggregate(p) &&
             group_env == nullptr &&
             !force_direct && !force_affine && !force_hybrid;
@@ -1639,7 +1646,8 @@ private:
             automatic_dense_single_g8 || automatic_dense_single_affine ||
             automatic_equal_n4_g64 || automatic_gva_equal_n4_g16 ||
             automatic_gva_equal_n4_g32 || automatic_gva_n4_16k_nohint ||
-            automatic_k3_n4_16k_g64 || automatic_k3_n8_16k_g64;
+            automatic_k3_n4_16k_g64 ||
+            automatic_k3_n8_16k_hybrid_g32;
 
         const int requested_group = group_env ? std::atoi(group_env) : 0;
         const bool requested_g8 = env_exact(
@@ -1680,7 +1688,7 @@ private:
             ? 128
             : requested_group == 64 || automatic_equal_n4_g64 ||
                 automatic_dense_n1_h96_g64 ||
-                automatic_k3_n4_16k_g64 || automatic_k3_n8_16k_g64 ||
+                automatic_k3_n4_16k_g64 ||
                 (requested_group == 0 &&
                  (T_seq >= 12288 || hinted_n8_g64))
                 ? 64
@@ -1725,7 +1733,8 @@ private:
         // and forms affine maps only for the long contexts.
         const bool hybrid = is_varlen && !hinted_direct &&
             !automatic_mixed_boundary_direct &&
-            ((!force_affine &&
+            (automatic_k3_n8_16k_hybrid_g32 ||
+             (!force_affine &&
               (force_hybrid || (!force_direct && p.N >= 9))) ||
              (force_affine && !scratch_safe));
         const bool direct = !hybrid &&
@@ -1742,8 +1751,9 @@ private:
             group_chunks = 8;
         } else if (eligible_g16) {
             group_chunks = 16;
+        } else if (automatic_k3_n8_16k_hybrid_g32) {
+            group_chunks = 32;
         } else if (automatic_equal_n4_g64 || automatic_k3_n4_16k_g64 ||
-                   automatic_k3_n8_16k_g64 ||
                    automatic_dense_n1_h96_g64) {
             group_chunks = 64;
         } else if (automatic_dense_n1_h96_g128) {
@@ -1760,7 +1770,11 @@ private:
             p.N >= 4 && p.N <= 8 && group_env == nullptr &&
             !force_direct && !force_affine && !force_hybrid;
         return {force_context, group_chunks,
-                hybrid ? kHybridDirectMaxChunks : 0,
+                hybrid
+                    ? (automatic_k3_n8_16k_hybrid_g32
+                        ? kK3N8NoHintDirectMaxChunks
+                        : kHybridDirectMaxChunks)
+                    : 0,
                 automatic_gva_packed_nw4,
                 automatic_gva_equal_n4_g16};
     }
@@ -2480,11 +2494,13 @@ private:
         const bool scan_ksplit_prefetch_b =
             scan_ksplit && context_scan_ksplit_prefetch_b_enabled();
         auto launch_group = [&]<int GROUP_CHUNKS>() {
-            // Hybrid packed serving keeps up to 1024-token requests on the
-            // direct register-state path and builds affine maps only for
-            // longer sequences.  Requiring at least 65 C16 tiles per affine
-            // sequence also guarantees that the existing cs_u arena can hold
-            // one FP32 KxV map per selected context group.
+            // Hybrid packed serving keeps sequences through the selected
+            // DIRECT_MAX_CHUNKS threshold on the direct register-state path
+            // and builds affine maps only for longer sequences.  The same
+            // runtime threshold bounds the number of affine sequences, so the
+            // existing cs_u arena can hold one FP32 KxV map per selected
+            // context group for both the established 64-chunk route and the
+            // K3 N8/16K 128-chunk route.
             const int groups_per_sequence =
                 (a.NT + GROUP_CHUNKS - 1) / GROUP_CHUNKS;
             int context_upper;
@@ -2535,19 +2551,28 @@ private:
                     const dim3 context_grid(
                         context_upper * a.H, 8 / CONTEXT_NW);
                     if (hybrid) {
-                        k2_kda_context_parallel_nw4_kernel<
-                            1, KdaContextMode::kReplay, HO, FP, VL, true,
-                            CONTEXT_NW,
-                            kHybridDirectMaxChunks, CACHED_OPERANDS,
-                            U_FORWARD, V_FORWARD, LDS_PIPELINE_REPLAY>
-                            <<<dim3(a.N * a.H, 8 / CONTEXT_NW),
-                               CONTEXT_NW * 64, 0, a.stream>>>(
-                                a.v, beta, a.out, a.kd, a.qd, a.kr, a.gt,
-                                a.inv, a.mqk, nullptr, nullptr, a.init_state,
-                                a.final_state,
-                                VL ? a.cu_seqlens : nullptr,
-                                VL ? a.tile_prefix : nullptr, nullptr, a.N,
-                                a.total_tiles, a.T_seq, a.H, a.NT);
+                        auto launch_direct = [&]<int DIRECT_MAX_CHUNKS>() {
+                            k2_kda_context_parallel_nw4_kernel<
+                                1, KdaContextMode::kReplay, HO, FP, VL, true,
+                                CONTEXT_NW, DIRECT_MAX_CHUNKS,
+                                CACHED_OPERANDS, U_FORWARD, V_FORWARD,
+                                LDS_PIPELINE_REPLAY>
+                                <<<dim3(a.N * a.H, 8 / CONTEXT_NW),
+                                   CONTEXT_NW * 64, 0, a.stream>>>(
+                                    a.v, beta, a.out, a.kd, a.qd, a.kr, a.gt,
+                                    a.inv, a.mqk, nullptr, nullptr,
+                                    a.init_state, a.final_state,
+                                    VL ? a.cu_seqlens : nullptr,
+                                    VL ? a.tile_prefix : nullptr, nullptr,
+                                    a.N, a.total_tiles, a.T_seq, a.H, a.NT);
+                        };
+                        if (direct_max_chunks ==
+                            kK3N8NoHintDirectMaxChunks)
+                            launch_direct.template operator()<
+                                kK3N8NoHintDirectMaxChunks>();
+                        else
+                            launch_direct.template operator()<
+                                kHybridDirectMaxChunks>();
                     }
                     auto launch_affine_b = [&]() {
                         k2_kda_context_parallel_nw4_kernel<
