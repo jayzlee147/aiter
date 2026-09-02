@@ -10,13 +10,22 @@ ROCm graph capture, and alternating paired timing.  This runner fixes the
 promotion matrix and adds deterministic stratified-bootstrap evidence plus a
 fail-closed, three-seed performance decision.
 
-The formal matrix has 26 logical cells at each of seeds 42, 43, and 44:
+The formal matrix has 30 logical cells at each of seeds 42, 43, and 44:
 
 * single lengths 128 through 16K, including 4K, crossed with materialized
   zero FP32 and nonzero FP32 resume state;
 * the remaining core batch/ragged cases;
 * all mixed-production cases up to the 64-sequence production limit; and
-* both 1024/1025 mixed-boundary cases.
+* both 1024/1025 mixed-boundary cases; and
+* a nonduplicating N4/N8 16K adversarial route cross.  The established
+  ``resume-4x4k`` and ``ragged-16k`` cells supply N4-equal and N8-ragged;
+  four explicit extensions add N4 extreme-tail/mixed and N8 equal/extreme-tail.
+
+The mature benchmark intentionally requires every sequence length to be
+positive, so an empty-sequence *performance* cell cannot be represented here.
+Empty/ragged correctness and changed-prefix graph replay remain the raw-ABI
+validator's responsibility; this runner records that exclusion in its plan
+instead of silently replacing it with a different workload.
 
 Every cell uses Hq=HV=12, the zero-environment public wrapper for HIP, forced
 ``backend="triton"`` for the comparator, a materialized FP32 state tensor, and
@@ -50,7 +59,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-SCHEMA = "flash-kda-public-k3-formal-matrix-v2"
+SCHEMA = "flash-kda-public-k3-formal-matrix-v3"
 SEEDS = (42, 43, 44)
 HEADS = 12
 VALUE_HEADS = 12
@@ -66,7 +75,70 @@ MAX_TOLERANCE = 0.04
 PUBLIC_BACKEND = "public-zero-env"
 TRITON_BACKEND = "forced-triton"
 EXPECTED_PLAN_SHA256 = (
-    "9369efb7000c4d4f3d26caab31bd85b3f7679585891561c79518cc17ad71cbd6"
+    "5a9a537c38f9d061a4c1675eed5c969a6c96dba24af7bb8321144594ddaa9b29"
+)
+
+# These four cases are deliberately local to the formal public-K3 promotion
+# runner.  Two complementary route cells already exist in the mature source
+# suites and are reused below rather than timed twice.
+K3_16K_ADVERSARIAL_EXTENSIONS = (
+    (
+        "n4-extreme-tail-16k",
+        (1, 1, 1, 16381),
+    ),
+    (
+        "n4-mixed-16k",
+        (17, 255, 1025, 15087),
+    ),
+    (
+        "n8-equal-16k",
+        (2048,) * 8,
+    ),
+    (
+        "n8-extreme-tail-16k",
+        (1, 2, 4, 8, 16, 32, 64, 16257),
+    ),
+)
+
+# Pin the reviewer-facing coverage claim to exact logical cells and shapes.
+# The plan hash then protects both this manifest and the executable specs.
+K3_16K_ROUTE_COVERAGE = (
+    (
+        "n4-equal",
+        "resume-4x4k-resume-fp32",
+        (4096,) * 4,
+        True,
+    ),
+    (
+        "n4-extreme-tail",
+        "n4-extreme-tail-16k-fresh-zero-fp32",
+        (1, 1, 1, 16381),
+        False,
+    ),
+    (
+        "n4-mixed",
+        "n4-mixed-16k-fresh-zero-fp32",
+        (17, 255, 1025, 15087),
+        False,
+    ),
+    (
+        "n8-equal",
+        "n8-equal-16k-fresh-zero-fp32",
+        (2048,) * 8,
+        False,
+    ),
+    (
+        "n8-extreme-tail",
+        "n8-extreme-tail-16k-fresh-zero-fp32",
+        (1, 2, 4, 8, 16, 32, 64, 16257),
+        False,
+    ),
+    (
+        "n8-ragged",
+        "ragged-16k-fresh-zero-fp32",
+        (127, 255, 511, 1023, 2047, 3073, 4095, 5253),
+        True,
+    ),
 )
 
 
@@ -200,6 +272,20 @@ def _fixed_specs() -> tuple[CaseSpec, ...]:
                 state_variant="mixed-fp32",
             )
         )
+
+    for source_name, seq_lens in K3_16K_ADVERSARIAL_EXTENSIONS:
+        specs.append(
+            CaseSpec(
+                logical_name=f"{source_name}-fresh-zero-fp32",
+                source_name=source_name,
+                family="k3-16k-no-hint-adversarial",
+                source_suite="formal-explicit-extension",
+                seq_lens=seq_lens,
+                resume=False,
+                resume_mask=None,
+                state_variant="fresh-zero-fp32",
+            )
+        )
     return tuple(specs)
 
 
@@ -277,9 +363,19 @@ def _assert_runtime_suite_identity(benchmark: Any) -> dict[str, Any]:
             expected_by_name[case.name] = _source_tuple(case)
 
     checked: dict[str, tuple[Any, ...]] = {}
+    explicit_extensions = {
+        "single-4096": (4096,),
+        **dict(K3_16K_ADVERSARIAL_EXTENSIONS),
+    }
     for spec in ALL_SPECS:
-        # The requested 4K single is an explicit extension of historical core.
-        if spec.source_name == "single-4096":
+        # Explicit extensions are pinned here and in the plan hash rather than
+        # pretending that they came from one of the mature benchmark suites.
+        if spec.source_name in explicit_extensions:
+            if spec.seq_lens != explicit_extensions[spec.source_name]:
+                raise RuntimeError(
+                    f"explicit extension drift for {spec.source_name}: "
+                    f"{spec.seq_lens} != {explicit_extensions[spec.source_name]}"
+                )
             continue
         expected = expected_by_name.get(spec.source_name)
         if expected is None:
@@ -299,7 +395,7 @@ def _assert_runtime_suite_identity(benchmark: Any) -> dict[str, Any]:
     return {
         "runtime_suite_identity_verified": True,
         "verified_source_cases": sorted(checked),
-        "single_4k_explicit_extension": True,
+        "explicit_extension_sources": sorted(explicit_extensions),
     }
 
 
@@ -796,6 +892,64 @@ def _performance_gate(cross_seed_summary: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _k3_16k_route_manifest() -> dict[str, Any]:
+    """Describe and validate the N4/N8 no-hint performance coverage."""
+
+    by_name = {spec.logical_name: spec for spec in ALL_SPECS}
+    cells = []
+    for scenario, logical_name, seq_lens, reused in K3_16K_ROUTE_COVERAGE:
+        spec = by_name.get(logical_name)
+        if spec is None:
+            raise RuntimeError(
+                f"K3 16K route manifest references missing cell {logical_name}"
+            )
+        if spec.seq_lens != seq_lens:
+            raise RuntimeError(
+                f"K3 16K route manifest drift for {logical_name}: "
+                f"{spec.seq_lens} != {seq_lens}"
+            )
+        cells.append(
+            {
+                "scenario": scenario,
+                "logical_name": logical_name,
+                "seq_lens": list(seq_lens),
+                "sequences": len(seq_lens),
+                "tokens": sum(seq_lens),
+                "observed_max_seqlen": max(seq_lens),
+                "state_variant": spec.state_variant,
+                "reuses_established_matrix_cell": reused,
+            }
+        )
+    return {
+        "route_contract": {
+            "workload": "official K3 TP8 per-rank",
+            "heads": HEADS,
+            "value_heads": VALUE_HEADS,
+            "packed": True,
+            "execution": "graph",
+            "initial_state_literal_none": False,
+            "initial_state_dtype": "torch.float32",
+            "max_seqlen_upper_bound": None,
+        },
+        "logical_cells": len(cells),
+        "new_logical_cells": sum(
+            not cell["reuses_established_matrix_cell"] for cell in cells
+        ),
+        "reused_logical_cells": sum(
+            cell["reuses_established_matrix_cell"] for cell in cells
+        ),
+        "cells": cells,
+        "empty_sequence_performance_cell": {
+            "included": False,
+            "reason": (
+                "bench_flash_kda_native.Case requires every sequence length "
+                "to be positive; empty-sequence behavior is validated by "
+                "the raw-ABI correctness/changed-prefix suite"
+            ),
+        },
+    }
+
+
 def _plan(seeds: tuple[int, ...]) -> dict[str, Any]:
     family_counts: dict[str, int] = {}
     for spec in ALL_SPECS:
@@ -825,6 +979,12 @@ def _plan(seeds: tuple[int, ...]) -> dict[str, Any]:
         "graphs_per_seed_cell": 3,
         "family_counts_per_seed": family_counts,
         "paired_timing_calls_at_w20_r120": len(cells) * 2 * (20 + 120),
+        "per_seed_per_cell_performance_gate": {
+            "minimum_triton_over_public_hip_speedup": FORMAL_MIN_SPEEDUP,
+            "paired_hip_win_fraction_strictly_above": 0.5,
+            "p50_delta_95pct_ci_upper_bound_strictly_below_us": 0.0,
+        },
+        "k3_16k_no_hint_route_coverage": _k3_16k_route_manifest(),
         "cells": cells,
     }
 
@@ -837,7 +997,7 @@ def _plan_sha256(plan: dict[str, Any]) -> str:
 def _static_self_test() -> dict[str, Any]:
     if _RUNTIME_LOADED:
         raise RuntimeError("CPU self-test unexpectedly loaded the GPU benchmark")
-    if len(ALL_SPECS) != 26 or len({spec.logical_name for spec in ALL_SPECS}) != 26:
+    if len(ALL_SPECS) != 30 or len({spec.logical_name for spec in ALL_SPECS}) != 30:
         raise RuntimeError("fixed matrix cardinality or names changed")
     if {spec.state_variant for spec in ALL_SPECS if spec.family == "single"} != set(
         STATE_VARIANTS
@@ -856,9 +1016,55 @@ def _static_self_test() -> dict[str, Any]:
         f"mixed-{decodes}d-budget16k" for decodes in MIXED_PRODUCTION_DECODES
     }:
         raise RuntimeError("mixed-production source set changed")
+    route_manifest = _k3_16k_route_manifest()
+    if (
+        route_manifest["logical_cells"] != 6
+        or route_manifest["new_logical_cells"] != 4
+        or route_manifest["reused_logical_cells"] != 2
+    ):
+        raise RuntimeError("K3 N4/N8 16K route coverage cardinality changed")
+    expected_scenarios = {
+        "n4-equal",
+        "n4-extreme-tail",
+        "n4-mixed",
+        "n8-equal",
+        "n8-extreme-tail",
+        "n8-ragged",
+    }
+    if {
+        cell["scenario"] for cell in route_manifest["cells"]
+    } != expected_scenarios:
+        raise RuntimeError("K3 N4/N8 16K adversarial scenario set changed")
+    if any(
+        cell["sequences"] not in (4, 8)
+        or cell["tokens"] != 16384
+        or any(length <= 0 for length in cell["seq_lens"])
+        for cell in route_manifest["cells"]
+    ):
+        raise RuntimeError("K3 N4/N8 16K route fixture contract changed")
+    route_contract = route_manifest["route_contract"]
+    if route_contract != {
+        "workload": "official K3 TP8 per-rank",
+        "heads": 12,
+        "value_heads": 12,
+        "packed": True,
+        "execution": "graph",
+        "initial_state_literal_none": False,
+        "initial_state_dtype": "torch.float32",
+        "max_seqlen_upper_bound": None,
+    }:
+        raise RuntimeError("K3 N4/N8 16K route execution contract changed")
+    if route_manifest["empty_sequence_performance_cell"]["included"] is not False:
+        raise RuntimeError("unsupported empty-sequence performance cell was added")
+    if SEEDS != (42, 43, 44) or FORMAL_MIN_SPEEDUP != 1.05:
+        raise RuntimeError("formal three-seed per-cell speedup gate changed")
     plan = _plan(SEEDS)
-    if plan["total_seed_cells"] != 78:
+    if plan["total_seed_cells"] != 90:
         raise RuntimeError("formal seed-cell count changed")
+    if plan["family_counts_per_seed"].get(
+        "k3-16k-no-hint-adversarial"
+    ) != 4:
+        raise RuntimeError("formal K3 16K adversarial extension count changed")
     if any(
         cell["max_seqlen_upper_bound"] is not None
         or cell["initial_state_literal_none"] is not False

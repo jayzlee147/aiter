@@ -12158,11 +12158,15 @@ def _assert_packed_route_numerically_equivalent(
     reference: tuple[torch.Tensor, torch.Tensor],
     seq_lens: tuple[int, ...],
     label: str,
+    *,
+    tolerance: float = 1.0e-2,
 ) -> tuple[float, float]:
     """Compare packed output/state globally and for each nonempty sequence."""
 
     output_errors = [
-        _route_relative_rms(actual[0], reference[0], f"{label} output")
+        _route_relative_rms(
+            actual[0], reference[0], f"{label} output", tolerance=tolerance
+        )
     ]
     offset = 0
     for sequence, length in enumerate(seq_lens):
@@ -12173,6 +12177,7 @@ def _assert_packed_route_numerically_equivalent(
                     actual[0][:, offset:next_offset],
                     reference[0][:, offset:next_offset],
                     f"{label} output sequence {sequence}",
+                    tolerance=tolerance,
                 )
             )
         offset = next_offset
@@ -12187,7 +12192,12 @@ def _assert_packed_route_numerically_equivalent(
             f"expected {len(seq_lens)}"
         )
     state_errors = [
-        _route_relative_rms(actual[1], reference[1], f"{label} final state")
+        _route_relative_rms(
+            actual[1],
+            reference[1],
+            f"{label} final state",
+            tolerance=tolerance,
+        )
     ]
     for sequence in range(len(seq_lens)):
         state_errors.append(
@@ -12195,6 +12205,7 @@ def _assert_packed_route_numerically_equivalent(
                 actual[1][sequence],
                 reference[1][sequence],
                 f"{label} final state sequence {sequence}",
+                tolerance=tolerance,
             )
         )
     return max(output_errors), max(state_errors)
@@ -12890,6 +12901,157 @@ def check_raw_v3_gva_mixed_boundary_no_hint(
                 os.environ[name] = value
 
 
+def check_raw_v3_mixed_hint_resume_chains(
+    module, device: torch.device
+) -> None:
+    """Chain legal hint modes while feeding each final state into the next step."""
+
+    if flash_kda._device_arch(device) != "gfx950":
+        print("SKIP raw-v3 mixed-hint resume chains: gfx950 only")
+        return
+
+    previous_env = {
+        name: os.environ.get(name) for name in _RAW_V2_POLICY_ENV
+    }
+
+    def clear_policy_environment() -> None:
+        for name in _RAW_V2_POLICY_ENV:
+            os.environ.pop(name, None)
+
+    def configure_general_reference() -> None:
+        # Use the same ordinary prefix-building direct graph and no host hint
+        # for every reference step, independent of the candidate's hint mode.
+        clear_policy_environment()
+        os.environ["FLASH_KDA_GFX950_CONTEXT_DIRECT"] = "1"
+        os.environ["FLASH_KDA_GFX950_CONTEXT_DIRECT_NW"] = "1"
+        os.environ[_CONTEXT_DIRECT_PREFIXLESS_ENV] = "0"
+
+    decodes = (1,) * 15
+    steps = (
+        ("no-hint", decodes + (1024,), 0),
+        ("exact-hint", (1025,) + decodes, 1025),
+        ("over-hint", decodes + (1025,), 1040),
+    )
+    cases = (
+        ("K3-H12", 12, 12),
+        ("GVA-Hq2-Hv4", 2, 4),
+        ("GVA-Hq2-Hv8", 2, 8),
+    )
+
+    try:
+        for case_index, (case_label, q_heads, value_heads) in enumerate(cases):
+            candidate_state = None
+            reference_state = None
+            for step_index, (hint_label, seq_lens, bound) in enumerate(steps):
+                maximum = max(seq_lens)
+                if hint_label == "no-hint" and bound != 0:
+                    raise AssertionError("invalid no-hint resume-chain fixture")
+                if hint_label == "exact-hint" and bound != maximum:
+                    raise AssertionError("invalid exact-hint resume-chain fixture")
+                if hint_label == "over-hint" and bound <= maximum:
+                    raise AssertionError("invalid over-hint resume-chain fixture")
+                if bound and not maximum <= bound <= sum(seq_lens):
+                    raise AssertionError("illegal positive resume-chain hint")
+
+                base = make_inputs(
+                    seq_lens,
+                    q_heads,
+                    device,
+                    value_heads=value_heads,
+                    packed=True,
+                    state_dtype=torch.float32,
+                    has_initial_state=True,
+                    output_final_state=True,
+                    seed=20261100 + 10 * case_index + step_index,
+                )
+                if candidate_state is None:
+                    candidate_state = base["initial_state"].clone()
+                    reference_state = base["initial_state"].clone()
+                if reference_state is None:
+                    raise AssertionError("missing resume-chain reference state")
+
+                # Do not clone between steps: these are the actual final-state
+                # allocations returned by the preceding candidate/reference
+                # launches, now consumed as the next initial states.
+                candidate_x = {**base, "initial_state": candidate_state}
+                reference_x = {**base, "initial_state": reference_state}
+                candidate_input_copy = candidate_state.clone()
+                reference_input_copy = reference_state.clone()
+
+                clear_policy_environment()
+                candidate_out, candidate_final, candidate_workspace = allocate(
+                    candidate_x
+                )
+                candidate_out.fill_(float("nan"))
+                candidate_final.fill_(float("nan"))
+                candidate_workspace.fill_(0x59)
+                raw_v3_call(
+                    module,
+                    candidate_x,
+                    candidate_out,
+                    candidate_final,
+                    candidate_workspace,
+                    bound,
+                )
+                torch.cuda.synchronize(device)
+                assert_bitwise_same(
+                    candidate_state,
+                    candidate_input_copy,
+                    f"raw-v3 {case_label} resume step {step_index} "
+                    f"{hint_label} mutated candidate input state",
+                )
+
+                configure_general_reference()
+                reference_out, reference_final, reference_workspace = allocate(
+                    reference_x
+                )
+                reference_out.fill_(float("nan"))
+                reference_final.fill_(float("nan"))
+                reference_workspace.fill_(0xA6)
+                raw_v3_call(
+                    module,
+                    reference_x,
+                    reference_out,
+                    reference_final,
+                    reference_workspace,
+                    0,
+                )
+                torch.cuda.synchronize(device)
+                assert_bitwise_same(
+                    reference_state,
+                    reference_input_copy,
+                    f"raw-v3 {case_label} resume step {step_index} "
+                    "forced-general/no-hint mutated reference input state",
+                )
+
+                errors = _assert_packed_route_numerically_equivalent(
+                    (candidate_out, candidate_final),
+                    (reference_out, reference_final),
+                    seq_lens,
+                    f"raw-v3 {case_label} resume step {step_index} "
+                    f"{hint_label} vs forced-general/no-hint chain",
+                    tolerance=1.0e-3,
+                )
+                print(
+                    f"PASS raw-v3 {case_label} resume step {step_index} "
+                    f"{hint_label}: max global/per-sequence output/state "
+                    f"rRMS={errors[0]:.3e}/{errors[1]:.3e}"
+                )
+                candidate_state = candidate_final
+                reference_state = reference_final
+
+            print(
+                f"PASS raw-v3 {case_label} no-hint/exact/over-hint "
+                "three-step resume chain"
+            )
+    finally:
+        for name, value in previous_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def check_raw_v3_k3_16k_no_hint_matrix(
     module, device: torch.device
 ) -> None:
@@ -13014,7 +13176,7 @@ def check_raw_v3_k3_16k_no_hint_matrix(
         ("n4-empty-ragged", (0, 1, 8191, 8192), 4),
         ("n4-mixed", (17, 255, 1025, 15087), 4),
         ("n4-equal-4x4k", (4096, 4096, 4096, 4096), 4),
-        ("n8-extreme-tail", (1, 1, 1, 1, 1, 1, 1, 16377), 8),
+        ("n8-extreme-tail", (1, 2, 4, 8, 16, 32, 64, 16257), 8),
         (
             "n8-empty-ragged",
             (0, 1, 15, 255, 1025, 2048, 4096, 8944),
@@ -14017,6 +14179,7 @@ def main():
     check_raw_v2_invalid_bounds(module, device, min(args.heads, 2))
     check_raw_v3_k3_mixed_boundary_no_hint(module, device)
     check_raw_v3_gva_mixed_boundary_no_hint(module, device)
+    check_raw_v3_mixed_hint_resume_chains(module, device)
     check_raw_v3_k3_16k_no_hint_matrix(module, device)
     check_raw_v3_gva_n4_16k_no_hint_matrix(module, device)
     check_raw_v2_hint_policy_matrix(module, device, min(args.heads, 2))
