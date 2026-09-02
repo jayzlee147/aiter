@@ -1204,18 +1204,37 @@ private:
             bt16_fused_mode() != Bt16FusedMode::disabled;
     }
 
+    static bool is_k3_dense_n4_4k_nohint(const FwdParams& p) {
+        constexpr int kSequences = 4;
+        constexpr int kSequenceTokens = 4096;
+        constexpr int kChunksPerSequence =
+            kSequenceTokens / WorkspaceSizes::CHUNK;
+        constexpr int kDenseTiles = kSequences * kChunksPerSequence;
+        static_assert(kChunksPerSequence == 256 && kDenseTiles == 1024,
+                      "K3 dense N4/G64 geometry changed");
+        return p.cu_seqlens == nullptr &&
+            p.H_q == 12 && p.H == 12 && p.N == kSequences &&
+            p.T_total == kSequences * kSequenceTokens &&
+            p.total_tiles == kDenseTiles;
+    }
+
     static bool context_equal_dense_n4_g64_enabled(
             const FwdParams& p,
             const ContextRouteConfig& route,
             K2DefaultRoute default_k2_route) {
-        // Unlike a kernel-local schedule bit, this candidate removes the
-        // packed prefix launch and changes every downstream workspace index.
-        // Publish one capability only after the complete K1 -> affine AB ->
-        // K-split scan -> replay recipe has matched.  Common dispatch repeats
-        // the geometry proof before replacing packed metadata with the dense
-        // N=4 layout.
-        if (!env_exact(
-                "FLASH_KDA_GFX950_CONTEXT_EQUAL_DENSE_N4_G64", "1"))
+        // The opt-in candidate normalizes one packed, proven-equal layout to
+        // dense indexing.  The zero-environment K3 candidate is already a
+        // true dense tensor, so it needs no caller hint and no metadata
+        // erasure.  Both consume the same exact N4/G64 K1 -> fused AB ->
+        // K-split scan -> replay graph; keep the automatic form restricted to
+        // the production TP8 head count and exact 4x4K geometry.
+        const char* const equal_dense = std::getenv(
+            "FLASH_KDA_GFX950_CONTEXT_EQUAL_DENSE_N4_G64");
+        const bool explicit_packed =
+            equal_dense != nullptr && std::strcmp(equal_dense, "1") == 0;
+        const bool automatic_dense =
+            equal_dense == nullptr && is_k3_dense_n4_4k_nohint(p);
+        if (!explicit_packed && !automatic_dense)
             return false;
 
         constexpr int kSequences = 4;
@@ -1227,11 +1246,16 @@ private:
         static_assert(kChunksPerSequence == 256 && kDenseTiles == 1024 &&
                       kPackedTiles == 1028,
                       "equal dense N4/G64 geometry changed");
-        if (p.H_q != p.H || p.cu_seqlens == nullptr ||
-            p.N != kSequences || p.H <= 0 ||
+        const bool packed_geometry =
+            explicit_packed && p.cu_seqlens != nullptr &&
+            p.max_seqlen_upper_bound == kSequenceTokens &&
+            p.total_tiles == kPackedTiles;
+        const bool dense_geometry =
+            automatic_dense && p.cu_seqlens == nullptr &&
+            p.total_tiles == kDenseTiles;
+        if (p.H_q != p.H || p.N != kSequences || p.H <= 0 ||
             p.T_total != kSequences * kSequenceTokens ||
-            p.max_seqlen_upper_bound != kSequenceTokens ||
-            p.total_tiles != kPackedTiles ||
+            (!packed_geometry && !dense_geometry) ||
             default_k2_route != K2DefaultRoute::context_parallel ||
             !route.force_context || route.group_chunks != 64 ||
             route.direct_max_chunks != 0 ||
@@ -1536,6 +1560,19 @@ private:
             group_env == nullptr &&
             !force_direct && !force_affine && !force_hybrid;
 
+        // The public dense API already supplies an exact rectangular shape,
+        // so unlike packed inputs it needs neither a maximum-length hint nor
+        // an inferred equality promise.  Graduate only the measured K3 TP8
+        // bucket in a zero-route-environment process.  Setting the existing
+        // equal-dense knob (including its canonical rollback value "0") or
+        // any explicit context selector leaves the previous route intact.
+        const bool automatic_k3_dense_n4_h12_g64 =
+            is_k3_dense_n4_4k_nohint(p) && group_env == nullptr &&
+            direct_value == nullptr && affine_value == nullptr &&
+            hybrid_value == nullptr &&
+            std::getenv(
+                "FLASH_KDA_GFX950_CONTEXT_EQUAL_DENSE_N4_G64") == nullptr;
+
         // A single 256/512-token K3 sequence is faster as one fused-K1 plus
         // pure-direct replay pair than through the four-launch plain C-split
         // topology.  This covers both dense input and the one-sequence packed
@@ -1646,6 +1683,7 @@ private:
             automatic_dense_single_g8 || automatic_dense_single_affine ||
             automatic_equal_n4_g64 || automatic_gva_equal_n4_g16 ||
             automatic_gva_equal_n4_g32 || automatic_gva_n4_16k_nohint ||
+            automatic_k3_dense_n4_h12_g64 ||
             automatic_k3_n4_16k_g64 ||
             automatic_k3_n8_16k_hybrid_g32;
 
@@ -1688,6 +1726,7 @@ private:
             ? 128
             : requested_group == 64 || automatic_equal_n4_g64 ||
                 automatic_dense_n1_h96_g64 ||
+                automatic_k3_dense_n4_h12_g64 ||
                 automatic_k3_n4_16k_g64 ||
                 (requested_group == 0 &&
                  (T_seq >= 12288 || hinted_n8_g64))
@@ -1753,7 +1792,9 @@ private:
             group_chunks = 16;
         } else if (automatic_k3_n8_16k_hybrid_g32) {
             group_chunks = 32;
-        } else if (automatic_equal_n4_g64 || automatic_k3_n4_16k_g64 ||
+        } else if (automatic_equal_n4_g64 ||
+                   automatic_k3_dense_n4_h12_g64 ||
+                   automatic_k3_n4_16k_g64 ||
                    automatic_dense_n1_h96_g64) {
             group_chunks = 64;
         } else if (automatic_dense_n1_h96_g128) {

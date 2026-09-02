@@ -10,7 +10,7 @@ ROCm graph capture, and alternating paired timing.  This runner fixes the
 promotion matrix and adds deterministic stratified-bootstrap evidence plus a
 fail-closed, three-seed performance decision.
 
-The formal matrix has 31 logical cells at each of seeds 42, 43, and 44:
+The formal matrix has 33 logical cells at each of seeds 42, 43, and 44:
 
 * single lengths 128 through 16K, including 4K, crossed with materialized
   zero FP32 and nonzero FP32 resume state;
@@ -20,21 +20,25 @@ The formal matrix has 31 logical cells at each of seeds 42, 43, and 44:
 * a nonduplicating N4/N8 16K adversarial route cross.  The established
   ``resume-4x4k`` and ``ragged-16k`` cells supply N4-equal and N8-ragged;
   five explicit extensions add N4 extreme-tail/mixed and N8
-  equal/extreme-tail/mixed.
+  equal/extreme-tail/mixed; and
+* two true dense public-API calls with ``cu_seqlens=None``: B1x8K fresh and
+  B4x4K resume.
 
-The mature benchmark intentionally requires every sequence length to be
-positive, so an empty-sequence *performance* cell cannot be represented here.
-Empty/ragged correctness and changed-prefix graph replay remain the raw-ABI
-validator's responsibility; this runner records that exclusion in its plan
-instead of silently replacing it with a different workload.
+Packed empty-sequence performance is deliberately excluded: PR #4683's
+Triton packed sequence mapper does not define duplicate offsets, so it cannot
+serve as a valid comparator for such a cell.  Empty-prefix correctness and
+graph replay remain pinned by the raw-ABI validator and are recorded in this
+plan as required external evidence.
 
-Every cell uses Hq=HV=12, the zero-environment public wrapper for HIP, forced
-``backend="triton"`` for the comparator, a materialized FP32 state tensor, and
-``max_seqlen_upper_bound=None`` exactly as ATOM commit 16c20d3048 calls the
+The official checkpoint has 96 KDA heads and ATOM's validated TP8 deployment
+therefore calls each rank with Hq=HV=12.  Every cell uses that local shape, the
+zero-environment public wrapper for HIP, forced ``backend="triton"`` for the
+comparator, a materialized FP32 state tensor, and an omitted
+``max_seqlen_upper_bound`` keyword exactly as ATOM commit 16c20d3048 calls the
 operator.  It uses graph replay, exactly 20 warmup rounds, 120 measured rounds,
-and 10,000 bootstrap resamples.  The process exits nonzero after writing evidence
-unless every logical cell satisfies all four formal criteria documented in
-``_performance_gate``.
+and 10,000 bootstrap resamples.  The process exits nonzero after writing
+evidence unless every logical cell satisfies all four formal criteria
+documented in ``_performance_gate``.
 
 ``--print-plan`` and ``--static-self-test`` are CPU-only and intentionally do
 not import PyTorch or AITER.
@@ -60,10 +64,12 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-SCHEMA = "flash-kda-public-k3-formal-matrix-v3"
+SCHEMA = "flash-kda-public-k3-formal-matrix-v4"
 SEEDS = (42, 43, 44)
-HEADS = 12
-VALUE_HEADS = 12
+K3_GLOBAL_HEADS = 96
+K3_TP_SIZE = 8
+HEADS = K3_GLOBAL_HEADS // K3_TP_SIZE
+VALUE_HEADS = HEADS
 SINGLE_LENGTHS = (128, 256, 512, 1024, 2048, 4096, 8192, 16384)
 STATE_VARIANTS = ("fresh-zero-fp32", "resume-fp32")
 MIXED_PRODUCTION_DECODES = (7, 8, 32, 63)
@@ -76,7 +82,7 @@ MAX_TOLERANCE = 0.04
 PUBLIC_BACKEND = "public-zero-env"
 TRITON_BACKEND = "forced-triton"
 EXPECTED_PLAN_SHA256 = (
-    "026ab17c1f2808441d488084c19884b62215ea59daedf332833fb853efedb7a7"
+    "345a3aec5df370b7d1f81720a4097542b6dc7be49054dbd1c38c6cb12275666a"
 )
 
 # These five cases are deliberately local to the formal public-K3 promotion
@@ -102,6 +108,26 @@ K3_16K_ADVERSARIAL_EXTENSIONS = (
     (
         "n8-mixed-16k",
         (17, 63, 255, 1025, 2047, 3073, 4095, 5809),
+    ),
+)
+
+# Minimal public-API topology coverage that cannot be represented by the
+# established packed-positive source suites.  Both still execute through the
+# canonical benchmark, public resolver, graph audit, and formal timing gate.
+K3_PUBLIC_API_EXTENSIONS = (
+    (
+        "dense-single-8k",
+        (8192,),
+        False,
+        None,
+        "fresh-zero-fp32",
+    ),
+    (
+        "dense-batch-4x4k",
+        (4096,) * 4,
+        True,
+        None,
+        "resume-fp32",
     ),
 )
 
@@ -184,6 +210,7 @@ class CaseSpec:
     resume: bool
     resume_mask: tuple[bool, ...] | None
     state_variant: str
+    packed: bool = True
 
     @property
     def observed_max_seqlen(self) -> int:
@@ -297,6 +324,27 @@ def _fixed_specs() -> tuple[CaseSpec, ...]:
                 state_variant="fresh-zero-fp32",
             )
         )
+
+    for (
+        source_name,
+        seq_lens,
+        resume,
+        resume_mask,
+        state_variant,
+    ) in K3_PUBLIC_API_EXTENSIONS:
+        specs.append(
+            CaseSpec(
+                logical_name=f"{source_name}-{state_variant}",
+                source_name=source_name,
+                family="public-api-layout",
+                source_suite="formal-explicit-extension",
+                seq_lens=seq_lens,
+                resume=resume,
+                resume_mask=resume_mask,
+                state_variant=state_variant,
+                packed=False,
+            )
+        )
     return tuple(specs)
 
 
@@ -358,11 +406,18 @@ def _source_tuple(case: Any) -> tuple[Any, ...]:
         tuple(case.seq_lens),
         bool(case.resume),
         None if case.resume_mask is None else tuple(case.resume_mask),
+        bool(case.packed),
     )
 
 
 def _spec_source_tuple(spec: CaseSpec) -> tuple[Any, ...]:
-    return (spec.source_name, spec.seq_lens, spec.resume, spec.resume_mask)
+    return (
+        spec.source_name,
+        spec.seq_lens,
+        spec.resume,
+        spec.resume_mask,
+        spec.packed,
+    )
 
 
 def _assert_runtime_suite_identity(benchmark: Any) -> dict[str, Any]:
@@ -375,17 +430,32 @@ def _assert_runtime_suite_identity(benchmark: Any) -> dict[str, Any]:
 
     checked: dict[str, tuple[Any, ...]] = {}
     explicit_extensions = {
-        "single-4096": (4096,),
-        **dict(K3_16K_ADVERSARIAL_EXTENSIONS),
+        "single-4096": ((4096,), True),
+        **{
+            source_name: (seq_lens, True)
+            for source_name, seq_lens in K3_16K_ADVERSARIAL_EXTENSIONS
+        },
+        **{
+            source_name: (seq_lens, False)
+            for source_name, seq_lens, _resume, _resume_mask, _state_variant
+            in K3_PUBLIC_API_EXTENSIONS
+        },
     }
     for spec in ALL_SPECS:
         # Explicit extensions are pinned here and in the plan hash rather than
         # pretending that they came from one of the mature benchmark suites.
         if spec.source_name in explicit_extensions:
-            if spec.seq_lens != explicit_extensions[spec.source_name]:
+            expected_seq_lens, expected_packed = explicit_extensions[
+                spec.source_name
+            ]
+            if (
+                spec.seq_lens != expected_seq_lens
+                or spec.packed is not expected_packed
+            ):
                 raise RuntimeError(
                     f"explicit extension drift for {spec.source_name}: "
-                    f"{spec.seq_lens} != {explicit_extensions[spec.source_name]}"
+                    f"{spec.seq_lens}/{spec.packed} != "
+                    f"{expected_seq_lens}/{expected_packed}"
                 )
             continue
         expected = expected_by_name.get(spec.source_name)
@@ -394,7 +464,7 @@ def _assert_runtime_suite_identity(benchmark: Any) -> dict[str, Any]:
         actual = _spec_source_tuple(spec)
         # Resume singles deliberately add state to the established fresh shape.
         matches = (
-            actual[:2] == expected[:2]
+            actual[:2] == expected[:2] and actual[4] == expected[4]
             if spec.family == "single"
             else actual == expected
         )
@@ -480,12 +550,19 @@ def _paired_raw_rows(
         if backend not in aliases:
             raise RuntimeError(f"{spec.logical_name}: unexpected backend {backend}")
         row = dict(raw)
+        if (
+            "max_seqlen_upper_bound" not in row
+            or row["max_seqlen_upper_bound"] is not None
+        ):
+            raise RuntimeError(
+                f"{spec.logical_name}/{backend}: measured call did not omit "
+                "the max-seqlen hint"
+            )
         row["backend"] = aliases[backend]
         row["logical_name"] = spec.logical_name
         row["source_case"] = spec.source_name
         row["state_variant"] = spec.state_variant
         row["initial_state_literal_none"] = False
-        row["max_seqlen_upper_bound"] = None
         by_round.setdefault(int(row["round"]), []).append(row)
 
     if sorted(by_round) != list(range(repeat)):
@@ -548,12 +625,19 @@ def _summary_rows(
     normalized = []
     for source in rows:
         row = dict(source)
+        if (
+            "max_seqlen_upper_bound" not in row
+            or row["max_seqlen_upper_bound"] is not None
+        ):
+            raise RuntimeError(
+                f"{spec.logical_name}/{source.get('backend')}: summary did "
+                "not preserve the omitted max-seqlen hint"
+            )
         row["backend"] = aliases[str(source["backend"])]
         row["logical_name"] = spec.logical_name
         row["source_case"] = spec.source_name
         row["state_variant"] = spec.state_variant
         row["initial_state_literal_none"] = False
-        row["max_seqlen_upper_bound"] = None
         normalized.append(row)
     return normalized
 
@@ -590,6 +674,7 @@ def _run_one(
         spec.seq_lens,
         resume=spec.resume,
         resume_mask=spec.resume_mask,
+        packed=spec.packed,
     )
     raw_rows: list[dict[str, object]] = []
     rows = benchmark._benchmark_case(
@@ -638,6 +723,22 @@ def _run_one(
             f"{spec.logical_name}: public benchmark unexpectedly supplied a "
             "max-seqlen hint"
         )
+    expected_effective_bound = spec.seq_lens[0] if not spec.packed else None
+    if (
+        public.get("public_max_seqlen_upper_bound_keyword_omitted") is not True
+        or public.get("native_policy_effective_max_seqlen_upper_bound")
+        != expected_effective_bound
+    ):
+        raise RuntimeError(
+            f"{spec.logical_name}: public/effective max-seqlen contract failed"
+        )
+    if (
+        public.get("packed") is not spec.packed
+        or public.get("cu_seqlens_is_none") is spec.packed
+    ):
+        raise RuntimeError(
+            f"{spec.logical_name}: public input layout contract failed"
+        )
     route_audit = public.pop("graph_route_audit", None)
     if not isinstance(route_audit, dict) or not all(
         route_audit.get(field) is True
@@ -649,7 +750,34 @@ def _run_one(
         )
     ):
         raise RuntimeError(f"{spec.logical_name}: graph route audit failed")
+    audited_backends = route_audit.get("backends")
+    expected_routes = {
+        "native": "native-hip-k1-k2",
+        "explicit-native": "native-hip-k1-k2",
+        "triton": "triton-flash-kda-prepare-segment",
+    }
+    if (
+        not isinstance(audited_backends, dict)
+        or set(audited_backends) != set(expected_routes)
+        or any(
+            not isinstance(audited_backends.get(backend), dict)
+            or audited_backends[backend].get("route") != expected_route
+            or audited_backends[backend].get("route_verified") is not True
+            for backend, expected_route in expected_routes.items()
+        )
+    ):
+        raise RuntimeError(
+            f"{spec.logical_name}: expected native HIP K1/K2 and PR #4683 "
+            f"compact Triton routes, got {audited_backends!r}"
+        )
     for backend, row in by_backend.items():
+        if (
+            row.get("packed") is not spec.packed
+            or row.get("cu_seqlens_is_none") is spec.packed
+        ):
+            raise RuntimeError(
+                f"{spec.logical_name}/{backend}: input layout evidence changed"
+            )
         if row.get("output_contract_verified") is not True:
             raise RuntimeError(
                 f"{spec.logical_name}/{backend}: output contract was not verified"
@@ -673,6 +801,17 @@ def _run_one(
         )
 
     positions = _position_counts(raw_rows)
+    if any(
+        row.get("packed") is not spec.packed
+        or row.get("cu_seqlens_is_none") is spec.packed
+        or row.get("public_max_seqlen_upper_bound_keyword_omitted") is not True
+        or row.get("native_policy_effective_max_seqlen_upper_bound")
+        != expected_effective_bound
+        for row in raw_rows
+    ):
+        raise RuntimeError(
+            f"{spec.logical_name}: raw timing layout evidence changed"
+        )
     expected_positions = {"first": repeat // 2, "second": repeat // 2}
     if any(counts != expected_positions for counts in positions.values()):
         raise RuntimeError(
@@ -698,18 +837,25 @@ def _run_one(
         "heads": HEADS,
         "value_heads": VALUE_HEADS,
         "state_variant": spec.state_variant,
+        "packed": spec.packed,
+        "cu_seqlens_is_none": not spec.packed,
         "initial_state_contract": {
             "literal_none": False,
             "materialized_dtype": "torch.float32",
             "resume_mask": None if spec.resume_mask is None else list(spec.resume_mask),
         },
         "max_seqlen_upper_bound": None,
+        "public_max_seqlen_upper_bound_keyword_omitted": True,
+        "native_policy_effective_max_seqlen_upper_bound": (
+            expected_effective_bound
+        ),
         "observed_max_seqlen": spec.observed_max_seqlen,
         "execution": "graph",
         "timed_callable_contract": {
             "hip": "chunk_kimi_delta_attn(...), backend keyword omitted",
             "triton": "chunk_kimi_delta_attn(..., backend='triton')",
             "max_seqlen_upper_bound": None,
+            "cu_seqlens": "int32" if spec.packed else None,
         },
         "timing": timing,
         "summary_rows": rows,
@@ -813,6 +959,8 @@ def _cross_seed_summary(
             "family": spec.family,
             "state_variant": spec.state_variant,
             "seq_lens": list(spec.seq_lens),
+            "packed": spec.packed,
+            "cu_seqlens_is_none": not spec.packed,
             "per_seed": per_seed,
             "worst_seed_speedup_from_p50": min(
                 item["speedup_from_p50"] for item in per_seed
@@ -934,6 +1082,8 @@ def _k3_16k_route_manifest() -> dict[str, Any]:
     return {
         "route_contract": {
             "workload": "official K3 TP8 per-rank",
+            "model_global_heads": K3_GLOBAL_HEADS,
+            "tensor_parallel_size": K3_TP_SIZE,
             "heads": HEADS,
             "value_heads": VALUE_HEADS,
             "packed": True,
@@ -953,10 +1103,77 @@ def _k3_16k_route_manifest() -> dict[str, Any]:
         "empty_sequence_performance_cell": {
             "included": False,
             "reason": (
-                "bench_flash_kda_native.Case requires every sequence length "
-                "to be positive; empty-sequence behavior is validated by "
-                "the raw-ABI correctness/changed-prefix suite"
+                "PR #4683 Triton packed mapping does not define duplicate "
+                "cu_seqlens offsets, so it is not a valid empty-sequence "
+                "performance comparator"
             ),
+            "required_acceptance_stage": "raw-v3-k3-no-hint",
+            "correctness_cases": ["n4-empty-ragged", "n8-empty-ragged"],
+            "graph_replay_cases": [
+                "N4-even-to-empty-ragged",
+                "N8-even-to-empty-ragged",
+            ],
+        },
+    }
+
+
+def _public_api_layout_manifest() -> dict[str, Any]:
+    """Pin the true dense public calls and packed-empty evidence boundary."""
+
+    by_name = {spec.logical_name: spec for spec in ALL_SPECS}
+    dense_cells = []
+    for (
+        source_name,
+        seq_lens,
+        _resume,
+        _resume_mask,
+        state_variant,
+    ) in K3_PUBLIC_API_EXTENSIONS:
+        logical_name = f"{source_name}-{state_variant}"
+        spec = by_name.get(logical_name)
+        if spec is None or spec.seq_lens != seq_lens or spec.packed is not False:
+            raise RuntimeError(f"public API extension drift: {logical_name}")
+        dense_cells.append(
+            {
+                "logical_name": logical_name,
+                "seq_lens": list(seq_lens),
+                "packed": False,
+                "cu_seqlens": None,
+                "public_max_seqlen_upper_bound_keyword": "omitted",
+                "native_policy_effective_max_seqlen_upper_bound": seq_lens[0],
+                "state_variant": state_variant,
+                "execution": "graph",
+                "performance_gate_minimum_speedup": FORMAL_MIN_SPEEDUP,
+            }
+        )
+    return {
+        "dense_performance_cells": dense_cells,
+        "packed_empty_sequence": _k3_16k_route_manifest()[
+            "empty_sequence_performance_cell"
+        ],
+    }
+
+
+def _hint_mode_correctness_manifest() -> dict[str, Any]:
+    """Describe the out-of-band route-hint equivalence proof."""
+
+    return {
+        "required_acceptance_stage": "raw-v3-k3-no-hint",
+        "heads": HEADS,
+        "value_heads": VALUE_HEADS,
+        "valid_modes": [
+            "no-hint-zero-sentinel",
+            "exact-observed-maximum",
+            "truthful-over-bound",
+        ],
+        "orders_per_initial_state_mode": 6,
+        "initial_state_modes": ["materialized-fp32", "fresh-none"],
+        "returned_state_is_next_step_input": True,
+        "reference_route": "forced-general-no-hint",
+        "maximum_relative_rms_tolerance": 1.0e-3,
+        "under_hint": {
+            "included": False,
+            "reason": "invalid caller promise; may select an inapplicable route",
         },
     }
 
@@ -972,8 +1189,13 @@ def _plan(seeds: tuple[int, ...]) -> dict[str, Any]:
             "heads": HEADS,
             "value_heads": VALUE_HEADS,
             "max_seqlen_upper_bound": None,
+            "public_max_seqlen_upper_bound_keyword_omitted": True,
+            "native_policy_effective_max_seqlen_upper_bound": (
+                spec.seq_lens[0] if not spec.packed else None
+            ),
             "observed_max_seqlen": spec.observed_max_seqlen,
             "initial_state_literal_none": False,
+            "cu_seqlens_is_none": not spec.packed,
         }
         for seed in seeds
         for spec in ALL_SPECS
@@ -982,6 +1204,8 @@ def _plan(seeds: tuple[int, ...]) -> dict[str, Any]:
         "schema": SCHEMA,
         "cpu_only": True,
         "seeds": list(seeds),
+        "model_global_heads": K3_GLOBAL_HEADS,
+        "tensor_parallel_size": K3_TP_SIZE,
         "heads": HEADS,
         "value_heads": VALUE_HEADS,
         "logical_cells_per_seed": len(ALL_SPECS),
@@ -996,6 +1220,8 @@ def _plan(seeds: tuple[int, ...]) -> dict[str, Any]:
             "p50_delta_95pct_ci_upper_bound_strictly_below_us": 0.0,
         },
         "k3_16k_no_hint_route_coverage": _k3_16k_route_manifest(),
+        "public_api_layout_coverage": _public_api_layout_manifest(),
+        "hint_mode_correctness_coverage": _hint_mode_correctness_manifest(),
         "cells": cells,
     }
 
@@ -1008,7 +1234,7 @@ def _plan_sha256(plan: dict[str, Any]) -> str:
 def _static_self_test() -> dict[str, Any]:
     if _RUNTIME_LOADED:
         raise RuntimeError("CPU self-test unexpectedly loaded the GPU benchmark")
-    if len(ALL_SPECS) != 31 or len({spec.logical_name for spec in ALL_SPECS}) != 31:
+    if len(ALL_SPECS) != 33 or len({spec.logical_name for spec in ALL_SPECS}) != 33:
         raise RuntimeError("fixed matrix cardinality or names changed")
     if {spec.state_variant for spec in ALL_SPECS if spec.family == "single"} != set(
         STATE_VARIANTS
@@ -1057,6 +1283,8 @@ def _static_self_test() -> dict[str, Any]:
     route_contract = route_manifest["route_contract"]
     if route_contract != {
         "workload": "official K3 TP8 per-rank",
+        "model_global_heads": 96,
+        "tensor_parallel_size": 8,
         "heads": 12,
         "value_heads": 12,
         "packed": True,
@@ -1067,22 +1295,81 @@ def _static_self_test() -> dict[str, Any]:
     }:
         raise RuntimeError("K3 N4/N8 16K route execution contract changed")
     if route_manifest["empty_sequence_performance_cell"]["included"] is not False:
-        raise RuntimeError("unsupported empty-sequence performance cell was added")
-    if SEEDS != (42, 43, 44) or FORMAL_MIN_SPEEDUP != 1.05:
+        raise RuntimeError("invalid empty-sequence performance cell was added")
+    empty_evidence = route_manifest["empty_sequence_performance_cell"]
+    if (
+        empty_evidence["required_acceptance_stage"]
+        != "raw-v3-k3-no-hint"
+        or empty_evidence["correctness_cases"]
+        != ["n4-empty-ragged", "n8-empty-ragged"]
+        or len(empty_evidence["graph_replay_cases"]) != 2
+    ):
+        raise RuntimeError("packed-empty raw evidence contract changed")
+    layout_manifest = _public_api_layout_manifest()
+    dense_cells = layout_manifest["dense_performance_cells"]
+    if (
+        len(dense_cells) != 2
+        or {cell["logical_name"] for cell in dense_cells}
+        != {
+            "dense-single-8k-fresh-zero-fp32",
+            "dense-batch-4x4k-resume-fp32",
+        }
+        or any(
+            cell["packed"] is not False
+            or cell["cu_seqlens"] is not None
+            or cell["public_max_seqlen_upper_bound_keyword"] != "omitted"
+            or cell["native_policy_effective_max_seqlen_upper_bound"]
+            not in (4096, 8192)
+            or cell["execution"] != "graph"
+            or cell["performance_gate_minimum_speedup"] != 1.05
+            for cell in dense_cells
+        )
+    ):
+        raise RuntimeError("dense public-API performance coverage changed")
+    hint_coverage = _hint_mode_correctness_manifest()
+    if (
+        hint_coverage["required_acceptance_stage"]
+        != "raw-v3-k3-no-hint"
+        or hint_coverage["heads"] != 12
+        or hint_coverage["value_heads"] != 12
+        or len(hint_coverage["valid_modes"]) != 3
+        or hint_coverage["orders_per_initial_state_mode"] != 6
+        or len(hint_coverage["initial_state_modes"]) != 2
+        or hint_coverage["returned_state_is_next_step_input"] is not True
+        or hint_coverage["maximum_relative_rms_tolerance"] != 1.0e-3
+        or hint_coverage["under_hint"]["included"] is not False
+    ):
+        raise RuntimeError("max-seqlen hint correctness coverage changed")
+    if (
+        K3_GLOBAL_HEADS != 96
+        or K3_TP_SIZE != 8
+        or HEADS != 12
+        or VALUE_HEADS != 12
+        or SEEDS != (42, 43, 44)
+        or FORMAL_MIN_SPEEDUP != 1.05
+    ):
         raise RuntimeError("formal three-seed per-cell speedup gate changed")
     plan = _plan(SEEDS)
-    if plan["total_seed_cells"] != 93:
+    if plan["total_seed_cells"] != 99:
         raise RuntimeError("formal seed-cell count changed")
     if plan["family_counts_per_seed"].get(
         "k3-16k-no-hint-adversarial"
     ) != 5:
         raise RuntimeError("formal K3 16K adversarial extension count changed")
+    if plan["family_counts_per_seed"].get("public-api-layout") != 2:
+        raise RuntimeError("formal public-API layout extension count changed")
     if any(
         cell["max_seqlen_upper_bound"] is not None
+        or cell["public_max_seqlen_upper_bound_keyword_omitted"] is not True
         or cell["initial_state_literal_none"] is not False
+        or cell["cu_seqlens_is_none"] is cell["packed"]
+        or cell["native_policy_effective_max_seqlen_upper_bound"]
+        != (cell["seq_lens"][0] if not cell["packed"] else None)
         for cell in plan["cells"]
     ):
-        raise RuntimeError("formal ATOM no-hint/materialized-state contract changed")
+        raise RuntimeError(
+            "formal no-hint/materialized-state/input-layout contract changed"
+        )
     if _plan_sha256(plan) != EXPECTED_PLAN_SHA256:
         raise RuntimeError("formal public-K3 matrix identity changed")
 
@@ -1105,6 +1392,7 @@ def _static_self_test() -> dict[str, Any]:
                     "backend": backend,
                     "round": round_index,
                     "order": position,
+                    "max_seqlen_upper_bound": None,
                     "latency_ms": 1.0 if backend == "native" else 2.0,
                 }
             )
@@ -1312,6 +1600,8 @@ def _run_gpu(args: argparse.Namespace) -> dict[str, Any]:
                 "tolerance": args.tolerance,
                 "bootstrap_resamples": args.bootstrap_resamples,
                 "bootstrap_seed": BOOTSTRAP_SEED,
+                "model_global_heads": K3_GLOBAL_HEADS,
+                "tensor_parallel_size": K3_TP_SIZE,
                 "heads": HEADS,
                 "value_heads": VALUE_HEADS,
                 "execution": "graph",
@@ -1319,6 +1609,9 @@ def _run_gpu(args: argparse.Namespace) -> dict[str, Any]:
                 "public_triton_backend_keyword": "triton",
                 "max_seqlen_upper_bound": None,
                 "max_seqlen_hint_omitted": True,
+                "dense_native_policy_bound": "shape-derived-T",
+                "input_layouts": ["packed-int32-cu_seqlens", "dense-cu_seqlens-none"],
+                "packed_empty_sequence_validation": "raw-v3-k3-no-hint",
                 "initial_state_literal_none": False,
                 "initial_state_dtype": "torch.float32",
                 "paired_order": "alternating-position-balanced",

@@ -351,10 +351,10 @@ struct ContextParallelLaunch {
     // must derive their compact C16 workspace base from cu_seqlens and must
     // not dereference tile_prefix when this is set.
     bool packed_direct_prefixless = false;
-    // True only after common dispatch has proved the packed N=4, 4K-each
-    // promise and normalized the complete K1/producer/scan/replay graph to
-    // the equivalent dense layout.  This is a whole-graph ABI bit: no kernel
-    // may infer it from the now-null packed metadata in isolation.
+    // True only after common dispatch has proved either the packed N=4,
+    // 4K-each promise and normalized it to dense indexing, or the exact true
+    // dense K3 TP8 shape.  This is a whole-graph ABI bit: no kernel may infer
+    // it from null packed metadata in isolation.
     bool equal_dense_n4_g64 = false;
     // True only when common dispatch selected the matching BT16 producer and
     // that exact invocation was asked to publish activated beta plus the
@@ -487,9 +487,10 @@ struct HipLaunchPolicy {
     // The common launcher still rechecks the packed pure-direct shape before
     // it removes k1_build_tile_prefix.
     bool context_direct_prefixless = false;
-    // Strict whole-graph capability for the packed equal-length N=4/G64
-    // dense-normalization candidate.  Appending this field preserves every
-    // existing aggregate initializer, including gfx942's shorter prefix.
+    // Strict whole-graph capability shared by the packed equal-length N=4/G64
+    // dense-normalization candidate and the exact true-dense K3 TP8 route.
+    // Appending this field preserves every existing aggregate initializer,
+    // including gfx942's shorter prefix.
     bool context_equal_dense_n4_g64 = false;
     // The architecture BT16 callback may consume grouped-value q/k heads and
     // publish the ordinary per-value-head workspace.  Downstream routes still

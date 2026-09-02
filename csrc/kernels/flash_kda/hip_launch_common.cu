@@ -127,33 +127,45 @@ void launch_fwd_common(
         use_context_parallel &&
         policy.launch_bt16_k1 != nullptr &&
         policy.bt16_k1_context_operand_cache;
-    // The raw-v2 maximum is a caller promise: every packed sequence is no
-    // longer than max_seqlen_upper_bound.  If their sum is exactly N times
-    // that bound, every sequence must therefore have the same length.  The
-    // measured N=4/G64 affine bucket can use the cheaper dense K1/K2 index
-    // mapping and omit the prefix node entirely.  The architecture policy
-    // publishes this whole-graph capability only for a canonical exact-"1"
-    // recipe; repeat every geometry check here before erasing metadata.
-    const int equal_dense_nt = p.max_seqlen_upper_bound > 0
-        ? int((int64_t(p.max_seqlen_upper_bound) +
-               WorkspaceSizes::CHUNK - 1) / WorkspaceSizes::CHUNK)
-        : 0;
+    // A packed raw-v2 maximum is a caller promise: if its sum is exactly N
+    // times the total, every sequence has the same length and may be
+    // normalized to dense indexing.  A true dense tensor already proves its
+    // rectangular geometry and must not depend on (or manufacture) that
+    // optional hint.  Repeat both exact shapes here before admitting the
+    // shared N4/G64 graph, and keep metadata normalization packed-only.
+    const int equal_dense_nt = is_varlen
+        ? (p.max_seqlen_upper_bound > 0
+            ? int((int64_t(p.max_seqlen_upper_bound) +
+                   WorkspaceSizes::CHUNK - 1) / WorkspaceSizes::CHUNK)
+            : 0)
+        : NT;
     const int64_t equal_dense_total_tiles =
         int64_t(N) * int64_t(equal_dense_nt);
-    const bool use_context_equal_dense_n4_g64 =
-        !is_gva && policy.context_equal_dense_n4_g64 &&
-        use_context_parallel && is_varlen && N == 4 && H > 0 &&
+    const bool packed_equal_dense_n4_g64 =
+        is_varlen && N == 4 && H > 0 &&
         p.max_seqlen_upper_bound == 4096 &&
         int64_t(p.max_seqlen_upper_bound) * int64_t(N) ==
             int64_t(p.T_total) &&
+        equal_dense_nt == 256 &&
+        equal_dense_total_tiles == int64_t(4 * 256) &&
+        int64_t(total_tiles) == equal_dense_total_tiles + N;
+    const bool true_dense_n4_h12_g64 =
+        !is_varlen && H_q == 12 && H == 12 && N == 4 &&
+        T_seq == 4096 && p.T_total == 4 * 4096 && NT == 256 &&
+        equal_dense_total_tiles == int64_t(4 * 256) &&
+        int64_t(total_tiles) == equal_dense_total_tiles;
+    const bool use_context_equal_dense_n4_g64 =
+        !is_gva && policy.context_equal_dense_n4_g64 &&
+        use_context_parallel &&
+        (packed_equal_dense_n4_g64 || true_dense_n4_h12_g64) &&
         policy.launch_bt16_k1 != nullptr &&
         policy.context_group_chunks == 64 &&
-        policy.context_direct_max_chunks == 0 && equal_dense_nt > 0 &&
-        equal_dense_total_tiles == int64_t(4 * 256) &&
-        int64_t(total_tiles) == equal_dense_total_tiles + N &&
+        policy.context_direct_max_chunks == 0 &&
         !policy.context_direct_prefixless &&
         policy.launch_context_prefix == nullptr &&
         policy.context_persistent_blocks == 0;
+    const bool normalize_packed_equal_dense_n4_g64 =
+        use_context_equal_dense_n4_g64 && packed_equal_dense_n4_g64;
     // A prefix node may be removed only as a matched K1/K2 topology.  The
     // gfx950 policy capability is already strict opt-in; repeat the structural
     // guards here before suppressing architecture-neutral work so a partial or
@@ -286,7 +298,7 @@ void launch_fwd_common(
     int* sequence_count = ws.sequence_count;
     unsigned int* task_counter = ws.task_counter;
     if (is_varlen && !use_context_direct_prefixless &&
-        !use_context_equal_dense_n4_g64) {
+        !normalize_packed_equal_dense_n4_g64) {
         if (use_csplit64_k6_persistent) {
             const PersistentPrefixLaunch args{
                 stream, cu_seqlens, N, tile_prefix, pair_prefix,
@@ -537,10 +549,10 @@ void launch_fwd_common(
         request_context_operand_cache && use_bt16_k1_callback;
     if (use_bt16_k1_callback) {
         const bool k1_is_varlen =
-            is_varlen && !use_context_equal_dense_n4_g64;
-        const int k1_total_tiles = use_context_equal_dense_n4_g64
+            is_varlen && !normalize_packed_equal_dense_n4_g64;
+        const int k1_total_tiles = normalize_packed_equal_dense_n4_g64
             ? int(equal_dense_total_tiles) : total_tiles;
-        const int k1_nt = use_context_equal_dense_n4_g64
+        const int k1_nt = normalize_packed_equal_dense_n4_g64
             ? equal_dense_nt : NT;
         const Bt16K1Launch args{
             stream,
@@ -725,10 +737,10 @@ void launch_fwd_common(
             ? reinterpret_cast<float*>(cs_sin)
             : reinterpret_cast<float*>(cs_u);
         const bool context_is_varlen =
-            is_varlen && !use_context_equal_dense_n4_g64;
-        const int context_total_tiles = use_context_equal_dense_n4_g64
+            is_varlen && !normalize_packed_equal_dense_n4_g64;
+        const int context_total_tiles = normalize_packed_equal_dense_n4_g64
             ? int(equal_dense_total_tiles) : total_tiles;
-        const int context_nt = use_context_equal_dense_n4_g64
+        const int context_nt = normalize_packed_equal_dense_n4_g64
             ? equal_dense_nt : NT;
         const ContextParallelLaunch args{
             stream, v_bf, beta_f, out_bf, ws_kd, ws_qd, ws_kr, ws_gt,

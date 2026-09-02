@@ -15,9 +15,10 @@ readonly WARMUP=20
 readonly REPEAT=120
 readonly BOOTSTRAP_RESAMPLES=10000
 readonly MIN_SPEEDUP=1.05
-readonly EXPECTED_LOGICAL_CELLS=31
-readonly EXPECTED_SEED_CELLS=93
-readonly FORMAL_PLAN_SHA256=026ab17c1f2808441d488084c19884b62215ea59daedf332833fb853efedb7a7
+readonly EXPECTED_LOGICAL_CELLS=33
+readonly EXPECTED_SEED_CELLS=99
+readonly FORMAL_PLAN_SHA256=345a3aec5df370b7d1f81720a4097542b6dc7be49054dbd1c38c6cb12275666a
+readonly K3_NO_HINT_PASS_MARKER="TARGETED K3 NO-HINT ABI CHECKS PASSED"
 
 if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
     cat <<'EOF'
@@ -30,10 +31,17 @@ HIP_VISIBLE_DEVICES) before invoking the script.
 The output directory must be outside the source checkout. The default is a
 new /tmp/flash-kda-public-k3-* directory. The formal seed set is 42, 43, and
 44. Timing and statistics are pinned to warmup 20, repeat 120, and 10,000
-bootstrap resamples. Every cell uses Hq=HV=12, materialized FP32 state, and
-omits max_seqlen_upper_bound to reproduce the ATOM public call contract.
+bootstrap resamples. Kimi-K3 has 96 global KDA heads; the validated TP8
+deployment gives each rank Hq=HV=12. Every cell uses that local shape,
+materialized FP32 state, and omits max_seqlen_upper_bound to reproduce the
+ATOM public call contract.
 Every cell must reach at least 1.05x HIP-over-Triton p50 speedup in every seed,
-in addition to the paired-win and bootstrap-confidence gates.
+in addition to the paired-win and bootstrap-confidence gates. The matrix
+includes true dense public calls with cu_seqlens=None. Packed empty sequences
+are checked separately through the raw-v3 correctness/topology/graph validator
+because PR #4683 Triton does not define duplicate cu_seqlens offsets. That
+validator also chains no-hint, exact-hint, and truthful over-hint calls in all
+six orders and verifies equivalent output/state at every resume step.
 EOF
     exit 0
 fi
@@ -163,7 +171,8 @@ acceptance_exit() {
     for candidate in \
         status.txt repository-after.txt git-head.txt git-tree.txt \
         static-self-test.json static-self-test.log plan.json plan.log \
-        environment.log benchmark.log benchmark-status.txt result.json \
+        environment.log k3-no-hint-validation.log benchmark.log \
+        benchmark-status.txt result.json \
         partial-results.jsonl artifact-validation.log jit/module_aiter_core.so \
         jit/module_flash_kda_hip.so; do
         [[ -s $OUTPUT_DIR/$candidate ]] && artifacts+=("$candidate")
@@ -301,6 +310,17 @@ print(f"PYTHONHASHSEED: {os.environ['PYTHONHASHSEED']}")
 print(f"PYTHONOPTIMIZE: {os.environ.get('PYTHONOPTIMIZE')}")
 PY
 
+ACCEPTANCE_STAGE=raw-v3-k3-no-hint
+"$PYTHON_BIN" -u \
+    op_tests/op_benchmarks/triton/validate_flash_kda_raw_path.py \
+    --heads 12 --k3-no-hint-only \
+    2>&1 | tee "$OUTPUT_DIR/k3-no-hint-validation.log"
+if [[ $(grep -Fxc -- "$K3_NO_HINT_PASS_MARKER" \
+    "$OUTPUT_DIR/k3-no-hint-validation.log") -ne 1 ]]; then
+    echo "ERROR: targeted K3 no-hint validator did not emit its unique PASS marker" >&2
+    exit 1
+fi
+
 ACCEPTANCE_STAGE=benchmark
 set +e
 "$PYTHON_BIN" -u "$BENCHMARK_ENTRY" \
@@ -379,7 +399,7 @@ with (root / "result.json").open(encoding="utf-8") as handle:
 with (root / "plan.json").open(encoding="utf-8") as handle:
     emitted_plan = json.load(handle)
 
-require(result.get("schema") == "flash-kda-public-k3-formal-matrix-v3",
+require(result.get("schema") == "flash-kda-public-k3-formal-matrix-v4",
         "result schema")
 require(result.get("capture_complete") is True, "capture is incomplete")
 require(result.get("all_nonperformance_contract_checks_passed") is True,
@@ -391,6 +411,11 @@ require(result.get("performance_gate_passed") is True,
 require(result.get("plan_sha256") == expected_plan_sha256,
         "result plan hash")
 require(result.get("plan") == emitted_plan, "emitted and embedded plans differ")
+canonical_plan = json.dumps(
+    emitted_plan, sort_keys=True, separators=(",", ":")
+).encode()
+require(hashlib.sha256(canonical_plan).hexdigest() == expected_plan_sha256,
+        "emitted plan canonical hash")
 
 plan = result["plan"]
 require(plan.get("logical_cells_per_seed") == expected_logical_cells,
@@ -398,6 +423,8 @@ require(plan.get("logical_cells_per_seed") == expected_logical_cells,
 require(plan.get("total_seed_cells") == expected_seed_cells,
         "seed-cell count")
 require(plan.get("seeds") == [42, 43, 44], "seed set")
+require(plan.get("model_global_heads") == 96, "model global heads")
+require(plan.get("tensor_parallel_size") == 8, "tensor parallel size")
 require(len(plan.get("cells", ())) == expected_seed_cells, "plan cell count")
 route_coverage = plan.get("k3_16k_no_hint_route_coverage", {})
 require(route_coverage.get("logical_cells") == 7,
@@ -410,6 +437,85 @@ require(
     },
     "K3 N4/N8 route scenarios",
 )
+layout_coverage = plan.get("public_api_layout_coverage", {})
+dense_cells = layout_coverage.get("dense_performance_cells", ())
+require(
+    {cell.get("logical_name") for cell in dense_cells}
+    == {
+        "dense-single-8k-fresh-zero-fp32",
+        "dense-batch-4x4k-resume-fp32",
+    },
+    "dense public-API cells",
+)
+require(
+    all(
+        cell.get("packed") is False
+        and cell.get("cu_seqlens") is None
+        and cell.get("public_max_seqlen_upper_bound_keyword") == "omitted"
+        and cell.get("native_policy_effective_max_seqlen_upper_bound")
+        in (4096, 8192)
+        and cell.get("performance_gate_minimum_speedup") == 1.05
+        for cell in dense_cells
+    ),
+    "dense public-API execution contract",
+)
+empty_evidence = layout_coverage.get("packed_empty_sequence", {})
+require(empty_evidence.get("included") is False,
+        "packed-empty performance exclusion")
+require(
+    empty_evidence.get("required_acceptance_stage")
+    == "raw-v3-k3-no-hint",
+    "packed-empty raw evidence stage",
+)
+hint_coverage = plan.get("hint_mode_correctness_coverage", {})
+require(
+    hint_coverage.get("required_acceptance_stage")
+    == "raw-v3-k3-no-hint",
+    "mixed-hint raw evidence stage",
+)
+require(
+    hint_coverage.get("heads") == 12
+    and hint_coverage.get("value_heads") == 12,
+    "mixed-hint K3 head contract",
+)
+require(
+    hint_coverage.get("valid_modes")
+    == [
+        "no-hint-zero-sentinel",
+        "exact-observed-maximum",
+        "truthful-over-bound",
+    ]
+    and hint_coverage.get("orders_per_initial_state_mode") == 6
+    and hint_coverage.get("initial_state_modes")
+    == ["materialized-fp32", "fresh-none"]
+    and hint_coverage.get("returned_state_is_next_step_input") is True
+    and hint_coverage.get("maximum_relative_rms_tolerance") == 1.0e-3,
+    "mixed-hint resume-chain contract",
+)
+require(
+    hint_coverage.get("under_hint", {}).get("included") is False,
+    "under-hint must remain outside the valid equivalence matrix",
+)
+k3_no_hint_log = (root / "k3-no-hint-validation.log").read_text(
+    encoding="utf-8"
+)
+for marker in (
+    "PASS raw-v3 K3-H12/materialized: all six no-hint/exact/over-hint resume orders",
+    "PASS raw-v3 K3-H12/fresh-none: all six no-hint/exact/over-hint resume orders",
+    "PASS raw-v3 K3 mixed no-hint changed-prefix graph replay:",
+    "PASS raw-v3 K3 16K no-hint route/result/hint contract: n4-empty-ragged",
+    "PASS raw-v3 K3 16K no-hint route/result/hint contract: n8-empty-ragged",
+    "PASS raw-v3 K3 N4/16K no-hint graph replay",
+    "PASS raw-v3 K3 N8/16K no-hint graph replay",
+):
+    require(marker in k3_no_hint_log, f"K3 no-hint evidence marker: {marker}")
+require(
+    k3_no_hint_log.splitlines().count(
+        "TARGETED K3 NO-HINT ABI CHECKS PASSED"
+    )
+    == 1,
+    "targeted K3 no-hint terminal PASS marker",
+)
 
 configuration = result.get("configuration", {})
 require(configuration.get("seeds") == [42, 43, 44], "configuration seeds")
@@ -417,6 +523,10 @@ require(configuration.get("warmup") == 20, "configuration warmup")
 require(configuration.get("repeat") == 120, "configuration repeat")
 require(configuration.get("bootstrap_resamples") == 10000,
         "configuration bootstrap resamples")
+require(configuration.get("model_global_heads") == 96,
+        "configuration model global heads")
+require(configuration.get("tensor_parallel_size") == 8,
+        "configuration tensor parallel size")
 require(configuration.get("heads") == 12, "configuration Hq")
 require(configuration.get("value_heads") == 12, "configuration HV")
 require(configuration.get("execution") == "graph", "configuration execution")
@@ -424,6 +534,18 @@ require(configuration.get("max_seqlen_upper_bound") is None,
         "configuration max-seqlen hint")
 require(configuration.get("max_seqlen_hint_omitted") is True,
         "configuration hint omission")
+require(configuration.get("dense_native_policy_bound") == "shape-derived-T",
+        "configuration dense effective bound")
+require(
+    configuration.get("input_layouts")
+    == ["packed-int32-cu_seqlens", "dense-cu_seqlens-none"],
+    "configuration input layouts",
+)
+require(
+    configuration.get("packed_empty_sequence_validation")
+    == "raw-v3-k3-no-hint",
+    "configuration packed-empty validation",
+)
 require(configuration.get("initial_state_literal_none") is False,
         "configuration state presence")
 require(configuration.get("initial_state_dtype") == "torch.float32",
@@ -435,6 +557,7 @@ require(environment.get("git_status_porcelain") == "",
         "benchmark observed a dirty checkout")
 require(environment.get("arch") == "gfx950", "GPU arch")
 require(environment.get("compute_units") == 256, "GPU CU count")
+require(environment.get("tp_size") == 8, "benchmark tensor parallel size")
 require(environment.get("active_kda_environment") == {},
         "active KDA route environment")
 expected_module = (root / "jit/module_flash_kda_hip.so").resolve()
@@ -457,16 +580,34 @@ require(isinstance(rows, list) and len(rows) == expected_seed_cells,
 expected_keys = {
     (cell["logical_name"], cell["seed"]) for cell in plan["cells"]
 }
+plan_by_key = {
+    (cell["logical_name"], cell["seed"]): cell for cell in plan["cells"]
+}
 actual_keys = {(row.get("logical_name"), row.get("seed")) for row in rows}
 require(len(actual_keys) == expected_seed_cells and actual_keys == expected_keys,
         "missing, duplicate, or unexpected seed cell")
 for row in rows:
     label = f"{row.get('logical_name')}/seed-{row.get('seed')}"
+    planned = plan_by_key[(row.get("logical_name"), row.get("seed"))]
     require(row.get("heads") == 12 and row.get("value_heads") == 12,
             f"{label}: heads")
     require(row.get("execution") == "graph", f"{label}: execution")
     require(row.get("max_seqlen_upper_bound") is None,
             f"{label}: max-seqlen hint")
+    require(
+        row.get("public_max_seqlen_upper_bound_keyword_omitted") is True,
+        f"{label}: public max-seqlen keyword",
+    )
+    require(row.get("packed") is planned["packed"], f"{label}: layout")
+    require(
+        row.get("cu_seqlens_is_none") is planned["cu_seqlens_is_none"],
+        f"{label}: cu_seqlens contract",
+    )
+    require(
+        row.get("native_policy_effective_max_seqlen_upper_bound")
+        == planned["native_policy_effective_max_seqlen_upper_bound"],
+        f"{label}: native effective max-seqlen",
+    )
     state = row.get("initial_state_contract", {})
     require(state.get("literal_none") is False,
             f"{label}: state presence")
@@ -494,12 +635,41 @@ for row in rows:
     require(all(sample.get("max_seqlen_upper_bound") is None
                 for sample in row["raw_timing_samples"]),
             f"{label}: raw timing hint")
+    require(
+        all(
+            sample.get("packed") is planned["packed"]
+            and sample.get("cu_seqlens_is_none")
+            is planned["cu_seqlens_is_none"]
+            and sample.get("public_max_seqlen_upper_bound_keyword_omitted")
+            is True
+            and sample.get("native_policy_effective_max_seqlen_upper_bound")
+            == planned["native_policy_effective_max_seqlen_upper_bound"]
+            for sample in row["raw_timing_samples"]
+        ),
+        f"{label}: raw timing input contract",
+    )
     audit = row.get("graph_route_audit", {})
     require(all(audit.get(field) is True for field in (
                 "all_routes_verified", "graphs_independent",
                 "streams_independent",
                 "public_explicit_graph_signatures_equal")),
             f"{label}: graph route audit")
+    audited_backends = audit.get("backends", {})
+    expected_routes = {
+        "native": "native-hip-k1-k2",
+        "explicit-native": "native-hip-k1-k2",
+        "triton": "triton-flash-kda-prepare-segment",
+    }
+    require(
+        set(audited_backends) == set(expected_routes)
+        and all(
+            isinstance(audited_backends.get(backend), dict)
+            and audited_backends[backend].get("route") == expected_route
+            and audited_backends[backend].get("route_verified") is True
+            for backend, expected_route in expected_routes.items()
+        ),
+        f"{label}: exact native/PR-4683 comparator routes",
+    )
 
 summary = result.get("cross_seed_summary", {})
 require(summary.get("logical_cells") == expected_logical_cells,
@@ -525,7 +695,7 @@ require(events and events[-1].get("event") == "run-complete",
 require(events[-1].get("complete") is True, "checkpoint incomplete")
 require(events[-1].get("performance_gate_passed") is True,
         "checkpoint performance gate")
-print("artifact validation: PASS (31/31 logical cells, 93/93 seed cells)")
+print("artifact validation: PASS (33/33 logical cells, 99/99 seed cells)")
 PY
 
 ACCEPTANCE_STAGE=complete
