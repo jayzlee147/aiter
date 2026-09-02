@@ -49,18 +49,19 @@ fi
 
 cd "$REPO_ROOT"
 repo_is_clean() {
-    local submodule_status
+    local submodule_status untracked
     git -c safe.directory="$REPO_ROOT" diff --quiet -- || return 1
     git -c safe.directory="$REPO_ROOT" diff --cached --quiet -- || return 1
-    [[ -z $(git -c safe.directory="$REPO_ROOT" \
-        ls-files --others --exclude-standard) ]] || return 1
+    untracked="$(git -c safe.directory="$REPO_ROOT" \
+        ls-files --others --exclude-standard)" || return 1
+    [[ -z $untracked ]] || return 1
     submodule_status="$(git -c safe.directory="$REPO_ROOT" \
         submodule status --recursive)" || return 1
-    if grep -Eq '^[+U]' <<<"$submodule_status"; then
+    if grep -Eq '^[-+U]' <<<"$submodule_status"; then
         return 1
     fi
     git -c safe.directory="$REPO_ROOT" submodule foreach --recursive \
-        --quiet 'test -z "$(git status --porcelain --untracked-files=all)"'
+        --quiet 'submodule_tree="$(git status --porcelain --untracked-files=all)" || exit $?; test -z "$submodule_tree"'
 }
 
 if ! repo_is_clean; then
