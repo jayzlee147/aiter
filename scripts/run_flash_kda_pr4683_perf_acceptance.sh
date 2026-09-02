@@ -19,6 +19,7 @@ readonly WARMUP=20
 readonly REPEAT=120
 readonly BOOTSTRAP_RESAMPLES=10000
 readonly MIN_NATIVE_SPEEDUP=1.03
+readonly FORMAL_PLAN_SHA256=f78e32aa80d754d7f02c91f9f138a68b77720f286c9f667f1f26a598f50ae894
 
 usage() {
     cat <<'EOF'
@@ -48,14 +49,18 @@ fi
 
 cd "$REPO_ROOT"
 repo_is_clean() {
-    git -c safe.directory="$REPO_ROOT" diff --quiet -- &&
-        git -c safe.directory="$REPO_ROOT" diff --cached --quiet -- &&
-        [[ -z $(git -c safe.directory="$REPO_ROOT" \
-            ls-files --others --exclude-standard) ]] &&
-        ! git -c safe.directory="$REPO_ROOT" submodule status --recursive |
-            grep -Eq '^[+U]' &&
-        git -c safe.directory="$REPO_ROOT" submodule foreach --recursive \
-            --quiet 'test -z "$(git status --porcelain --untracked-files=all)"'
+    local submodule_status
+    git -c safe.directory="$REPO_ROOT" diff --quiet -- || return 1
+    git -c safe.directory="$REPO_ROOT" diff --cached --quiet -- || return 1
+    [[ -z $(git -c safe.directory="$REPO_ROOT" \
+        ls-files --others --exclude-standard) ]] || return 1
+    submodule_status="$(git -c safe.directory="$REPO_ROOT" \
+        submodule status --recursive)" || return 1
+    if grep -Eq '^[+U]' <<<"$submodule_status"; then
+        return 1
+    fi
+    git -c safe.directory="$REPO_ROOT" submodule foreach --recursive \
+        --quiet 'test -z "$(git status --porcelain --untracked-files=all)"'
 }
 
 if ! repo_is_clean; then
@@ -111,35 +116,49 @@ acceptance_exit() {
         fi
     fi
 
-    {
+    if ! {
         printf 'initial_head=%s\n' "$INITIAL_HEAD"
         printf 'final_head=%s\n' "$final_head"
         printf 'initial_tree=%s\n' "$INITIAL_TREE"
         printf 'final_tree=%s\n' "$final_tree"
         printf 'clean_and_unchanged=%s\n' "$repository_ok"
-    } >"$OUTPUT_DIR/repository-after.txt"
-
-    local status=failed
-    if ((exit_code == 0)); then
-        status=passed
+    } >"$OUTPUT_DIR/repository-after.txt"; then
+        if ((exit_code == 0)); then
+            exit_code=1
+            ACCEPTANCE_STAGE=repository-evidence-finalization
+        fi
     fi
-    {
-        printf 'status=%s\n' "$status"
-        printf 'exit_code=%s\n' "$exit_code"
-        printf 'stage=%s\n' "$ACCEPTANCE_STAGE"
-        printf 'git_head=%s\n' "$INITIAL_HEAD"
-        printf 'git_tree=%s\n' "$INITIAL_TREE"
-        printf 'logical_cells=%s\n' "$EXPECTED_LOGICAL_CELLS"
-        printf 'seed_cells=%s\n' "$EXPECTED_SEED_CELLS"
-        printf 'seeds=42,43,44\n'
-        printf 'warmup=%s\n' "$WARMUP"
-        printf 'repeat=%s\n' "$REPEAT"
-        printf 'bootstrap_resamples=%s\n' "$BOOTSTRAP_RESAMPLES"
-        printf 'minimum_native_speedup=%s\n' "$MIN_NATIVE_SPEEDUP"
-        printf 'execution=eager\n'
-        printf 'python=%s\n' "$PYTHON_BIN"
-        printf 'benchmark_exit=%s\n' "${BENCHMARK_EXIT:-not-run}"
-    } >"$OUTPUT_DIR/status.txt"
+
+    write_acceptance_status() {
+        local status=failed
+        if ((exit_code == 0)); then
+            status=passed
+        fi
+        {
+            printf 'status=%s\n' "$status"
+            printf 'exit_code=%s\n' "$exit_code"
+            printf 'stage=%s\n' "$ACCEPTANCE_STAGE"
+            printf 'git_head=%s\n' "$INITIAL_HEAD"
+            printf 'git_tree=%s\n' "$INITIAL_TREE"
+            printf 'logical_cells=%s\n' "$EXPECTED_LOGICAL_CELLS"
+            printf 'seed_cells=%s\n' "$EXPECTED_SEED_CELLS"
+            printf 'seeds=42,43,44\n'
+            printf 'warmup=%s\n' "$WARMUP"
+            printf 'repeat=%s\n' "$REPEAT"
+            printf 'bootstrap_resamples=%s\n' "$BOOTSTRAP_RESAMPLES"
+            printf 'minimum_native_speedup=%s\n' "$MIN_NATIVE_SPEEDUP"
+            printf 'execution=eager\n'
+            printf 'python=%s\n' "$PYTHON_BIN"
+            printf 'benchmark_exit=%s\n' "${BENCHMARK_EXIT:-not-run}"
+        } >"$OUTPUT_DIR/status.txt"
+    }
+    if ! write_acceptance_status; then
+        if ((exit_code == 0)); then
+            exit_code=1
+            ACCEPTANCE_STAGE=status-finalization
+        fi
+        write_acceptance_status || true
+    fi
 
     local candidate
     local -a artifacts=()
@@ -152,10 +171,17 @@ acceptance_exit() {
         [[ -s $OUTPUT_DIR/$candidate ]] && artifacts+=("$candidate")
     done
     if ((${#artifacts[@]} > 0)); then
-        (
+        if ! (
             cd "$OUTPUT_DIR" || exit 1
             sha256sum -- "${artifacts[@]}"
-        ) >"$OUTPUT_DIR/artifacts.sha256"
+        ) >"$OUTPUT_DIR/artifacts.sha256"; then
+            rm -f -- "$OUTPUT_DIR/artifacts.sha256"
+            if ((exit_code == 0)); then
+                exit_code=1
+                ACCEPTANCE_STAGE=artifact-checksum-finalization
+            fi
+            write_acceptance_status || true
+        fi
     fi
 
     if ((repository_ok == 0)); then
@@ -315,23 +341,34 @@ if ((BENCHMARK_EXIT != 0)); then
 fi
 
 ACCEPTANCE_STAGE=artifact-validation
-for artifact in result.json partial-results.jsonl \
+for artifact in plan.json result.json partial-results.jsonl \
     jit/module_flash_kda_hip.so; do
     [[ -s $OUTPUT_DIR/$artifact ]] || {
         echo "ERROR: successful benchmark did not produce $artifact" >&2
         exit 1
     }
 done
-"$PYTHON_BIN" - "$OUTPUT_DIR" <<'PY' \
+"$PYTHON_BIN" - \
+    "$OUTPUT_DIR" "$INITIAL_HEAD" "$INITIAL_TREE" "$FORMAL_PLAN_SHA256" \
+    "$EXPECTED_LOGICAL_CELLS" "$EXPECTED_SEED_CELLS" <<'PY' \
     2>&1 | tee "$OUTPUT_DIR/artifact-validation.log"
+import hashlib
 import json
+import math
 import pathlib
 import sys
 
 
 root = pathlib.Path(sys.argv[1])
+expected_head = sys.argv[2]
+expected_tree = sys.argv[3]
+expected_plan_sha256 = sys.argv[4]
+expected_logical_cells = int(sys.argv[5])
+expected_seed_cells = int(sys.argv[6])
 with (root / "result.json").open(encoding="utf-8") as handle:
     result = json.load(handle)
+with (root / "plan.json").open(encoding="utf-8") as handle:
+    emitted_plan = json.load(handle)
 
 
 def require(condition, message):
@@ -339,54 +376,187 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
-require(result["schema"] == "flash-kda-pr4683-dense-gfx950-v1", "schema")
-require(result["capture_complete"] is True, "capture is incomplete")
-require(result["performance_gate_evaluated"] is True, "gate not evaluated")
-require(result["performance_gate_passed"] is True, "global gate failed")
-require(result["performance_gate"]["failed_logical_cells"] == [], "failed cells")
-require(len(result["results"]) == 18, "seed-cell count")
-require(result["cross_seed_summary"]["logical_cells"] == 6, "logical-cell count")
-require(result["cross_seed_summary"]["seed_cells"] == 18, "summary seed count")
-require(
-    all(row["performance_gate_passed"] is True for row in result["results"]),
-    "at least one seed-cell gate failed",
-)
-require(result["environment"]["gpu"]["arch"] == "gfx950", "GPU arch")
-require(result["environment"]["gpu"]["compute_units"] == 256, "GPU CU count")
-require(
-    result["environment"]["modules"]["native_jit"][
-        "matches_expected_jit_path"
-    ]
-    is True,
-    "native JIT provenance",
-)
-require(
-    result["environment"]["modules"]["native_jit"]["raw_abi_version"] == 3,
-    "native raw ABI",
-)
-require(
-    result["environment"]["modules"]["native_build_roots"][
-        "both_match_checkout"
-    ]
-    is True,
-    "native build roots",
-)
-require(
-    result["environment"]["modules"]["pr4683_triton_python"][
-        "matches_audited_pr_source"
-    ]
-    is True,
-    "PR #4683 Triton source identity",
-)
-require(
-    result["environment"]["active_route_control_environment"] == {},
-    "route-control environment",
-)
+def finite_number(value):
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+    )
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+schema = "flash-kda-pr4683-dense-gfx950-v1"
+require(result.get("schema") == schema, "result schema")
+require(result.get("capture_complete") is True, "capture is incomplete")
+require(result.get("performance_gate_evaluated") is True, "gate not evaluated")
+require(result.get("performance_gate_passed") is True, "global gate failed")
+
+encoded_plan = json.dumps(
+    emitted_plan, sort_keys=True, separators=(",", ":")
+).encode()
+emitted_plan_sha256 = hashlib.sha256(encoded_plan).hexdigest()
+require(emitted_plan_sha256 == expected_plan_sha256, "emitted plan hash")
+require(result.get("plan_sha256") == expected_plan_sha256, "result plan hash")
+require(result.get("plan") == emitted_plan, "emitted and embedded plans differ")
+plan = emitted_plan
+require(plan.get("schema") == schema, "plan schema")
+require(plan.get("logical_shapes") == expected_logical_cells,
+        "plan logical-cell count")
+require(plan.get("seed_cells") == expected_seed_cells, "plan seed-cell count")
+require(plan.get("seeds") == [42, 43, 44], "plan seed set")
+require(plan.get("warmup_rounds") == 20, "plan warmup")
+require(plan.get("measured_rounds") == 120, "plan measured rounds")
+require(plan.get("bootstrap_resamples") == 10000, "plan bootstrap resamples")
+require(len(plan.get("cells", ())) == expected_seed_cells, "plan cells")
+
+configuration = result.get("configuration", {})
+require(configuration.get("seeds") == [42, 43, 44], "configuration seeds")
+require(configuration.get("warmup_rounds") == 20, "configuration warmup")
+require(configuration.get("measured_rounds") == 120,
+        "configuration measured rounds")
+require(configuration.get("bootstrap_resamples") == 10000,
+        "configuration bootstrap resamples")
+require(configuration.get("minimum_native_speedup") == 1.03,
+        "configuration speedup gate")
+require(configuration.get("execution") == "eager", "configuration execution")
+require(configuration.get("triton_forced_direct_internal_import") is True,
+        "configuration Triton import")
+
+environment = result.get("environment", {})
+git = environment.get("git", {})
+require(git.get("head") == expected_head, "benchmark git HEAD")
+require(git.get("tree") == expected_tree, "benchmark git tree")
+require(git.get("status_porcelain") == "", "benchmark dirty checkout")
+require(environment.get("gpu", {}).get("arch") == "gfx950", "GPU arch")
+require(environment.get("gpu", {}).get("compute_units") == 256,
+        "GPU CU count")
+require(environment.get("gpu", {}).get("visible_device_count") == 1,
+        "visible GPU count")
+require(environment.get("active_route_control_environment") == {},
+        "route-control environment")
+modules = environment.get("modules", {})
+native_jit = modules.get("native_jit", {})
+expected_module = (root / "jit/module_flash_kda_hip.so").resolve()
+require(expected_module.is_file() and expected_module.stat().st_size > 0,
+        "native module is missing")
+module_sha256 = sha256(expected_module)
+require(native_jit.get("matches_expected_jit_path") is True,
+        "native JIT expected-path marker")
+require(native_jit.get("path") == str(expected_module), "native JIT path")
+require(native_jit.get("sha256") == module_sha256, "native JIT SHA256")
+require(native_jit.get("raw_abi_version") == 3, "native raw ABI")
+require(modules.get("native_build_roots", {}).get("both_match_checkout") is True,
+        "native build roots")
+require(modules.get("pr4683_triton_python", {}).get(
+            "matches_audited_pr_source") is True,
+        "PR #4683 Triton source identity")
+
+rows = result.get("results")
+require(isinstance(rows, list) and len(rows) == expected_seed_cells,
+        "result seed-cell count")
+expected_cells = {
+    (cell["logical_name"], cell["seed"]): cell for cell in plan["cells"]
+}
+actual_keys = [(row.get("logical_name"), row.get("seed")) for row in rows]
+require(len(set(actual_keys)) == expected_seed_cells and
+        set(actual_keys) == set(expected_cells),
+        "missing, duplicate, or unexpected seed cell")
+for row in rows:
+    key = (row.get("logical_name"), row.get("seed"))
+    label = f"{key[0]}/seed-{key[1]}"
+    require(row.get("shape") == expected_cells[key]["shape"], f"{label}: shape")
+    require(row.get("execution") == "eager", f"{label}: execution")
+    require(row.get("performance_gate_passed") is True, f"{label}: cell gate")
+    correctness = row.get("correctness", {})
+    rrms = correctness.get("native_vs_triton_output_relative_rms")
+    require(correctness.get("passed") is True and finite_number(rrms) and
+            float(rrms) <= 0.04, f"{label}: correctness")
+    timing = row.get("timing", {})
+    speedup = timing.get("triton_over_native_speedup_from_p50")
+    paired_speedup = timing.get("paired_triton_over_native_speedup_p50")
+    win_fraction = timing.get("native_paired_win_fraction")
+    require(timing.get("measured_rounds") == 120, f"{label}: timing rounds")
+    require(finite_number(speedup) and float(speedup) >= 1.03,
+            f"{label}: p50 speedup")
+    require(finite_number(paired_speedup) and float(paired_speedup) >= 1.03,
+            f"{label}: paired p50 speedup")
+    require(finite_number(win_fraction) and float(win_fraction) > 0.5,
+            f"{label}: paired win fraction")
+    require(len(row.get("raw_timing_samples", ())) == 240,
+            f"{label}: raw timing count")
+    require(len(row.get("paired_rounds", ())) == 120,
+            f"{label}: paired timing count")
+    ci = row.get("paired_bootstrap", {}).get("bootstrap_95pct_ci", {})
+    p50_ci = ci.get("p50_delta_us", ())
+    mean_ci = ci.get("mean_delta_us", ())
+    require(len(p50_ci) == 2 and finite_number(p50_ci[1]) and
+            float(p50_ci[1]) < 0.0, f"{label}: p50 CI")
+    require(len(mean_ci) == 2 and finite_number(mean_ci[1]) and
+            float(mean_ci[1]) < 0.0, f"{label}: mean CI")
+
+summary = result.get("cross_seed_summary", {})
+require(summary.get("logical_cells") == expected_logical_cells,
+        "summary logical-cell count")
+require(summary.get("seed_cells") == expected_seed_cells,
+        "summary seed-cell count")
+require(summary.get("passed_logical_cells") == expected_logical_cells,
+        "summary passed-cell count")
+require(summary.get("failed_logical_cells") == [], "summary failed cells")
+require(len(summary.get("cells", ())) == expected_logical_cells,
+        "summary cell list")
+for cell in summary["cells"]:
+    label = cell.get("logical_name")
+    require(cell.get("performance_gate_passed") is True,
+            f"{label}: cross-seed gate")
+    ci = cell.get("cross_seed_paired_bootstrap", {}).get(
+        "bootstrap_95pct_ci", {}
+    )
+    require(float(ci.get("p50_delta_us", [0.0, 0.0])[1]) < 0.0,
+            f"{label}: cross-seed p50 CI")
+    require(float(ci.get("mean_delta_us", [0.0, 0.0])[1]) < 0.0,
+            f"{label}: cross-seed mean CI")
+gate = result.get("performance_gate", {})
+require(gate.get("evaluated") is True and gate.get("passed") is True,
+        "global gate")
+require(gate.get("failed_logical_cells") == [], "global failed cells")
+
 with (root / "partial-results.jsonl").open(encoding="utf-8") as handle:
     events = [json.loads(line) for line in handle if line.strip()]
-require(events and events[-1]["event"] == "run-complete", "checkpoint terminal event")
-require(events[-1]["complete"] is True, "checkpoint incomplete")
-require(events[-1]["performance_gate_passed"] is True, "checkpoint gate failed")
+require(all(event.get("schema") == schema for event in events),
+        "checkpoint schema")
+require(not any(event.get("event") == "run-failed" for event in events),
+        "checkpoint contains a failure")
+completed = [event for event in events if event.get("event") == "seed-cell-complete"]
+require(len(completed) == expected_seed_cells, "checkpoint seed-cell count")
+completed_keys = [
+    (event.get("result", {}).get("logical_name"),
+     event.get("result", {}).get("seed"))
+    for event in completed
+]
+require(len(set(completed_keys)) == expected_seed_cells and
+        set(completed_keys) == set(expected_cells),
+        "checkpoint seed-cell identity")
+require(sum(event.get("event") == "run-complete" for event in events) == 1,
+        "checkpoint completion count")
+require(events and events[-1].get("event") == "run-complete",
+        "checkpoint terminal event")
+terminal = events[-1]
+require(terminal.get("complete") is True, "checkpoint incomplete")
+require(terminal.get("capture_complete") is True, "checkpoint capture")
+require(terminal.get("result_json_written") is True, "checkpoint result")
+require(terminal.get("completed_seed_cells") == expected_seed_cells,
+        "checkpoint completed count")
+require(terminal.get("total_seed_cells") == expected_seed_cells,
+        "checkpoint total count")
+require(terminal.get("performance_gate_passed") is True,
+        "checkpoint gate failed")
 print("artifact validation: PASS (6/6 logical cells, 18/18 seed cells)")
 PY
 

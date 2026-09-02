@@ -139,14 +139,18 @@ readonly EXPECTED_BENCHMARK_RUNS
 
 cd "$REPO_ROOT"
 repo_is_clean() {
-    git -c safe.directory="$REPO_ROOT" diff --quiet -- &&
-        git -c safe.directory="$REPO_ROOT" diff --cached --quiet -- &&
-        [[ -z $(git -c safe.directory="$REPO_ROOT" \
-            ls-files --others --exclude-standard) ]] &&
-        ! git -c safe.directory="$REPO_ROOT" submodule status --recursive |
-            grep -Eq '^[+U]' &&
-        git -c safe.directory="$REPO_ROOT" submodule foreach --recursive \
-            --quiet 'test -z "$(git status --porcelain --untracked-files=all)"'
+    local submodule_status
+    git -c safe.directory="$REPO_ROOT" diff --quiet -- || return 1
+    git -c safe.directory="$REPO_ROOT" diff --cached --quiet -- || return 1
+    [[ -z $(git -c safe.directory="$REPO_ROOT" \
+        ls-files --others --exclude-standard) ]] || return 1
+    submodule_status="$(git -c safe.directory="$REPO_ROOT" \
+        submodule status --recursive)" || return 1
+    if grep -Eq '^[+U]' <<<"$submodule_status"; then
+        return 1
+    fi
+    git -c safe.directory="$REPO_ROOT" submodule foreach --recursive \
+        --quiet 'test -z "$(git status --porcelain --untracked-files=all)"'
 }
 
 if ! repo_is_clean; then
@@ -577,6 +581,167 @@ def finite_number(value):
     )
 
 
+TRITON_COMPACT_PATTERNS = (
+    "flash_kda_prepare",
+    "flash_kda_segment",
+    "flash_kda_seg_scan",
+)
+TRITON_GVA_STAGE_PATTERNS = (
+    "l2norm_fwd_kernel",
+    "beta_sigmoid_fwd_kernel",
+    "chunk_gate_cumsum_kernel",
+    "chunk_delta_attn_fwd_kernel_intra_sub_chunk",
+    "chunk_delta_attn_fwd_kernel_inter_solve",
+    "recompute_w_u_fwd_kernel",
+    "chunk_gated_delta_rule_fwd_kernel",
+    "chunk_gla_fwd_kernel_o",
+)
+
+
+def canonical_graph_signature(records):
+    entries = [
+        (
+            record.get("node_type"),
+            record.get("name"),
+            tuple(record.get("grid", [])),
+            tuple(record.get("block", [])),
+            record.get("shared_mem_bytes"),
+        )
+        for record in records
+    ]
+    return tuple(sorted(entries, key=repr))
+
+
+def validate_gva_route_audit(route_audit, label):
+    """Recompute every graph-route claim from the serialized HIP records."""
+
+    for key in ("graph_handles", "stream_handles"):
+        handles = route_audit.get(key)
+        require(
+            isinstance(handles, list) and len(handles) == 3,
+            f"{label}: {key} cardinality",
+        )
+        require(
+            all(type(value) is int and value > 0 for value in handles),
+            f"{label}: invalid {key}",
+        )
+        require(len(set(handles)) == 3, f"{label}: aliased {key}")
+
+    audited_backends = route_audit.get("backends")
+    require(isinstance(audited_backends, dict), f"{label}: audited backends")
+    require(
+        set(audited_backends) == {"native", "explicit-native", "triton"},
+        f"{label}: route backend set",
+    )
+
+    records_by_backend = {}
+    for backend in ("native", "explicit-native", "triton"):
+        route = audited_backends[backend]
+        require(isinstance(route, dict), f"{label}/{backend}: route record")
+        records = route.get("records")
+        require(isinstance(records, list) and records,
+                f"{label}/{backend}: missing graph records")
+        require(
+            type(route.get("node_count")) is int
+            and route["node_count"] == len(records),
+            f"{label}/{backend}: node count",
+        )
+
+        kernels = []
+        for expected_index, record in enumerate(records):
+            require(isinstance(record, dict),
+                    f"{label}/{backend}: malformed graph record")
+            require(type(record.get("index")) is int
+                    and record["index"] == expected_index,
+                    f"{label}/{backend}: noncanonical node index")
+            node_type = record.get("node_type")
+            require(type(node_type) is int and node_type >= 0,
+                    f"{label}/{backend}: invalid node type")
+            if node_type != 0:
+                continue
+            name = record.get("name")
+            require(
+                isinstance(name, str) and name not in ("", "<unknown>"),
+                f"{label}/{backend}: unresolved kernel name",
+            )
+            for field in ("grid", "block"):
+                dimensions = record.get(field)
+                require(
+                    isinstance(dimensions, list)
+                    and len(dimensions) == 3
+                    and all(type(value) is int and value > 0
+                            for value in dimensions),
+                    f"{label}/{backend}: invalid {field} for {name}",
+                )
+            shared_mem = record.get("shared_mem_bytes")
+            require(type(shared_mem) is int and shared_mem >= 0,
+                    f"{label}/{backend}: invalid shared memory for {name}")
+            kernels.append(record)
+
+        names = [record["name"] for record in kernels]
+        require(
+            type(route.get("kernel_node_count")) is int
+            and route["kernel_node_count"] == len(kernels)
+            and len(kernels) > 0,
+            f"{label}/{backend}: kernel node count",
+        )
+        require(route.get("kernel_names") == names,
+                f"{label}/{backend}: kernel name witness mismatch")
+
+        lowered = [name.lower() for name in names]
+        has_native_k1 = any("k1_kda_" in name for name in lowered)
+        has_native_k2 = any("k2_kda_" in name for name in lowered)
+        has_compact_triton = any(
+            pattern in name
+            for name in lowered
+            for pattern in TRITON_COMPACT_PATTERNS
+        )
+        gva_stage_matches = {
+            pattern: [index for index, name in enumerate(lowered)
+                      if pattern in name]
+            for pattern in TRITON_GVA_STAGE_PATTERNS
+        }
+        has_any_gva_stage = any(gva_stage_matches.values())
+
+        if backend in ("native", "explicit-native"):
+            require(has_native_k1 and has_native_k2,
+                    f"{label}/{backend}: missing native K1/K2 anchors")
+            require(not has_compact_triton and not has_any_gva_stage,
+                    f"{label}/{backend}: mixed native/Triton graph")
+            expected_route = "native-hip-k1-k2"
+        else:
+            require(not has_native_k1 and not has_native_k2,
+                    f"{label}/{backend}: native kernels in Triton graph")
+            require(not has_compact_triton,
+                    f"{label}/{backend}: compact equal-head Triton graph")
+            missing = [
+                pattern for pattern, matches in gva_stage_matches.items()
+                if not matches
+            ]
+            require(not missing,
+                    f"{label}/{backend}: missing GVA stages {missing}")
+            matched_indices = [
+                index
+                for matches in gva_stage_matches.values()
+                for index in matches
+            ]
+            require(len(set(matched_indices)) >= len(TRITON_GVA_STAGE_PATTERNS),
+                    f"{label}/{backend}: aliased GVA stage anchors")
+            expected_route = "triton-gva-chunk-kda"
+
+        require(route.get("route_verified") is True,
+                f"{label}/{backend}: route proof")
+        require(route.get("route") == expected_route,
+                f"{label}/{backend}: route label")
+        records_by_backend[backend] = records
+
+    require(
+        canonical_graph_signature(records_by_backend["native"])
+        == canonical_graph_signature(records_by_backend["explicit-native"]),
+        f"{label}: public/explicit graph signature mismatch",
+    )
+
+
 def make_case(name, seq_lens, *, resume=False, resume_mask=None):
     if resume_mask is None:
         state = "resume" if resume else "fresh"
@@ -986,6 +1151,9 @@ for entry in manifest:
             route_audit = native.get("graph_route_audit")
             require(isinstance(route_audit, dict),
                     f"{stem}/{case['name']}: graph route witness")
+            validate_gva_route_audit(
+                route_audit, f"{stem}/{case['name']}"
+            )
             require(route_audit.get("all_routes_verified") is True,
                     f"{stem}/{case['name']}: graph routes")
             require(route_audit.get("graphs_independent") is True,
@@ -1005,7 +1173,7 @@ for entry in manifest:
             for route_backend, expected_route in (
                 ("native", "native-hip-k1-k2"),
                 ("explicit-native", "native-hip-k1-k2"),
-                ("triton", "triton-flash-kda-prepare-segment"),
+                ("triton", "triton-gva-chunk-kda"),
             ):
                 route = audited_backends[route_backend]
                 require(route.get("route_verified") is True,

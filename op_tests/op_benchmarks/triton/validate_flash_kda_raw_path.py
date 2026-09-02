@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import itertools
 import os
 import re
 import sys
@@ -962,7 +963,7 @@ def check_context_lds_pipeline_pass_policy_static() -> None:
         "CACHED_OPERANDS, U_FORWARD, V_FORWARD, LDS_PIPELINE_A>",
         "KdaContextMode::kReplay, HO, FP, VL, false, CONTEXT_NW, 0, "
         "CACHED_OPERANDS, U_FORWARD, V_FORWARD, LDS_PIPELINE_REPLAY>",
-        "kHybridDirectMaxChunks, CACHED_OPERANDS, U_FORWARD, V_FORWARD, "
+        "CONTEXT_NW, DIRECT_MAX_CHUNKS, CACHED_OPERANDS, U_FORWARD, V_FORWARD, "
         "LDS_PIPELINE_REPLAY>",
     )
     for specialization in mode_wiring:
@@ -1270,24 +1271,49 @@ def _check_context_direct_prefixless_policy_static(
         "const bool automatic_k3_n4_16k_g64 = "
         "is_k3_n4_16k_nohint_aggregate(p) && group_env == nullptr && "
         "!force_direct && !force_affine && !force_hybrid;",
-        "const bool automatic_k3_n8_16k_g64 = "
+        "const bool automatic_k3_n8_16k_hybrid_g32 = "
         "is_k3_n8_16k_nohint_aggregate(p) && group_env == nullptr && "
         "!force_direct && !force_affine && !force_hybrid;",
         "hinted_direct || automatic_mixed_boundary_direct || "
         "automatic_short_single_direct",
         "const bool hybrid = is_varlen && !hinted_direct && "
-        "!automatic_mixed_boundary_direct",
+        "!automatic_mixed_boundary_direct && "
+        "(automatic_k3_n8_16k_hybrid_g32 ||",
         "automatic_short_single_direct || hinted_direct || "
         "automatic_mixed_boundary_direct",
         "automatic_gva_equal_n4_g32 || automatic_gva_n4_16k_nohint || "
-        "automatic_k3_n4_16k_g64 || automatic_k3_n8_16k_g64;",
-        "automatic_dense_n1_h96_g64 || automatic_k3_n4_16k_g64 || "
-        "automatic_k3_n8_16k_g64",
+        "automatic_k3_n4_16k_g64 || automatic_k3_n8_16k_hybrid_g32;",
+        "else if (automatic_k3_n8_16k_hybrid_g32) { "
+        "group_chunks = 32;",
+        "automatic_k3_n8_16k_hybrid_g32 ? "
+        "kK3N8NoHintDirectMaxChunks : kHybridDirectMaxChunks",
     )
     for contract in resolve_contracts:
         if contract not in resolve_context:
             raise AssertionError(
                 "K3 no-hint mixed-boundary direct route changed: " + contract
+            )
+
+    compact_policy = " ".join(policy.split())
+    direct_threshold_contract = (
+        "static constexpr int kK3N8NoHintDirectMaxChunks = 128;"
+    )
+    if direct_threshold_contract not in compact_policy:
+        raise AssertionError(
+            "K3 N8 hybrid direct threshold changed: "
+            + direct_threshold_contract
+        )
+    launch_contracts = (
+        "if (direct_max_chunks == kK3N8NoHintDirectMaxChunks) "
+        "launch_direct.template operator()< "
+        "kK3N8NoHintDirectMaxChunks>();",
+        "else launch_direct.template operator()< "
+        "kHybridDirectMaxChunks>();",
+    )
+    for contract in launch_contracts:
+        if contract not in compact_policy:
+            raise AssertionError(
+                "K3 N8 hybrid direct-threshold dispatch changed: " + contract
             )
 
     context_launch = cpp_block(
@@ -1948,7 +1974,7 @@ def _check_dense_n1_h96_policy_static(policy: str) -> None:
         "requested_group == 128 || automatic_dense_n1_h96_g128",
         "requested_group == 64 || automatic_equal_n4_g64 || "
         "automatic_dense_n1_h96_g64",
-        "automatic_k3_n4_16k_g64 || automatic_k3_n8_16k_g64 || "
+        "automatic_equal_n4_g64 || automatic_k3_n4_16k_g64 || "
         "automatic_dense_n1_h96_g64",
         "else if (automatic_dense_n1_h96_g128) { group_chunks = 128; }",
     )
@@ -3576,7 +3602,8 @@ def check_gva_whole_route_policy_static() -> None:
         "p.N >= 4 && p.N <= 8 && group_env == nullptr && "
         "!force_direct && !force_affine && !force_hybrid;",
         "return {force_context, group_chunks, "
-        "hybrid ? kHybridDirectMaxChunks : 0, "
+        "hybrid ? (automatic_k3_n8_16k_hybrid_g32 ? "
+        "kK3N8NoHintDirectMaxChunks : kHybridDirectMaxChunks) : 0, "
         "automatic_gva_packed_nw4, automatic_gva_equal_n4_g16};",
         "const bool automatic_gva_packed_nw4 = "
         "a.automatic_gva_packed_nw4 && a.is_gva && a.is_varlen && "
@@ -4059,13 +4086,20 @@ _CONTEXT_PIPELINE_SYMBOL = re.compile(
     r"LNS[0-9]*_14KdaContextModeE(?P<mode>[0-2])E"
     r"Lb(?P<ho>[01])ELb(?P<fp>[01])E"
     r"Lb(?P<vl>[01])ELb(?P<direct>[01])E"
-    r"Li(?P<nw>[0-9]+)ELi[0-9]+E"
+    r"Li(?P<nw>[0-9]+)ELi(?P<direct_max>[0-9]+)E"
     r"Lb(?P<cached>[01])E"
     r"Lb(?P<u_forward>[01])E"
     r"Lb(?P<v_forward>[01])E"
     r"Lb(?P<lds_pipeline>[01])E"
     r"Lb(?P<tail_first>[01])E"
     r"Lb(?P<prefixless>[01])E"
+)
+
+_CONTEXT_SCAN_SYMBOL = re.compile(
+    r"k2_kda_context_affine_scan_nw4_kernelI"
+    r"Li(?P<group>[0-9]+)ELi(?P<nw>[0-9]+)E"
+    r"Lb(?P<hi>[01])ELb(?P<ho>[01])ELb(?P<fp>[01])E"
+    r"Lb(?P<vl>[01])ELb(?P<tight>[01])E"
 )
 
 _K1_FUSED_SYMBOL = re.compile(
@@ -11746,25 +11780,32 @@ def _assert_k3_16k_no_hint_topology(
     sequences: int,
     label: str,
 ) -> None:
-    """Require the complete packed H12 N4/N8 automatic G64 graph."""
+    """Require the packed H12 N4/G64 or N8/G32-hybrid graph."""
 
     if sequences not in (4, 8):
         raise ValueError(f"unsupported K3 16K sequence count: {sequences}")
 
-    expected_nodes = 5 if sequences == 4 else 6
+    expected_nodes = 5 if sequences == 4 else 7
     if len(kernel_names) != expected_nodes:
         raise AssertionError(
             f"{label}: expected exactly {expected_nodes} kernel nodes, got "
             f"{kernel_names!r}"
         )
 
-    prefix_names = [
+    prefix_like_names = [
         name for name in kernel_names if "k1_build_tile_prefix" in name
     ]
-    if len(prefix_names) != 1:
+    prefix_names = [
+        name
+        for name in prefix_like_names
+        if "20k1_build_tile_prefix" in name
+        and "hybrid_g64_compact" not in name
+    ]
+    if len(prefix_names) != 1 or prefix_names != prefix_like_names:
         raise AssertionError(
-            f"{label}: packed metadata must retain one prefix node, got "
-            f"{prefix_names!r}; all kernels={kernel_names!r}"
+            f"{label}: packed metadata must retain exactly the generic prefix "
+            f"node, got prefix-like={prefix_like_names!r}, "
+            f"generic={prefix_names!r}; all kernels={kernel_names!r}"
         )
 
     k1_names = [
@@ -11836,22 +11877,162 @@ def _assert_k3_16k_no_hint_topology(
     else:
         _assert_context_route_topology(
             kernel_names,
-            ((64, 0, 4), (64, 1, 4), (64, 2, 4)),
+            ((1, 2, 4), (32, 0, 4), (32, 1, 4), (32, 2, 4)),
             label,
         )
         if fused_names or ksplit_names:
             raise AssertionError(
-                f"{label}: N8 ordinary G64 graph selected an unvalidated "
+                f"{label}: N8 hybrid G32 graph selected an unvalidated "
                 f"fused/K-split submode: fused={fused_names!r}, "
                 f"ksplit={ksplit_names!r}"
             )
+        direct_matches = []
+        for name in kernel_names:
+            match = _CONTEXT_PIPELINE_SYMBOL.search(name)
+            if (
+                match is not None
+                and int(match.group("group")) == 1
+                and int(match.group("mode")) == 2
+            ):
+                direct_matches.append((name, match))
+        if len(direct_matches) != 1:
+            raise AssertionError(
+                f"{label}: expected one N8 direct replay node, got "
+                f"{[name for name, _ in direct_matches]!r}; "
+                f"all kernels={kernel_names!r}"
+            )
+        direct_name, direct_match = direct_matches[0]
+        expected_direct = {
+            "vl": 1,
+            "direct": 1,
+            "nw": 4,
+            "direct_max": 128,
+            "cached": 1,
+            "u_forward": 1,
+            "v_forward": 1,
+            "lds_pipeline": 0,
+            "tail_first": 0,
+            "prefixless": 0,
+        }
+        direct_mismatches = {
+            field: (int(direct_match.group(field)), expected)
+            for field, expected in expected_direct.items()
+            if int(direct_match.group(field)) != expected
+        }
+        if direct_mismatches:
+            raise AssertionError(
+                f"{label}: N8 direct replay specialization mismatch "
+                f"{direct_mismatches!r}: {direct_name!r}"
+            )
+        expected_context_fields = {
+            (1, 2): {
+                "ho": 1,
+                "fp": 1,
+                "vl": 1,
+                "direct": 1,
+                "nw": 4,
+                "direct_max": 128,
+                "cached": 1,
+                "u_forward": 1,
+                "v_forward": 1,
+                "lds_pipeline": 0,
+                "tail_first": 0,
+                "prefixless": 0,
+            },
+            (32, 0): {
+                "ho": 0,
+                "fp": 0,
+                "vl": 1,
+                "direct": 0,
+                "nw": 4,
+                "direct_max": 0,
+                "cached": 1,
+                "u_forward": 1,
+                "v_forward": 1,
+                "lds_pipeline": 0,
+                "tail_first": 0,
+                "prefixless": 0,
+            },
+            (32, 1): {
+                "ho": 0,
+                "fp": 0,
+                "vl": 1,
+                "direct": 0,
+                "nw": 4,
+                "direct_max": 0,
+                "cached": 1,
+                "u_forward": 1,
+                "v_forward": 1,
+                "lds_pipeline": 0,
+                "tail_first": 0,
+                "prefixless": 0,
+            },
+            (32, 2): {
+                "ho": 1,
+                "fp": 1,
+                "vl": 1,
+                "direct": 0,
+                "nw": 4,
+                "direct_max": 0,
+                "cached": 1,
+                "u_forward": 1,
+                "v_forward": 1,
+                "lds_pipeline": 0,
+                "tail_first": 0,
+                "prefixless": 0,
+            },
+        }
+        decoded_context = {}
+        for name in kernel_names:
+            match = _CONTEXT_PIPELINE_SYMBOL.search(name)
+            if match is None:
+                continue
+            key = (int(match.group("group")), int(match.group("mode")))
+            decoded_context[key] = (name, match)
+        for key, expected_fields in expected_context_fields.items():
+            name, match = decoded_context[key]
+            mismatches = {
+                field: (int(match.group(field)), expected)
+                for field, expected in expected_fields.items()
+                if int(match.group(field)) != expected
+            }
+            if mismatches:
+                raise AssertionError(
+                    f"{label}: N8 context node {key} specialization "
+                    f"mismatch {mismatches!r}: {name!r}"
+                )
         if len(ordinary_scan_names) != 1 or re.search(
-            r"affine_scan_nw4_kernelI(?:Li)?64E(?:Li)?2E",
+            r"affine_scan_nw4_kernelI(?:Li)?32E(?:Li)?2E",
             ordinary_scan_names[0],
         ) is None:
             raise AssertionError(
-                f"{label}: expected one ordinary G64/NW2 affine scan, got "
+                f"{label}: expected one ordinary G32/NW2 affine scan, got "
                 f"{ordinary_scan_names!r}; all kernels={kernel_names!r}"
+            )
+        scan_match = _CONTEXT_SCAN_SYMBOL.search(ordinary_scan_names[0])
+        expected_scan = {
+            "group": 32,
+            "nw": 2,
+            "hi": 1,
+            "ho": 1,
+            "fp": 1,
+            "vl": 1,
+            "tight": 0,
+        }
+        if scan_match is None:
+            raise AssertionError(
+                f"{label}: cannot decode N8 affine scan specialization: "
+                f"{ordinary_scan_names[0]!r}"
+            )
+        scan_mismatches = {
+            field: (int(scan_match.group(field)), expected)
+            for field, expected in expected_scan.items()
+            if int(scan_match.group(field)) != expected
+        }
+        if scan_mismatches:
+            raise AssertionError(
+                f"{label}: N8 affine scan specialization mismatch "
+                f"{scan_mismatches!r}: {ordinary_scan_names[0]!r}"
             )
 
     if any("equal_n4_g64" in name for name in kernel_names):
@@ -12693,7 +12874,7 @@ def check_raw_v3_gva_mixed_boundary_no_hint(
                             0,
                         )
                         torch.cuda.synchronize(device)
-                        assert_numerically_equivalent(
+                        _assert_packed_route_numerically_equivalent(
                             (rollback_out, rollback_final),
                             reference,
                             seq_lens,
@@ -12927,7 +13108,7 @@ def check_raw_v3_mixed_hint_resume_chains(
         os.environ[_CONTEXT_DIRECT_PREFIXLESS_ENV] = "0"
 
     decodes = (1,) * 15
-    steps = (
+    hint_steps = (
         ("no-hint", decodes + (1024,), 0),
         ("exact-hint", (1025,) + decodes, 1025),
         ("over-hint", decodes + (1025,), 1040),
@@ -12940,110 +13121,172 @@ def check_raw_v3_mixed_hint_resume_chains(
 
     try:
         for case_index, (case_label, q_heads, value_heads) in enumerate(cases):
-            candidate_state = None
-            reference_state = None
-            for step_index, (hint_label, seq_lens, bound) in enumerate(steps):
-                maximum = max(seq_lens)
-                if hint_label == "no-hint" and bound != 0:
-                    raise AssertionError("invalid no-hint resume-chain fixture")
-                if hint_label == "exact-hint" and bound != maximum:
-                    raise AssertionError("invalid exact-hint resume-chain fixture")
-                if hint_label == "over-hint" and bound <= maximum:
-                    raise AssertionError("invalid over-hint resume-chain fixture")
-                if bound and not maximum <= bound <= sum(seq_lens):
-                    raise AssertionError("illegal positive resume-chain hint")
+            hint_seed = {
+                label: 20261100 + 100 * case_index + index
+                for index, (label, _, _) in enumerate(hint_steps)
+            }
+            for starts_without_state in (False, True):
+                start_label = (
+                    "fresh-none" if starts_without_state else "materialized"
+                )
+                for order_index, steps in enumerate(
+                    itertools.permutations(hint_steps)
+                ):
+                    candidate_state = None
+                    reference_state = None
+                    for step_index, (
+                        hint_label,
+                        seq_lens,
+                        bound,
+                    ) in enumerate(steps):
+                        maximum = max(seq_lens)
+                        if hint_label == "no-hint" and bound != 0:
+                            raise AssertionError(
+                                "invalid no-hint resume-chain fixture"
+                            )
+                        if hint_label == "exact-hint" and bound != maximum:
+                            raise AssertionError(
+                                "invalid exact-hint resume-chain fixture"
+                            )
+                        if hint_label == "over-hint" and bound <= maximum:
+                            raise AssertionError(
+                                "invalid over-hint resume-chain fixture"
+                            )
+                        if bound and not maximum <= bound <= sum(seq_lens):
+                            raise AssertionError(
+                                "illegal positive resume-chain hint"
+                            )
 
-                base = make_inputs(
-                    seq_lens,
-                    q_heads,
-                    device,
-                    value_heads=value_heads,
-                    packed=True,
-                    state_dtype=torch.float32,
-                    has_initial_state=True,
-                    output_final_state=True,
-                    seed=20261100 + 10 * case_index + step_index,
-                )
-                if candidate_state is None:
-                    candidate_state = base["initial_state"].clone()
-                    reference_state = base["initial_state"].clone()
-                if reference_state is None:
-                    raise AssertionError("missing resume-chain reference state")
+                        has_initial_state = not (
+                            starts_without_state and step_index == 0
+                        )
+                        base = make_inputs(
+                            seq_lens,
+                            q_heads,
+                            device,
+                            value_heads=value_heads,
+                            packed=True,
+                            state_dtype=torch.float32,
+                            has_initial_state=has_initial_state,
+                            output_final_state=True,
+                            seed=hint_seed[hint_label],
+                        )
+                        if step_index == 0 and has_initial_state:
+                            candidate_state = base["initial_state"].clone()
+                            reference_state = base["initial_state"].clone()
+                        if step_index > 0 and (
+                            candidate_state is None or reference_state is None
+                        ):
+                            raise AssertionError(
+                                "missing prior final state in resume chain"
+                            )
 
-                # Do not clone between steps: these are the actual final-state
-                # allocations returned by the preceding candidate/reference
-                # launches, now consumed as the next initial states.
-                candidate_x = {**base, "initial_state": candidate_state}
-                reference_x = {**base, "initial_state": reference_state}
-                candidate_input_copy = candidate_state.clone()
-                reference_input_copy = reference_state.clone()
+                        # After the first launch, consume the actual final-state
+                        # allocations without cloning them between steps.  The
+                        # fresh-none variant proves that a null initial state can
+                        # begin the same mixed-hint resume chain.
+                        candidate_x = {
+                            **base,
+                            "initial_state": (
+                                base["initial_state"]
+                                if candidate_state is None
+                                else candidate_state
+                            ),
+                            "has_initial_state": candidate_state is not None,
+                        }
+                        reference_x = {
+                            **base,
+                            "initial_state": (
+                                base["initial_state"]
+                                if reference_state is None
+                                else reference_state
+                            ),
+                            "has_initial_state": reference_state is not None,
+                        }
+                        candidate_input_copy = (
+                            None
+                            if candidate_state is None
+                            else candidate_state.clone()
+                        )
+                        reference_input_copy = (
+                            None
+                            if reference_state is None
+                            else reference_state.clone()
+                        )
 
-                clear_policy_environment()
-                candidate_out, candidate_final, candidate_workspace = allocate(
-                    candidate_x
-                )
-                candidate_out.fill_(float("nan"))
-                candidate_final.fill_(float("nan"))
-                candidate_workspace.fill_(0x59)
-                raw_v3_call(
-                    module,
-                    candidate_x,
-                    candidate_out,
-                    candidate_final,
-                    candidate_workspace,
-                    bound,
-                )
-                torch.cuda.synchronize(device)
-                assert_bitwise_same(
-                    candidate_state,
-                    candidate_input_copy,
-                    f"raw-v3 {case_label} resume step {step_index} "
-                    f"{hint_label} mutated candidate input state",
-                )
+                        clear_policy_environment()
+                        candidate_out, candidate_final, candidate_workspace = (
+                            allocate(candidate_x)
+                        )
+                        candidate_out.fill_(float("nan"))
+                        candidate_final.fill_(float("nan"))
+                        candidate_workspace.fill_(0x59)
+                        raw_v3_call(
+                            module,
+                            candidate_x,
+                            candidate_out,
+                            candidate_final,
+                            candidate_workspace,
+                            bound,
+                        )
+                        torch.cuda.synchronize(device)
+                        if candidate_input_copy is not None:
+                            assert_bitwise_same(
+                                candidate_state,
+                                candidate_input_copy,
+                                f"raw-v3 {case_label}/{start_label}/order-"
+                                f"{order_index} step {step_index} {hint_label} "
+                                "mutated candidate input state",
+                            )
 
-                configure_general_reference()
-                reference_out, reference_final, reference_workspace = allocate(
-                    reference_x
-                )
-                reference_out.fill_(float("nan"))
-                reference_final.fill_(float("nan"))
-                reference_workspace.fill_(0xA6)
-                raw_v3_call(
-                    module,
-                    reference_x,
-                    reference_out,
-                    reference_final,
-                    reference_workspace,
-                    0,
-                )
-                torch.cuda.synchronize(device)
-                assert_bitwise_same(
-                    reference_state,
-                    reference_input_copy,
-                    f"raw-v3 {case_label} resume step {step_index} "
-                    "forced-general/no-hint mutated reference input state",
-                )
+                        configure_general_reference()
+                        reference_out, reference_final, reference_workspace = (
+                            allocate(reference_x)
+                        )
+                        reference_out.fill_(float("nan"))
+                        reference_final.fill_(float("nan"))
+                        reference_workspace.fill_(0xA6)
+                        raw_v3_call(
+                            module,
+                            reference_x,
+                            reference_out,
+                            reference_final,
+                            reference_workspace,
+                            0,
+                        )
+                        torch.cuda.synchronize(device)
+                        if reference_input_copy is not None:
+                            assert_bitwise_same(
+                                reference_state,
+                                reference_input_copy,
+                                f"raw-v3 {case_label}/{start_label}/order-"
+                                f"{order_index} step {step_index} "
+                                "forced-general/no-hint mutated reference "
+                                "input state",
+                            )
 
-                errors = _assert_packed_route_numerically_equivalent(
-                    (candidate_out, candidate_final),
-                    (reference_out, reference_final),
-                    seq_lens,
-                    f"raw-v3 {case_label} resume step {step_index} "
-                    f"{hint_label} vs forced-general/no-hint chain",
-                    tolerance=1.0e-3,
-                )
+                        errors = _assert_packed_route_numerically_equivalent(
+                            (candidate_out, candidate_final),
+                            (reference_out, reference_final),
+                            seq_lens,
+                            f"raw-v3 {case_label}/{start_label}/order-"
+                            f"{order_index} step {step_index} {hint_label} "
+                            "vs forced-general/no-hint chain",
+                            tolerance=1.0e-3,
+                        )
+                        print(
+                            f"PASS raw-v3 {case_label}/{start_label}/order-"
+                            f"{order_index} step {step_index} {hint_label}: "
+                            "max global/per-sequence output/state rRMS="
+                            f"{errors[0]:.3e}/{errors[1]:.3e}"
+                        )
+                        candidate_state = candidate_final
+                        reference_state = reference_final
+
                 print(
-                    f"PASS raw-v3 {case_label} resume step {step_index} "
-                    f"{hint_label}: max global/per-sequence output/state "
-                    f"rRMS={errors[0]:.3e}/{errors[1]:.3e}"
+                    f"PASS raw-v3 {case_label}/{start_label}: all six "
+                    "no-hint/exact/over-hint resume orders"
                 )
-                candidate_state = candidate_final
-                reference_state = reference_final
-
-            print(
-                f"PASS raw-v3 {case_label} no-hint/exact/over-hint "
-                "three-step resume chain"
-            )
     finally:
         for name, value in previous_env.items():
             if value is None:
@@ -13187,6 +13430,11 @@ def check_raw_v3_k3_16k_no_hint_matrix(
             (17, 63, 255, 1025, 2047, 3073, 4095, 5809),
             8,
         ),
+        (
+            "n8-threshold-2048-2049",
+            (0, 1, 2047, 2048, 2049, 2064, 2065, 6110),
+            8,
+        ),
     )
 
     try:
@@ -13266,6 +13514,31 @@ def check_raw_v3_k3_16k_no_hint_matrix(
                     seq_lens,
                     f"raw-v3 K3 16K {label}/{hint_label} vs forced-general",
                 )
+                if sequences == 8:
+                    clear_policy_environment()
+                    hinted_names = _capture_raw_v3_kernel_names(
+                        module, x, bound
+                    )
+                    leaked_no_hint_nodes = []
+                    for name in hinted_names:
+                        match = _CONTEXT_PIPELINE_SYMBOL.search(name)
+                        if (
+                            match is not None
+                            and int(match.group("direct_max")) == 128
+                        ):
+                            leaked_no_hint_nodes.append(name)
+                    if leaked_no_hint_nodes:
+                        raise AssertionError(
+                            f"raw-v3 K3 16K {label}/{hint_label}: positive "
+                            "hint entered the no-hint N8/128 route: "
+                            f"{leaked_no_hint_nodes!r}"
+                        )
+                    assert_bitwise_same(
+                        x["initial_state"],
+                        initial_copy,
+                        f"raw-v3 K3 16K {label}/{hint_label} graph capture "
+                        "mutated initial state",
+                    )
 
             # Deliberately do not launch with max(seq_lens)-1.  The hint is a
             # caller promise about device-resident cu_seqlens; validating its
@@ -13278,7 +13551,7 @@ def check_raw_v3_k3_16k_no_hint_matrix(
                 f"{no_hint_errors[0]:.3e}/{no_hint_errors[1]:.3e}"
             )
 
-        # The N4 fused/K-split and N8 ordinary G64 routes are separate
+        # The N4 fused/K-split G64 and N8 hybrid-G32/128 routes are separate
         # automatic families.  Capture each on an even layout and replay it
         # on an empty/ragged layout with identical host geometry and pointers.
         graph_cases = (

@@ -583,9 +583,12 @@ def flash_kda_fwd(
     dtype-appropriate floating-point tolerance.  A looser bound is safe but
     can be slower. ``None`` retains the conservative no-hint policy.  The
     tensor-descriptor fallback used during a JIT cold start or while tracing
-    with ``torch.compile`` also uses that safe no-hint policy; subsequent
-    raw-v3 calls consume the supplied bound.  Older native modules without the
-    additive raw-v3 symbol retain their legacy equal-head route.
+    with ``torch.compile`` also uses that safe no-hint policy.  After a cold
+    start, a later eager call can discover raw-v3 and consume the supplied
+    bound.  A descriptor graph captured by ``torch.compile`` remains no-hint
+    on replay; only a later non-compiling call that re-enters this Python
+    wrapper can consume the bound.  Older native modules without the additive
+    raw-v3 symbol retain their legacy equal-head route.
     """
 
     # Validate the public scalar before architecture admission so malformed

@@ -1399,23 +1399,39 @@ def main(argv: list[str] | None = None) -> None:
             },
         )
         raise
+    if payload["performance_gate_passed"] is not True:
+        failed = payload["performance_gate"]["failed_logical_cells"]
+        _append_checkpoint(
+            checkpoint,
+            {
+                "schema": SCHEMA,
+                "event": "run-failed",
+                "complete": False,
+                "capture_complete": True,
+                "result_json_written": True,
+                "phase": "performance-gate",
+                "completed_seed_cells": len(payload["results"]),
+                "total_seed_cells": len(SHAPES) * len(SEEDS),
+                "performance_gate_passed": False,
+                "failed_logical_cells": failed,
+            },
+        )
+        raise SystemExit(
+            "formal PR #4683 performance gate failed for: " + ", ".join(failed)
+        )
     _append_checkpoint(
         checkpoint,
         {
             "schema": SCHEMA,
             "event": "run-complete",
             "complete": True,
+            "capture_complete": True,
             "completed_seed_cells": len(payload["results"]),
             "total_seed_cells": len(SHAPES) * len(SEEDS),
             "result_json_written": True,
-            "performance_gate_passed": payload["performance_gate_passed"],
+            "performance_gate_passed": True,
         },
     )
-    if payload["performance_gate_passed"] is not True:
-        failed = payload["performance_gate"]["failed_logical_cells"]
-        raise SystemExit(
-            "formal PR #4683 performance gate failed for: " + ", ".join(failed)
-        )
 
 
 if __name__ == "__main__":
