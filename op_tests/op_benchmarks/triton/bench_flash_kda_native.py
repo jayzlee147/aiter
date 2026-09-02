@@ -14,6 +14,8 @@ implementations through the public KDA wrapper.  Pass ``--public-k3`` for the
 final production-routing gate: its ``native`` row uses the zero-environment
 public K3 default, proves it is bitwise equal to explicit native, and compares
 it with the same public wrapper forced to Triton.
+Pass ``--formal-public-witness`` with that mode to retain explicit native as an
+untimed graph/immutability witness and record the post-load native DSO identity.
 Pass ``--execution graph`` to compile and check every backend eagerly, capture
 each backend in its own ROCm graph, verify replay against that backend's eager
 result, and time only steady-state ``graph.replay()``.
@@ -1540,6 +1542,8 @@ def _print_environment(heads: int, value_heads: int) -> dict[str, object]:
             "NUMEXPR_NUM_THREADS",
             "GPU_ARCHS",
             "PYTHONNOUSERSITE",
+            "PYTHONHASHSEED",
+            "PYTHONOPTIMIZE",
             "PYTHONPATH",
             "TRITON_CACHE_DIR",
         }
@@ -1764,6 +1768,7 @@ def _write_json(
             "tolerance": args.tolerance,
             "backends": list(args.backend),
             "public_k3": args.public_k3,
+            "formal_public_witness": args.formal_public_witness,
             "omit_max_seqlen_hint": args.omit_max_seqlen_hint,
             "max_seqlen_hint_contract": (
                 "omitted-none"
@@ -1872,6 +1877,17 @@ def _parse_args(argv=None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--formal-public-witness",
+        action="store_true",
+        help=(
+            "For formal graph acceptance, capture an explicit-native witness "
+            "alongside the public default and Triton, audit all graph routes "
+            "and input-state immutability, but time/report only native and "
+            "Triton. Requires --public-k3, --execution graph, and exactly "
+            "--backend native --backend triton."
+        ),
+    )
+    parser.add_argument(
         "--omit-max-seqlen-hint",
         action="store_true",
         help=(
@@ -1955,6 +1971,17 @@ def _parse_args(argv=None) -> argparse.Namespace:
             "--public-k3 requires correctness checking to prove that the "
             "default resolver selected native"
         )
+    if args.formal_public_witness:
+        if not args.public_k3 or args.execution != "graph":
+            parser.error(
+                "--formal-public-witness requires --public-k3 and "
+                "--execution graph"
+            )
+        if args.backend != ["native", "triton"]:
+            parser.error(
+                "--formal-public-witness requires exactly --backend native "
+                "--backend triton, in that order"
+            )
     gate_values = (args.min_speedup, args.min_geomean_speedup)
     if any(
         value is not None and (not math.isfinite(value) or value <= 0.0)
@@ -2020,7 +2047,11 @@ def main(argv=None) -> None:
         )
     rows: list[dict[str, object]] = []
     raw_rows: list[dict[str, object]] = []
-    selected_backends = tuple(args.backend)
+    selected_backends = (
+        ("native", "explicit-native", "triton")
+        if args.formal_public_witness
+        else tuple(args.backend)
+    )
     for case in cases:
         print(
             f"Running {case.name}: N={len(case.seq_lens)}, "
@@ -2042,9 +2073,32 @@ def main(argv=None) -> None:
                 execution=args.execution,
                 public_k3=args.public_k3,
                 omit_max_seqlen_hint=args.omit_max_seqlen_hint,
+                check_input_state_immutability=args.formal_public_witness,
+                timed_selected=(
+                    ("native", "triton")
+                    if args.formal_public_witness
+                    else None
+                ),
+                audit_graph_routes=args.formal_public_witness,
                 raw_rows=raw_rows,
             )
         )
+
+    if args.formal_public_witness:
+        # The preflight metadata above is intentionally collected before any
+        # work.  Refresh it after the timed cases so formal evidence identifies
+        # the exact native DSO that was loaded by this benchmark process.
+        metadata = _print_environment(args.heads, args.value_heads)
+        loaded_modules = metadata.get("loaded_module_identities", {})
+        loaded_native = loaded_modules.get("module_flash_kda_hip", {})
+        if metadata.get("module_sha256") is None or (
+            loaded_native.get("matches_expected_jit_path") is not True
+            or loaded_native.get("sha256") != metadata["module_sha256"]
+        ):
+            raise RuntimeError(
+                "formal public witness did not load module_flash_kda_hip "
+                "from the configured AITER_JIT_DIR"
+            )
 
     _print_rows(rows)
     if args.csv is not None:
