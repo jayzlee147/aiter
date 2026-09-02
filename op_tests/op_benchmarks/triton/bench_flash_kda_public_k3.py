@@ -12,16 +12,17 @@ fail-closed, three-seed performance decision.
 
 The formal matrix has 26 logical cells at each of seeds 42, 43, and 44:
 
-* single lengths 128 through 16K, including 4K, crossed with literal
-  ``initial_state=None`` and nonzero FP32 resume state;
+* single lengths 128 through 16K, including 4K, crossed with materialized
+  zero FP32 and nonzero FP32 resume state;
 * the remaining core batch/ragged cases;
 * all mixed-production cases up to the 64-sequence production limit; and
 * both 1024/1025 mixed-boundary cases.
 
 Every cell uses Hq=HV=12, the zero-environment public wrapper for HIP, forced
-``backend="triton"`` for the comparator, graph replay, exactly 20 warmup rounds,
-120 measured rounds, and 10,000 bootstrap resamples.  The process exits nonzero
-after writing evidence
+``backend="triton"`` for the comparator, a materialized FP32 state tensor, and
+``max_seqlen_upper_bound=None`` exactly as ATOM commit 16c20d3048 calls the
+operator.  It uses graph replay, exactly 20 warmup rounds, 120 measured rounds,
+and 10,000 bootstrap resamples.  The process exits nonzero after writing evidence
 unless every logical cell satisfies all four formal criteria documented in
 ``_performance_gate``.
 
@@ -49,22 +50,23 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-SCHEMA = "flash-kda-public-k3-formal-matrix-v1"
+SCHEMA = "flash-kda-public-k3-formal-matrix-v2"
 SEEDS = (42, 43, 44)
 HEADS = 12
 VALUE_HEADS = 12
 SINGLE_LENGTHS = (128, 256, 512, 1024, 2048, 4096, 8192, 16384)
-STATE_VARIANTS = ("fresh-none", "resume-fp32")
+STATE_VARIANTS = ("fresh-zero-fp32", "resume-fp32")
 MIXED_PRODUCTION_DECODES = (7, 8, 32, 63)
 FORMAL_MIN_WARMUP = 20
 FORMAL_MIN_REPEAT = 120
+FORMAL_MIN_SPEEDUP = 1.05
 BOOTSTRAP_RESAMPLES = 10_000
 BOOTSTRAP_SEED = 20260820
 MAX_TOLERANCE = 0.04
 PUBLIC_BACKEND = "public-zero-env"
 TRITON_BACKEND = "forced-triton"
 EXPECTED_PLAN_SHA256 = (
-    "0aa58828638da3a2d11f7038333e6cce842a39ba0754799c803be6b859ceb464"
+    "9369efb7000c4d4f3d26caab31bd85b3f7679585891561c79518cc17ad71cbd6"
 )
 
 
@@ -101,12 +103,8 @@ class CaseSpec:
     state_variant: str
 
     @property
-    def max_seqlen_upper_bound(self) -> int:
+    def observed_max_seqlen(self) -> int:
         return max(self.seq_lens)
-
-    @property
-    def initial_state_is_none(self) -> bool:
-        return self.state_variant == "fresh-none"
 
 
 def _mixed_source(decodes: int) -> tuple[str, tuple[int, ...], tuple[bool, ...]]:
@@ -148,14 +146,14 @@ def _fixed_specs() -> tuple[CaseSpec, ...]:
     ):
         specs.append(
             CaseSpec(
-                logical_name=f"{source_name}-fresh-none",
+                logical_name=f"{source_name}-fresh-zero-fp32",
                 source_name=source_name,
                 family="core-additional",
                 source_suite="core",
                 seq_lens=seq_lens,
                 resume=False,
                 resume_mask=None,
-                state_variant="fresh-none",
+                state_variant="fresh-zero-fp32",
             )
         )
     specs.append(
@@ -379,7 +377,8 @@ def _paired_raw_rows(
         row["logical_name"] = spec.logical_name
         row["source_case"] = spec.source_name
         row["state_variant"] = spec.state_variant
-        row["initial_state_literal_none"] = spec.initial_state_is_none
+        row["initial_state_literal_none"] = False
+        row["max_seqlen_upper_bound"] = None
         by_round.setdefault(int(row["round"]), []).append(row)
 
     if sorted(by_round) != list(range(repeat)):
@@ -446,7 +445,8 @@ def _summary_rows(
         row["logical_name"] = spec.logical_name
         row["source_case"] = spec.source_name
         row["state_variant"] = spec.state_variant
-        row["initial_state_literal_none"] = spec.initial_state_is_none
+        row["initial_state_literal_none"] = False
+        row["max_seqlen_upper_bound"] = None
         normalized.append(row)
     return normalized
 
@@ -497,7 +497,8 @@ def _run_one(
         tolerance=tolerance,
         execution="graph",
         public_k3=True,
-        initial_state_none=spec.initial_state_is_none,
+        omit_max_seqlen_hint=True,
+        initial_state_none=False,
         check_input_state_immutability=True,
         timed_selected=("native", "triton"),
         audit_graph_routes=True,
@@ -517,6 +518,18 @@ def _run_one(
     if public.get("input_initial_state_unchanged") is not True:
         raise RuntimeError(
             f"{spec.logical_name}: initial-state immutability was not proven"
+        )
+    if (
+        public.get("input_initial_state_literal_none") is not False
+        or public.get("input_initial_state_dtype") != "torch.float32"
+    ):
+        raise RuntimeError(
+            f"{spec.logical_name}: ATOM materialized FP32 state contract failed"
+        )
+    if public.get("max_seqlen_upper_bound", object()) is not None:
+        raise RuntimeError(
+            f"{spec.logical_name}: public benchmark unexpectedly supplied a "
+            "max-seqlen hint"
         )
     route_audit = public.pop("graph_route_audit", None)
     if not isinstance(route_audit, dict) or not all(
@@ -579,18 +592,17 @@ def _run_one(
         "value_heads": VALUE_HEADS,
         "state_variant": spec.state_variant,
         "initial_state_contract": {
-            "literal_none": spec.initial_state_is_none,
-            "materialized_dtype": (
-                None if spec.initial_state_is_none else "torch.float32"
-            ),
+            "literal_none": False,
+            "materialized_dtype": "torch.float32",
             "resume_mask": None if spec.resume_mask is None else list(spec.resume_mask),
         },
-        "max_seqlen_upper_bound": spec.max_seqlen_upper_bound,
+        "max_seqlen_upper_bound": None,
+        "observed_max_seqlen": spec.observed_max_seqlen,
         "execution": "graph",
         "timed_callable_contract": {
             "hip": "chunk_kimi_delta_attn(...), backend keyword omitted",
             "triton": "chunk_kimi_delta_attn(..., backend='triton')",
-            "max_seqlen_upper_bound": spec.max_seqlen_upper_bound,
+            "max_seqlen_upper_bound": None,
         },
         "timing": timing,
         "summary_rows": rows,
@@ -622,7 +634,8 @@ def _gate_checks(speedup: Any, win_fraction: Any, ci_high_us: Any) -> dict[str, 
     ci_value = _finite_float(ci_high_us, "p50 delta CI upper bound")
     checks = {
         "p50_speedup": speedup_value,
-        "p50_speedup_strictly_above_one": speedup_value > 1.0,
+        "minimum_required_speedup": FORMAL_MIN_SPEEDUP,
+        "p50_speedup_meets_minimum": speedup_value >= FORMAL_MIN_SPEEDUP,
         "paired_hip_win_fraction": win_value,
         "paired_hip_win_fraction_strictly_above_half": win_value > 0.5,
         "p50_delta_95pct_ci_high_us": ci_value,
@@ -630,7 +643,7 @@ def _gate_checks(speedup: Any, win_fraction: Any, ci_high_us: Any) -> dict[str, 
     }
     checks["passed"] = all(
         (
-            checks["p50_speedup_strictly_above_one"],
+            checks["p50_speedup_meets_minimum"],
             checks["paired_hip_win_fraction_strictly_above_half"],
             checks["p50_delta_ci_upper_strictly_negative"],
         )
@@ -742,7 +755,8 @@ def _performance_gate(cross_seed_summary: dict[str, Any]) -> dict[str, Any]:
 
     cells = cross_seed_summary["cells"]
     all_p50 = all(
-        cell["worst_seed_speedup_from_p50"] > 1.0 for cell in cells
+        cell["worst_seed_speedup_from_p50"] >= FORMAL_MIN_SPEEDUP
+        for cell in cells
     )
     all_win = all(
         cell["worst_seed_hip_win_fraction"] > 0.5 for cell in cells
@@ -767,12 +781,14 @@ def _performance_gate(cross_seed_summary: dict[str, Any]) -> dict[str, Any]:
         "evaluated": True,
         "passed": passed,
         "performance_definition": (
-            "every logical cell must have HIP faster by p50 in every seed, "
+            "every logical cell must have HIP p50 speedup >= "
+            f"{FORMAL_MIN_SPEEDUP:.2f} in every seed, "
             "paired HIP win fraction > 0.5 in every seed, every per-seed "
             "p50-delta 95% CI upper bound < 0, and cross-seed p50-delta "
             "95% CI upper bound < 0"
         ),
         "all_cells_p50_faster_every_seed": all_p50,
+        "minimum_required_speedup": FORMAL_MIN_SPEEDUP,
         "all_cells_majority_paired_wins_every_seed": all_win,
         "all_per_seed_p50_delta_ci_upper_below_zero": all_seed_ci,
         "all_cross_seed_p50_delta_ci_upper_below_zero": all_cross_ci,
@@ -790,8 +806,9 @@ def _plan(seeds: tuple[int, ...]) -> dict[str, Any]:
             "seed": seed,
             "heads": HEADS,
             "value_heads": VALUE_HEADS,
-            "max_seqlen_upper_bound": spec.max_seqlen_upper_bound,
-            "initial_state_literal_none": spec.initial_state_is_none,
+            "max_seqlen_upper_bound": None,
+            "observed_max_seqlen": spec.observed_max_seqlen,
+            "initial_state_literal_none": False,
         }
         for seed in seeds
         for spec in ALL_SPECS
@@ -826,6 +843,11 @@ def _static_self_test() -> dict[str, Any]:
         STATE_VARIANTS
     ):
         raise RuntimeError("single state cross is incomplete")
+    if any(
+        spec.state_variant == "fresh-zero-fp32" and spec.resume
+        for spec in ALL_SPECS
+    ):
+        raise RuntimeError("fresh-zero state unexpectedly requests resume data")
     if {
         spec.source_name
         for spec in ALL_SPECS
@@ -837,6 +859,12 @@ def _static_self_test() -> dict[str, Any]:
     plan = _plan(SEEDS)
     if plan["total_seed_cells"] != 78:
         raise RuntimeError("formal seed-cell count changed")
+    if any(
+        cell["max_seqlen_upper_bound"] is not None
+        or cell["initial_state_literal_none"] is not False
+        for cell in plan["cells"]
+    ):
+        raise RuntimeError("formal ATOM no-hint/materialized-state contract changed")
     if _plan_sha256(plan) != EXPECTED_PLAN_SHA256:
         raise RuntimeError("formal public-K3 matrix identity changed")
 
@@ -870,10 +898,14 @@ def _static_self_test() -> dict[str, Any]:
         TRITON_BACKEND: {"first": 2, "second": 2},
     }:
         raise RuntimeError("paired timing position balance changed")
-    passing = _gate_checks(1.01, 0.51, -0.01)
+    passing = _gate_checks(FORMAL_MIN_SPEEDUP, 0.51, -0.01)
     if not passing["passed"]:
         raise RuntimeError("strict gate rejected a passing boundary witness")
-    for values in ((1.0, 0.51, -0.01), (1.01, 0.5, -0.01), (1.01, 0.51, 0.0)):
+    for values in (
+        (FORMAL_MIN_SPEEDUP - 0.001, 0.51, -0.01),
+        (FORMAL_MIN_SPEEDUP, 0.5, -0.01),
+        (FORMAL_MIN_SPEEDUP, 0.51, 0.0),
+    ):
         if _gate_checks(*values)["passed"]:
             raise RuntimeError("strict gate accepted an equality boundary")
     return {
@@ -1058,6 +1090,10 @@ def _run_gpu(args: argparse.Namespace) -> dict[str, Any]:
                 "execution": "graph",
                 "public_native_backend_keyword_omitted": True,
                 "public_triton_backend_keyword": "triton",
+                "max_seqlen_upper_bound": None,
+                "max_seqlen_hint_omitted": True,
+                "initial_state_literal_none": False,
+                "initial_state_dtype": "torch.float32",
                 "paired_order": "alternating-position-balanced",
             },
             "plan": _plan(args.seed),

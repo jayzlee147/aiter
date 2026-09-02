@@ -1142,7 +1142,7 @@ def check_context_nw8_policy_static() -> None:
 def _check_context_direct_prefixless_policy_static(
     policy: str, context_kernel: str
 ) -> None:
-    """Audit the exact mixed-boundary prefixless/NW1-flat recipe."""
+    """Audit the hinted and no-hint mixed-boundary direct recipe."""
 
     common_path = (
         _REPO_ROOT / "csrc/kernels/flash_kda/hip_launch_common.cu"
@@ -1172,6 +1172,47 @@ def _check_context_direct_prefixless_policy_static(
                     return " ".join(source[start : position + 1].split())
         raise AssertionError(f"cannot delimit C++ block {signature!r}")
 
+    aggregate_guard = cpp_block(
+        policy, "static bool is_k3_mixed_boundary_nohint_aggregate("
+    )
+    aggregate_contracts = (
+        "const bool supported_heads = "
+        "(p.H_q == p.H && p.H == 12) || "
+        "(p.H_q == 2 && (p.H == 4 || p.H == 8));",
+        "p.max_seqlen_upper_bound == 0",
+        "supported_heads",
+        "p.cu_seqlens != nullptr",
+        "p.N == 16",
+        "(p.T_total == 15 + 1024 || p.T_total == 15 + 1025)",
+        "p.total_tiles == 81",
+    )
+    for contract in aggregate_contracts:
+        if contract not in aggregate_guard:
+            raise AssertionError(
+                "K3 no-hint mixed-boundary aggregate changed: " + contract
+            )
+
+    for helper, sequences, total_tiles in (
+        ("is_k3_n4_16k_nohint_aggregate", 4, 1028),
+        ("is_k3_n8_16k_nohint_aggregate", 8, 1032),
+    ):
+        aggregate_guard = cpp_block(policy, f"static bool {helper}(")
+        aggregate_contracts = (
+            "p.max_seqlen_upper_bound == 0",
+            "p.H_q == p.H",
+            "p.H == 12",
+            "p.cu_seqlens != nullptr",
+            f"p.N == {sequences}",
+            "p.T_total == 16384",
+            f"p.total_tiles == {total_tiles}",
+        )
+        for contract in aggregate_contracts:
+            if contract not in aggregate_guard:
+                raise AssertionError(
+                    f"K3 no-hint N{sequences}/16K aggregate changed: "
+                    + contract
+                )
+
     prefixless_guard = cpp_block(
         policy, "static bool context_direct_prefixless_enabled("
     )
@@ -1179,17 +1220,24 @@ def _check_context_direct_prefixless_policy_static(
         f'std::getenv( "{_CONTEXT_DIRECT_PREFIXLESS_ENV}")',
         "const bool explicit_prefixless = value != nullptr && "
         "value[0] == '1' && value[1] == '\\0';",
-        "const bool automatic_mixed_boundary_prefixless = "
-        "value == nullptr && p.cu_seqlens != nullptr && p.N == 16",
+        "const bool hinted_mixed_boundary = "
+        "p.cu_seqlens != nullptr && p.N == 16",
         "(p.max_seqlen_upper_bound == 1024 || "
         "p.max_seqlen_upper_bound == 1025)",
         "p.T_total == p.max_seqlen_upper_bound + 15",
-        "p.total_tiles == 81",
+        "p.total_tiles == 81;",
+        "const bool automatic_mixed_boundary_prefixless = "
+        "value == nullptr && (hinted_mixed_boundary || "
+        "is_k3_mixed_boundary_nohint_aggregate(p))",
         'std::getenv( "FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS") == nullptr',
         f'std::getenv( "{_CONTEXT_DIRECT_NW1_FLAT_ENV}") == nullptr',
         'std::getenv( "FLASH_KDA_GFX950_CONTEXT_DIRECT_NW") == nullptr',
         "if (!explicit_prefixless && "
         "!automatic_mixed_boundary_prefixless) return false;",
+        "const bool supported_head_layout = p.H_q == p.H || "
+        "(automatic_mixed_boundary_prefixless && p.H_q == 2 && "
+        "(p.H == 4 || p.H == 8));",
+        "return supported_head_layout && p.cu_seqlens != nullptr",
         "default_k2_route == K2DefaultRoute::context_parallel",
         "route.group_chunks == 0 && route.direct_max_chunks == 0",
         'std::getenv("FLASH_KDA_K2") == nullptr',
@@ -1211,6 +1259,36 @@ def _check_context_direct_prefixless_policy_static(
                 f"explicit {route} value"
             )
 
+    resolve_context = cpp_block(
+        policy, "static ContextRouteConfig resolve_context_route("
+    )
+    resolve_contracts = (
+        "const bool automatic_mixed_boundary_direct = "
+        "is_k3_mixed_boundary_nohint_aggregate(p) && group_env == nullptr && "
+        "!force_direct && !force_affine && !force_hybrid;",
+        "const bool automatic_k3_n4_16k_g64 = "
+        "is_k3_n4_16k_nohint_aggregate(p) && group_env == nullptr && "
+        "!force_direct && !force_affine && !force_hybrid;",
+        "const bool automatic_k3_n8_16k_g64 = "
+        "is_k3_n8_16k_nohint_aggregate(p) && group_env == nullptr && "
+        "!force_direct && !force_affine && !force_hybrid;",
+        "hinted_direct || automatic_mixed_boundary_direct || "
+        "automatic_short_single_direct",
+        "const bool hybrid = is_varlen && !hinted_direct && "
+        "!automatic_mixed_boundary_direct",
+        "automatic_short_single_direct || hinted_direct || "
+        "automatic_mixed_boundary_direct",
+        "automatic_gva_equal_n4_g32 || automatic_gva_n4_16k_nohint || "
+        "automatic_k3_n4_16k_g64 || automatic_k3_n8_16k_g64;",
+        "automatic_dense_n1_h96_g64 || automatic_k3_n4_16k_g64 || "
+        "automatic_k3_n8_16k_g64",
+    )
+    for contract in resolve_contracts:
+        if contract not in resolve_context:
+            raise AssertionError(
+                "K3 no-hint mixed-boundary direct route changed: " + contract
+            )
+
     context_launch = cpp_block(
         policy,
         "static void launch_context_parallel(const ContextParallelLaunch& a)",
@@ -1226,7 +1304,8 @@ def _check_context_direct_prefixless_policy_static(
     flat_guard = context_launch[flat_guard_start : flat_guard_end + 1]
     flat_guard_contracts = (
         "const bool automatic_mixed_boundary_nw1_flat = "
-        "a.packed_direct_prefixless && a.is_varlen && a.N == 16",
+        "!a.is_gva && a.packed_direct_prefixless && "
+        "a.is_varlen && a.N == 16",
         "a.total_tiles == 81 && "
         "(a.T_seq == 64 || a.T_seq == 65)",
         f'std::getenv( "{_CONTEXT_DIRECT_PREFIXLESS_ENV}") == nullptr',
@@ -1248,6 +1327,38 @@ def _check_context_direct_prefixless_policy_static(
                 f"explicit {route} value"
             )
 
+    gva_nw1_start = context_launch.find(
+        "const bool automatic_gva_mixed_boundary_nw1 ="
+    )
+    gva_nw1_end = context_launch.find(";", gva_nw1_start)
+    if gva_nw1_start < 0 or gva_nw1_end < 0:
+        raise AssertionError(
+            "policy is missing the GVA mixed-boundary NW1 launch guard"
+        )
+    gva_nw1_guard = context_launch[gva_nw1_start : gva_nw1_end + 1]
+    for contract in (
+        "a.is_gva && a.packed_direct_prefixless && a.is_varlen",
+        "a.N == 16 && (a.H == 4 || a.H == 8)",
+        "a.total_tiles == 81",
+        "(a.T_seq == 64 || a.T_seq == 65)",
+        f'std::getenv( "{_CONTEXT_DIRECT_PREFIXLESS_ENV}") == nullptr',
+        'std::getenv( "FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS") == nullptr',
+        "direct_nw_value == nullptr && nw1_flat_value == nullptr",
+    ):
+        if contract not in gva_nw1_guard:
+            raise AssertionError(
+                "GVA mixed-boundary NW1 guard changed: " + contract
+            )
+    for route in ("DIRECT", "AFFINE", "HYBRID"):
+        contract = (
+            f'std::getenv("FLASH_KDA_GFX950_CONTEXT_{route}") == nullptr'
+        )
+        if contract not in gva_nw1_guard:
+            raise AssertionError(
+                "automatic GVA NW1 guard no longer rolls back explicit "
+                f"{route} values"
+            )
+
     flat_dispatch_contracts = (
         "const char* nw1_flat_value = std::getenv( "
         f'"{_CONTEXT_DIRECT_NW1_FLAT_ENV}");',
@@ -1255,6 +1366,7 @@ def _check_context_direct_prefixless_policy_static(
         "automatic_short_single_nw1_flat || "
         "automatic_mixed_boundary_nw1_flat",
         "use_nw1_flat_tail_first && !use_deep_n4_nw4",
+        "automatic_gva_mixed_boundary_nw1 ? 1",
         "if (a.packed_direct_prefixless) "
         "dispatch_flat.template operator()<true, false>();",
         "VL && !PACKED_DIRECT_PREFIXLESS ? a.tile_prefix : nullptr",
@@ -1267,6 +1379,9 @@ def _check_context_direct_prefixless_policy_static(
 
     k1_launch = cpp_block(policy, "static void launch_bt16_k1(")
     k1_contracts = (
+        "if (a.H_q != a.H)",
+        "if (a.packed_direct_prefixless) "
+        "launch_gva.template operator()<true, true>();",
         "if (a.packed_direct_prefixless) "
         "dispatch.template operator()<true, true, false>();",
         "dispatch.template operator()<true, false, false>();",
@@ -1279,7 +1394,7 @@ def _check_context_direct_prefixless_policy_static(
             )
 
     common_contracts = (
-        "use_context_parallel && !is_gva && is_varlen && "
+        "use_context_parallel && is_varlen && "
         "!use_context_equal_dense_n4_g64 && "
         "policy.context_direct_prefixless",
         "policy.context_group_chunks == 0 && "
@@ -1327,10 +1442,11 @@ def _check_context_direct_prefixless_policy_static(
 
     def selected(
         seq_lens: tuple[int, ...],
-        bound: int,
+        bound: int | None,
         total_tiles: int,
         *,
         prefixless_value: str | None = None,
+        group_value: str | None = None,
         direct_nw_value: str | None = None,
         nw1_flat_value: str | None = None,
         route_values: tuple[str | None, str | None, str | None] = (
@@ -1339,13 +1455,29 @@ def _check_context_direct_prefixless_policy_static(
             None,
         ),
         pure_direct: bool = True,
+        q_heads: int = 12,
+        value_heads: int = 12,
     ) -> tuple[bool, bool]:
-        automatic_prefixless = (
-            prefixless_value is None
+        equal_heads = q_heads == value_heads
+        supported_gva = q_heads == 2 and value_heads in (4, 8)
+        hinted = (
+            (equal_heads or supported_gva)
             and len(seq_lens) == 16
             and bound in (1024, 1025)
             and sum(seq_lens) == bound + 15
             and total_tiles == 81
+        )
+        nohint = (
+            bound is None
+            and ((equal_heads and value_heads == 12) or supported_gva)
+            and len(seq_lens) == 16
+            and sum(seq_lens) in (15 + 1024, 15 + 1025)
+            and total_tiles == 81
+        )
+        automatic_prefixless = (
+            prefixless_value is None
+            and (hinted or nohint)
+            and group_value is None
             and direct_nw_value is None
             and nw1_flat_value is None
             and all(value is None for value in route_values)
@@ -1353,6 +1485,7 @@ def _check_context_direct_prefixless_policy_static(
         )
         prefixless = (
             (prefixless_value == "1" or automatic_prefixless)
+            and (equal_heads or (automatic_prefixless and supported_gva))
             and 0 < len(seq_lens) <= 16
             and pure_direct
         )
@@ -1367,12 +1500,14 @@ def _check_context_direct_prefixless_policy_static(
             and nw1_flat_value is None
             and all(value is None for value in route_values)
             and pure_direct
+            and equal_heads
         )
         return prefixless, automatic_flat
 
     # These concrete fixtures share the admitted aggregate signature.  The
-    # host guard sees only N/bound/total/tile-upper; general prefixless device
+    # host guard sees only N/total/tile-upper; general prefixless device
     # mappings, not admission, are responsible for the actual distribution.
+    # Cover both the legacy hinted call and ATOM's omitted-hint call.
     for bound in (1024, 1025):
         for prefill_first in (False, True):
             decodes = (1,) * 15
@@ -1381,26 +1516,46 @@ def _check_context_direct_prefixless_policy_static(
                 if prefill_first
                 else decodes + (bound,)
             )
-            if selected(seq_lens, bound, 81) != (True, True):
-                raise AssertionError(
-                    "static mixed-boundary production recipe rejected "
-                    f"bound={bound}, prefill_first={prefill_first}"
-                )
+            for supplied_bound in (bound, None):
+                if selected(seq_lens, supplied_bound, 81) != (True, True):
+                    raise AssertionError(
+                        "static mixed-boundary production recipe rejected "
+                        f"bound={supplied_bound}, "
+                        f"prefill_first={prefill_first}"
+                    )
+
+    # Admission is intentionally aggregate-only.  Exercise legal packed
+    # distributions unlike the serving fixture so a future test helper does
+    # not accidentally turn the no-hint rule into an unverified equality or
+    # max-length assumption.
+    for aggregate_shape in (
+        (0,) * 15 + (1039,),
+        (64,) * 15 + (79,),
+        (65,) * 16,
+    ):
+        if selected(aggregate_shape, None, 81) != (True, True):
+            raise AssertionError(
+                "no-hint mixed-boundary aggregate rejected a legal packed "
+                f"distribution: {aggregate_shape}"
+            )
 
     target = (1,) * 15 + (1025,)
     rollbacks = (
         {"prefixless_value": "0"},
+        {"group_value": "64"},
         {"direct_nw_value": "1"},
         {"nw1_flat_value": "1"},
         {"route_values": ("0", None, None)},
         {"route_values": (None, "true", None)},
         {"route_values": (None, None, "01")},
     )
-    for override in rollbacks:
-        if selected(target, 1025, 81, **override) != (False, False):
-            raise AssertionError(
-                f"automatic mixed-boundary recipe ignored {override}"
-            )
+    for supplied_bound in (1025, None):
+        for override in rollbacks:
+            if selected(target, supplied_bound, 81, **override) != (False, False):
+                raise AssertionError(
+                    "automatic mixed-boundary recipe ignored "
+                    f"bound={supplied_bound}, override={override}"
+                )
     if selected(target, 1025, 81, prefixless_value="1") != (True, False):
         raise AssertionError(
             "explicit PREFIXLESS must select mapping without auto NW1-flat"
@@ -1420,6 +1575,19 @@ def _check_context_direct_prefixless_policy_static(
         ordinary, 65, 80, prefixless_value="1", pure_direct=False
     )[0]:
         raise AssertionError("prefixless escaped its pure-direct route guard")
+    for value_heads in (4, 8):
+        if selected(
+            target, None, 81, q_heads=2, value_heads=value_heads
+        ) != (True, False):
+            raise AssertionError(
+                f"no-hint GVA Hq2/Hv{value_heads} mixed route changed"
+            )
+    if selected(target, None, 81, q_heads=2, value_heads=6) != (False, False):
+        raise AssertionError("no-hint K3 specialization admitted unsupported GVA")
+    if selected(target, None, 81, q_heads=2, value_heads=2) != (False, False):
+        raise AssertionError("no-hint K3 specialization admitted non-H12 heads")
+    if selected(target, 1025, 81, q_heads=2, value_heads=2) != (True, True):
+        raise AssertionError("legacy hinted mixed-boundary route became H12-only")
 
 
 def check_context_direct_tail_first_policy_static() -> None:
@@ -1650,7 +1818,7 @@ def _check_context_equal_dense_n4_g64_policy_static(
         "a.equal_dense_n4_g64 && "
         "!a.is_varlen && a.N == 4 && a.T_seq == 4096 && a.NT == 256 && "
         "a.total_tiles == 1024",
-        "packed_automatic_equal_n4_g64 || equal_dense_n4_g64",
+        "packed_automatic_n4_16k_g64 || equal_dense_n4_g64",
         "(!a.is_varlen && a.N == 1) || equal_dense_n4_g64",
         "k2_kda_context_affine_ab_fused_equal_n4_g64_nw4_kernel",
         "k2_kda_context_affine_ab_fused_equal_n4_g64_stage_early_nw4_kernel",
@@ -1726,6 +1894,142 @@ def _check_context_equal_dense_n4_g64_policy_static(
             )
 
 
+def _check_dense_n1_h96_policy_static(policy: str) -> None:
+    """Pin the zero-environment dense H96 8K/16K route graduation."""
+
+    compact = " ".join(policy.split())
+
+    def statement(needle: str) -> str:
+        start = compact.find(needle)
+        end = compact.find(";", start)
+        if start < 0 or end < 0:
+            raise AssertionError(f"policy is missing H96 statement {needle!r}")
+        return compact[start : end + 1]
+
+    route_guards = (
+        (
+            "const bool automatic_dense_n1_h96_g64 =",
+            "T_seq == 8192",
+        ),
+        (
+            "const bool automatic_dense_n1_h96_g128 =",
+            "T_seq == 16384",
+        ),
+    )
+    for needle, token_guard in route_guards:
+        guard = statement(needle)
+        for contract in (
+            "!is_varlen",
+            "!is_gva",
+            "p.N == 1",
+            "p.H == 96",
+            token_guard,
+            "group_env == nullptr",
+            "!force_direct && !force_affine && !force_hybrid",
+        ):
+            if contract not in guard:
+                raise AssertionError(
+                    f"dense-N1 H96 route {needle!r} lost guard: {contract}"
+                )
+
+    group_contracts = (
+        "requested_group == 128 || automatic_dense_n1_h96_g128",
+        "requested_group == 64 || automatic_equal_n4_g64 || "
+        "automatic_dense_n1_h96_g64",
+        "automatic_k3_n4_16k_g64 || automatic_k3_n8_16k_g64 || "
+        "automatic_dense_n1_h96_g64",
+        "else if (automatic_dense_n1_h96_g128) { group_chunks = 128; }",
+    )
+    for contract in group_contracts:
+        if contract not in compact:
+            raise AssertionError(
+                "dense-N1 H96 route/group selection changed: " + contract
+            )
+
+    fused_guard = statement(
+        "const bool automatic_dense_n1_h96_fused ="
+    )
+    fused_contracts = (
+        "!a.is_gva",
+        "!a.is_varlen",
+        "a.N == 1",
+        "a.H == 96",
+        "a.T_seq == 8192 && group_chunks == 64",
+        "a.T_seq == 16384 && group_chunks == 128",
+        'std::getenv("FLASH_KDA_GFX950_CONTEXT_DIRECT") == nullptr',
+        'std::getenv("FLASH_KDA_GFX950_CONTEXT_AFFINE") == nullptr',
+        'std::getenv("FLASH_KDA_GFX950_CONTEXT_HYBRID") == nullptr',
+        'std::getenv("FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS") == nullptr',
+        'std::getenv("FLASH_KDA_GFX950_CONTEXT_AFFINE_AB_FUSED") == nullptr',
+    )
+    for contract in fused_contracts:
+        if contract not in fused_guard:
+            raise AssertionError(
+                "dense-N1 H96 fused A/B guard changed: " + contract
+            )
+    if "automatic_dense_n1_h96_fused ||" not in statement(
+        "const bool fuse_affine_ab ="
+    ):
+        raise AssertionError(
+            "dense-N1 H96 candidate no longer enables the fused A/B producer"
+        )
+
+    def resolve(
+        tokens: int,
+        *,
+        heads: int = 96,
+        q_heads: int = 96,
+        packed: bool = False,
+        sequences: int = 1,
+        route_override: bool = False,
+        group_override: bool = False,
+        fused_override: bool = False,
+    ) -> tuple[int | None, bool]:
+        eligible = (
+            not packed
+            and heads == q_heads
+            and sequences == 1
+            and heads == 96
+            and tokens in (8192, 16384)
+            and not route_override
+            and not group_override
+        )
+        group = {8192: 64, 16384: 128}.get(tokens) if eligible else None
+        fused = eligible and not fused_override
+        return group, fused
+
+    if resolve(8192) != (64, True):
+        raise AssertionError("dense-N1 H96 T=8192 did not select fused G64")
+    if resolve(16384) != (128, True):
+        raise AssertionError("dense-N1 H96 T=16384 did not select fused G128")
+    for mismatch in (
+        {"tokens": 8191},
+        {"tokens": 8193},
+        {"tokens": 16383},
+        {"tokens": 16385},
+        {"tokens": 8192, "heads": 95, "q_heads": 95},
+        {"tokens": 8192, "q_heads": 48},
+        {"tokens": 8192, "packed": True},
+        {"tokens": 8192, "sequences": 2},
+        {"tokens": 8192, "route_override": True},
+        {"tokens": 8192, "group_override": True},
+    ):
+        tokens = int(mismatch.pop("tokens"))
+        if resolve(tokens, **mismatch) != (None, False):
+            raise AssertionError(
+                f"dense-N1 H96 exact route admitted fallback: "
+                f"tokens={tokens}, options={mismatch}"
+            )
+    if resolve(8192, fused_override=True) != (64, False):
+        raise AssertionError(
+            "explicit fused-A/B setting did not suppress H96 auto fusion"
+        )
+    print(
+        "PASS static dense-N1 H96 exact 8K/G64 and 16K/G128 routes, "
+        "zero-environment guards, fused A/B selection, and overrides"
+    )
+
+
 def check_context_affine_ab_fused_policy_static() -> None:
     """Audit packed/dense-N1 fused B/A parsers and complete fallback guards."""
 
@@ -1791,7 +2095,7 @@ def check_context_affine_ab_fused_policy_static() -> None:
             "policy is missing the established context launcher"
         )
     automatic_guard_start = compact.find(
-        "const bool packed_automatic_equal_n4_g64 =", context_launch_start
+        "const bool packed_automatic_n4_16k_g64 =", context_launch_start
     )
     automatic_guard_end = compact.find(";", automatic_guard_start)
     if automatic_guard_start < 0 or automatic_guard_end < 0:
@@ -1802,7 +2106,7 @@ def check_context_affine_ab_fused_policy_static() -> None:
         automatic_guard_start : automatic_guard_end + 1
     ]
     automatic_guard_contracts = (
-        "packed_automatic_equal_n4_g64 = "
+        "packed_automatic_n4_16k_g64 = "
         "!a.is_gva && a.is_varlen && a.N == 4 && a.T_seq == 4096",
         "group_chunks == 64 && direct_max_chunks == 0",
         '!env_exact("FLASH_KDA_GFX950_CONTEXT_DIRECT", "1")',
@@ -1819,7 +2123,8 @@ def check_context_affine_ab_fused_policy_static() -> None:
     effective_guard = (
         "const bool fuse_affine_ab = "
         "(context_affine_ab_fused_enabled(group_chunks) || "
-        "(automatic_equal_n4_g64 && std::getenv( "
+        "automatic_dense_n1_h96_fused || "
+        "(automatic_n4_16k_g64 && std::getenv( "
         '"FLASH_KDA_GFX950_CONTEXT_AFFINE_AB_FUSED") == nullptr)) && '
         "!direct && (a.is_varlen || (!a.is_varlen && a.N == 1)) && "
         "!context_nw8 && "
@@ -2255,6 +2560,7 @@ def check_context_affine_ab_fused_policy_static() -> None:
         raise AssertionError(
             "replay-only LDS pipeline incorrectly disabled stage-early producer"
         )
+    _check_dense_n1_h96_policy_static(policy)
     _check_context_equal_dense_n4_g64_policy_static(policy, kernel)
     print(
         "PASS static packed/dense-N1/equal-dense-N4 affine B/A fused and "
@@ -2322,8 +2628,8 @@ def check_context_scan_ksplit_policy_static() -> None:
         raise AssertionError("K-split prefetch-b parser is not exact-'1'")
 
     automatic_guard = (
-        "const bool automatic_equal_n4_g64_ksplit = "
-        "automatic_equal_n4_g64 && scan_nw_env == nullptr && "
+        "const bool automatic_n4_16k_g64_ksplit = "
+        "automatic_n4_16k_g64 && scan_nw_env == nullptr && "
         "std::getenv( "
         '"FLASH_KDA_GFX950_CONTEXT_SCAN_KSPLIT") == nullptr;'
     )
@@ -2334,7 +2640,7 @@ def check_context_scan_ksplit_policy_static() -> None:
     effective_guard = (
         "const bool scan_ksplit = "
         "(context_scan_ksplit_enabled() || "
-        "automatic_equal_n4_g64_ksplit) && "
+        "automatic_n4_16k_g64_ksplit) && "
         "!direct && !hybrid && scan_nw == 2 && !scan_b_stream && "
         "!scan_a_gll && !scan_b_phased && "
         "(a.is_varlen || (!a.is_varlen && a.N == 1) || "
@@ -3202,12 +3508,17 @@ def check_gva_whole_route_policy_static() -> None:
     k1_contracts = (
         "bool DENSE_N1_ALL_FULL_C16, bool GVA = false>",
         "static_assert(!GVA || (!CACHE_CONTEXT_OPERANDS && "
-        "!PUBLISH_ACTIVATED_BETA && !PACKED_DIRECT_PREFIXLESS && "
-        "!DENSE_N1_ALL_FULL_C16)",
-        "if (a.H_q != a.H) { auto launch_gva = [&]<bool VL>()",
-        "VL, true, false, false, false, false, false, true>(a, grid);",
-        "VL, true, true, false, false, false, false, true>(a, grid);",
-        "VL, false, true, false, false, false, false, true>(a, grid);",
+        "!PUBLISH_ACTIVATED_BETA && !DENSE_N1_ALL_FULL_C16)",
+        "if (a.H_q != a.H) { auto launch_gva = [&]<bool VL, "
+        "bool PACKED_DIRECT_PREFIXLESS>()",
+        "VL, true, false, false, false, PACKED_DIRECT_PREFIXLESS, "
+        "false, true>(a, grid);",
+        "VL, true, true, false, false, PACKED_DIRECT_PREFIXLESS, "
+        "false, true>(a, grid);",
+        "VL, false, true, false, false, PACKED_DIRECT_PREFIXLESS, "
+        "false, true>(a, grid);",
+        "if (a.packed_direct_prefixless) "
+        "launch_gva.template operator()<true, true>();",
         "a.scale, a.gate_scale, a.T_seq, a.H, a.H_q",
         "if constexpr (GVA) { const int hq = h / (H / H_q); "
         "qk_off = (int64_t(t0 + vec_m) * H_q + hq) * D + vec_d0; }",
@@ -3218,13 +3529,23 @@ def check_gva_whole_route_policy_static() -> None:
 
     route_contracts = (
         "const bool is_gva = p.H_q != p.H;",
+        "const bool automatic_gva_n4_16k_nohint = "
+        "p.max_seqlen_upper_bound == 0 && is_varlen && is_gva && "
+        "p.H_q == 2 && (p.H == 4 || p.H == 8) && p.N == 4 && "
+        "p.T_total == 16384 && p.total_tiles == 1028",
         "const bool automatic_equal_n4_g64 = "
         "!is_gva && hinted_equal_lengths && p.N == 4",
         "const bool automatic_gva_equal_n4_g16 = "
-        "is_gva && hinted_equal_lengths && p.N == 4",
+        "is_gva && p.H_q == 2 && p.H == 4 && "
+        "hinted_equal_lengths && p.N == 4",
+        "const bool automatic_gva_equal_n4_g32 = "
+        "is_gva && p.H_q == 2 && p.H == 8 && "
+        "hinted_equal_lengths && p.N == 4",
         "hinted_bound == 4096 && p.T_total == 4 * 4096 && "
         "group_env == nullptr && "
         "!force_direct && !force_affine && !force_hybrid;",
+        "automatic_gva_equal_n4_g32 || automatic_gva_n4_16k_nohint || "
+        "automatic_k3_n4_16k_g64",
         "const bool hinted_n8_g64 = !is_gva && has_length_hint && "
         "p.N == 8 && hinted_bound >= 4096;",
         "requested_g16 || automatic_dense_g16 || "
@@ -3254,11 +3575,59 @@ def check_gva_whole_route_policy_static() -> None:
         if contract not in compact_policy:
             raise AssertionError("GVA context-route contract changed: " + contract)
 
+    def policy_statement(needle: str) -> str:
+        start = compact_policy.find(needle)
+        end = compact_policy.find(";", start)
+        if start < 0 or end < 0:
+            raise AssertionError(f"policy is missing GVA statement {needle!r}")
+        return compact_policy[start : end + 1]
+
+    nohint_guard = policy_statement(
+        "const bool automatic_gva_n4_16k_nohint ="
+    )
+    for contract in (
+        "p.max_seqlen_upper_bound == 0",
+        "is_varlen",
+        "is_gva",
+        "p.H_q == 2",
+        "(p.H == 4 || p.H == 8)",
+        "p.N == 4",
+        "p.T_total == 16384",
+        "p.total_tiles == 1028",
+        "group_env == nullptr",
+        "!force_direct && !force_affine && !force_hybrid",
+    ):
+        if contract not in nohint_guard:
+            raise AssertionError(
+                "GVA N4/16K no-hint guard changed: " + contract
+            )
+
+    for name, value_heads in (
+        ("automatic_gva_equal_n4_g16", 4),
+        ("automatic_gva_equal_n4_g32", 8),
+    ):
+        hinted_guard = policy_statement(f"const bool {name} =")
+        for contract in (
+            "is_gva",
+            "p.H_q == 2",
+            f"p.H == {value_heads}",
+            "hinted_equal_lengths",
+            "p.N == 4",
+            "hinted_bound == 4096",
+            "p.T_total == 4 * 4096",
+            "group_env == nullptr",
+            "!force_direct && !force_affine && !force_hybrid",
+        ):
+            if contract not in hinted_guard:
+                raise AssertionError(
+                    f"hinted ratio-{value_heads // 2} GVA guard changed: "
+                    + contract
+                )
+
     # Metadata-eliding/cache-heavy candidates are deliberately equal-head only.
     # This list is intentionally structural: adding GVA to one of these routes
     # requires a matched producer/consumer proof and a validator update.
     equal_head_only_contracts = (
-        "return p.H_q == p.H && p.cu_seqlens != nullptr",
         "if (p.H_q != p.H || p.cu_seqlens == nullptr ||",
         "if (!a.is_gva && a.context_persistent_blocks > 0",
         "const bool direct_dense_n1_h12 = !a.is_gva &&",
@@ -3273,9 +3642,6 @@ def check_gva_whole_route_policy_static() -> None:
             )
     common_equal_head_only = (
         "!is_gva && policy.context_equal_dense_n4_g64",
-        "use_context_parallel && !is_gva && is_varlen && "
-        "!use_context_equal_dense_n4_g64 && "
-        "policy.context_direct_prefixless",
         "use_context_parallel && !is_gva && is_varlen && "
         "policy.launch_context_prefix != nullptr",
     )
@@ -3292,6 +3658,10 @@ def check_gva_whole_route_policy_static() -> None:
         tokens_per_sequence: int,
         packed: bool,
         bound: int = 0,
+        q_heads: int = 2,
+        value_heads: int = 4,
+        total_tokens: int | None = None,
+        total_tiles: int | None = None,
         route: str | None = None,
         group: str | None = None,
         scan_nw: str | None = None,
@@ -3299,22 +3669,70 @@ def check_gva_whole_route_policy_static() -> None:
         scan_a_gll: str | None = None,
         scan_b_phased: str | None = None,
         scan_b_stream: str | None = None,
-    ) -> tuple[int, bool, int, bool, bool]:
+    ) -> tuple[int, bool, int, bool, bool, bool]:
         """Model only the automatic GVA facts consumed across policy stages."""
 
+        if total_tokens is None:
+            total_tokens = sequences * tokens_per_sequence
+        if total_tiles is None:
+            total_tiles = (
+                (total_tokens + 15) // 16 + sequences
+                if packed
+                else sequences * ((tokens_per_sequence + 15) // 16)
+            )
         force_direct = route == "direct"
         force_affine = route == "affine"
         force_hybrid = route == "hybrid"
+        is_gva = q_heads != value_heads
         hinted_equal = packed and bound > 0 and bound == tokens_per_sequence
         automatic_n4_g16 = (
-            hinted_equal
+            is_gva
+            and q_heads == 2
+            and value_heads == 4
+            and hinted_equal
             and sequences == 4
             and bound == 4096
             and tokens_per_sequence == 4096
+            and total_tokens == 16384
             and group is None
             and not force_direct
             and not force_affine
             and not force_hybrid
+        )
+        automatic_n4_g32 = (
+            is_gva
+            and q_heads == 2
+            and value_heads == 8
+            and hinted_equal
+            and sequences == 4
+            and bound == 4096
+            and total_tokens == 16384
+            and group is None
+            and not force_direct
+            and not force_affine
+            and not force_hybrid
+        )
+        automatic_n4_nohint = (
+            bound == 0
+            and packed
+            and is_gva
+            and q_heads == 2
+            and value_heads in (4, 8)
+            and sequences == 4
+            and total_tokens == 16384
+            and total_tiles == 1028
+            and group is None
+            and not force_direct
+            and not force_affine
+            and not force_hybrid
+        )
+        force_context = (
+            force_direct
+            or force_affine
+            or (force_hybrid and packed)
+            or automatic_n4_g16
+            or automatic_n4_g32
+            or automatic_n4_nohint
         )
         hybrid = packed and force_hybrid
         direct = not hybrid and force_direct
@@ -3327,7 +3745,8 @@ def check_gva_whole_route_policy_static() -> None:
         else:
             group_chunks = 64 if hybrid or tokens_per_sequence >= 12288 else 32
         automatic_packed_nw4 = (
-            packed
+            is_gva
+            and packed
             and not direct
             and not hybrid
             and 4 <= sequences <= 8
@@ -3369,6 +3788,7 @@ def check_gva_whole_route_policy_static() -> None:
             resolved_scan_nw,
             resolved_b_stream,
             automatic_n4_g16,
+            force_context,
         )
 
     # Packed N=1 is normalized to dense before policy construction.  It must
@@ -3380,7 +3800,7 @@ def check_gva_whole_route_policy_static() -> None:
         (
             "single-8k",
             dict(sequences=1, tokens_per_sequence=8192, packed=False),
-            (32, False, 2, False, False),
+            (32, False, 2, False, False, False),
         ),
         (
             "resume-4x4k",
@@ -3390,7 +3810,7 @@ def check_gva_whole_route_policy_static() -> None:
                 packed=True,
                 bound=4096,
             ),
-            (16, True, 4, False, True),
+            (16, True, 4, False, True, True),
         ),
         (
             "long-ragged-n8",
@@ -3400,7 +3820,7 @@ def check_gva_whole_route_policy_static() -> None:
                 packed=True,
                 bound=8192,
             ),
-            (32, True, 4, False, False),
+            (32, True, 4, False, False, False),
         ),
     )
     for label, configuration, expected in cases:
@@ -3410,6 +3830,52 @@ def check_gva_whole_route_policy_static() -> None:
                 f"static GVA {label} route changed: {actual} != {expected}"
             )
 
+    nohint_n4 = dict(
+        sequences=4,
+        tokens_per_sequence=4096,
+        packed=True,
+        bound=0,
+        total_tokens=16384,
+        total_tiles=1028,
+    )
+    for value_heads in (4, 8):
+        expected = (32, True, 4, False, False, True)
+        actual = resolve_gva_case(
+            **nohint_n4, q_heads=2, value_heads=value_heads
+        )
+        if actual != expected:
+            raise AssertionError(
+                f"static no-hint GVA Hq2/Hv{value_heads} N4/16K route "
+                f"changed: {actual} != {expected}"
+            )
+
+    ratio4_hinted = resolve_gva_case(
+        **{**nohint_n4, "bound": 4096},
+        q_heads=2,
+        value_heads=8,
+    )
+    if ratio4_hinted != (32, True, 4, False, False, True):
+        raise AssertionError(
+            "static hinted ratio-4 GVA N4/16K did not select G32/NW4"
+        )
+
+    nohint_rollbacks = (
+        ({"q_heads": 1, "value_heads": 4}, (32, True, 4, False, False, False)),
+        ({"q_heads": 2, "value_heads": 6}, (32, True, 4, False, False, False)),
+        ({"total_tokens": 16383}, (32, True, 4, False, False, False)),
+        ({"total_tiles": 1027}, (32, True, 4, False, False, False)),
+        ({"bound": 16384}, (32, True, 4, False, False, False)),
+        ({"group": "64"}, (64, False, 2, False, False, False)),
+    )
+    for override, expected in nohint_rollbacks:
+        configuration = {**nohint_n4, **override}
+        actual = resolve_gva_case(**configuration)
+        if actual != expected:
+            raise AssertionError(
+                "static no-hint GVA N4/16K fallback changed: "
+                f"override={override}, actual={actual}, expected={expected}"
+            )
+
     base_n4 = dict(
         sequences=4,
         tokens_per_sequence=4096,
@@ -3417,9 +3883,9 @@ def check_gva_whole_route_policy_static() -> None:
         bound=4096,
     )
     explicit_routes = {
-        "direct": (0, False, 2, False, False),
-        "affine": (32, False, 2, False, False),
-        "hybrid": (64, False, 2, False, False),
+        "direct": (0, False, 2, False, False, True),
+        "affine": (32, False, 2, False, False, True),
+        "hybrid": (64, False, 2, False, False, True),
     }
     for route, expected in explicit_routes.items():
         actual = resolve_gva_case(**base_n4, route=route)
@@ -3429,7 +3895,7 @@ def check_gva_whole_route_policy_static() -> None:
                 f"{actual} != {expected}"
             )
     for group in ("32", "64", "128"):
-        expected = (int(group), False, 2, False, False)
+        expected = (int(group), False, 2, False, False, False)
         actual = resolve_gva_case(**base_n4, group=group)
         if actual != expected:
             raise AssertionError(
@@ -3441,7 +3907,7 @@ def check_gva_whole_route_policy_static() -> None:
     # automatic NW4 fact.  Explicit SCAN_NW remains authoritative; on G16 its
     # explicit path restores the established default streamed-b decision.
     for explicit_nw in ("1", "2", "4"):
-        expected = (16, True, int(explicit_nw), True, True)
+        expected = (16, True, int(explicit_nw), True, True, True)
         actual = resolve_gva_case(**base_n4, scan_nw=explicit_nw)
         if actual != expected:
             raise AssertionError(
@@ -3451,7 +3917,7 @@ def check_gva_whole_route_policy_static() -> None:
     for axis in ("scan_ksplit", "scan_a_gll", "scan_b_phased"):
         for value in ("0", "1"):
             actual = resolve_gva_case(**base_n4, **{axis: value})
-            expected = (16, True, 2, True, True)
+            expected = (16, True, 2, True, True, True)
             if actual != expected:
                 raise AssertionError(
                     "explicit GVA scan-family fallback changed for "
@@ -3463,6 +3929,7 @@ def check_gva_whole_route_policy_static() -> None:
         4,
         True,
         True,
+        True,
     ):
         raise AssertionError("explicit GVA B_STREAM=1 did not override auto-off")
     if resolve_gva_case(**base_n4, scan_b_stream="0") != (
@@ -3471,13 +3938,15 @@ def check_gva_whole_route_policy_static() -> None:
         4,
         False,
         True,
+        True,
     ):
         raise AssertionError("explicit GVA B_STREAM=0 did not retain auto-off")
 
     print(
         "PASS static GVA whole-route capability handshake, grouped K1 mapping, "
-        "equal-head specialization exclusions, single/N4/N8 route facts, "
-        "automatic NW4/B-stream recipe, and explicit route/group/scan precedence"
+        "equal-head specialization exclusions, no-hint ratio-2/4 N4/16K and "
+        "hinted ratio-4 routes, automatic NW4/B-stream recipe, and explicit "
+        "route/group/scan precedence"
     )
 
 
@@ -11251,6 +11720,316 @@ def _assert_mixed_boundary_direct_topology(
         )
 
 
+def _assert_k3_16k_no_hint_topology(
+    kernel_names: list[str],
+    *,
+    sequences: int,
+    label: str,
+) -> None:
+    """Require the complete packed H12 N4/N8 automatic G64 graph."""
+
+    if sequences not in (4, 8):
+        raise ValueError(f"unsupported K3 16K sequence count: {sequences}")
+
+    expected_nodes = 5 if sequences == 4 else 6
+    if len(kernel_names) != expected_nodes:
+        raise AssertionError(
+            f"{label}: expected exactly {expected_nodes} kernel nodes, got "
+            f"{kernel_names!r}"
+        )
+
+    prefix_names = [
+        name for name in kernel_names if "k1_build_tile_prefix" in name
+    ]
+    if len(prefix_names) != 1:
+        raise AssertionError(
+            f"{label}: packed metadata must retain one prefix node, got "
+            f"{prefix_names!r}; all kernels={kernel_names!r}"
+        )
+
+    k1_names = [
+        name for name in kernel_names if "k1_kda_bt16_fused_kernel" in name
+    ]
+    if len(k1_names) != 1:
+        raise AssertionError(
+            f"{label}: expected one packed fused K1 node, got {k1_names!r}; "
+            f"all kernels={kernel_names!r}"
+        )
+    k1_match = _K1_FUSED_SYMBOL.search(k1_names[0])
+    if k1_match is None:
+        raise AssertionError(
+            f"{label}: cannot decode fused K1 template flags: {k1_names[0]!r}"
+        )
+    k1_flags = tuple(
+        int(value) for value in re.findall(r"Lb([01])E", k1_match["flags"])
+    )
+    if len(k1_flags) not in (9, 10, 11, 12, 13) or k1_flags[0] != 1:
+        raise AssertionError(
+            f"{label}: fused K1 is not the packed ABI: "
+            f"flags={k1_flags!r}, name={k1_names[0]!r}"
+        )
+    for index, specialization in (
+        (8, "prefixless"),
+        (9, "dense-N1/full-C16"),
+        (10, "dense-N1 padded solve"),
+        (11, "dense-N1 early beta"),
+        (12, "GVA"),
+    ):
+        if len(k1_flags) > index and k1_flags[index] != 0:
+            raise AssertionError(
+                f"{label}: packed equal-head route selected {specialization}: "
+                f"flags={k1_flags!r}, name={k1_names[0]!r}"
+            )
+
+    fused_symbol = "k2_kda_context_affine_ab_fused_nw4_kernel"
+    fused_names = [name for name in kernel_names if fused_symbol in name]
+    ksplit_symbol = "k2_kda_context_affine_scan_ksplit_wg4_kernel"
+    ksplit_names = [name for name in kernel_names if ksplit_symbol in name]
+    ordinary_scan_symbol = "k2_kda_context_affine_scan_nw4_kernel"
+    ordinary_scan_names = [
+        name for name in kernel_names if ordinary_scan_symbol in name
+    ]
+
+    if sequences == 4:
+        _assert_context_route_topology(
+            kernel_names, ((64, 2, 4),), label
+        )
+        if len(fused_names) != 1 or re.search(
+            rf"{fused_symbol}I(?:Li)?64E", fused_names[0]
+        ) is None:
+            raise AssertionError(
+                f"{label}: expected one packed fused G64 A/B producer, got "
+                f"{fused_names!r}; all kernels={kernel_names!r}"
+            )
+        if len(ksplit_names) != 1 or re.search(
+            r"ksplit_wg4_kernelI(?:Li)?64E", ksplit_names[0]
+        ) is None:
+            raise AssertionError(
+                f"{label}: expected one G64 K-split scan, got "
+                f"{ksplit_names!r}; all kernels={kernel_names!r}"
+            )
+        if ordinary_scan_names:
+            raise AssertionError(
+                f"{label}: N4 automatic graph retained an ordinary scan: "
+                f"{ordinary_scan_names!r}"
+            )
+    else:
+        _assert_context_route_topology(
+            kernel_names,
+            ((64, 0, 4), (64, 1, 4), (64, 2, 4)),
+            label,
+        )
+        if fused_names or ksplit_names:
+            raise AssertionError(
+                f"{label}: N8 ordinary G64 graph selected an unvalidated "
+                f"fused/K-split submode: fused={fused_names!r}, "
+                f"ksplit={ksplit_names!r}"
+            )
+        if len(ordinary_scan_names) != 1 or re.search(
+            r"affine_scan_nw4_kernelI(?:Li)?64E(?:Li)?2E",
+            ordinary_scan_names[0],
+        ) is None:
+            raise AssertionError(
+                f"{label}: expected one ordinary G64/NW2 affine scan, got "
+                f"{ordinary_scan_names!r}; all kernels={kernel_names!r}"
+            )
+
+    if any("equal_n4_g64" in name for name in kernel_names):
+        raise AssertionError(
+            f"{label}: no-hint aggregate incorrectly selected equal-dense "
+            f"metadata elision: {kernel_names!r}"
+        )
+
+
+def _assert_gva_n4_16k_no_hint_topology(
+    kernel_names: list[str], label: str
+) -> None:
+    """Require packed GVA K1 plus the ordinary G32/NW4 affine graph."""
+
+    if len(kernel_names) != 6:
+        raise AssertionError(
+            f"{label}: expected exactly six kernel nodes, got "
+            f"{kernel_names!r}"
+        )
+
+    prefix_names = [
+        name for name in kernel_names if "k1_build_tile_prefix" in name
+    ]
+    if len(prefix_names) != 1:
+        raise AssertionError(
+            f"{label}: packed GVA must retain one prefix node, got "
+            f"{prefix_names!r}; all kernels={kernel_names!r}"
+        )
+
+    k1_names = [
+        name for name in kernel_names if "k1_kda_bt16_fused_kernel" in name
+    ]
+    if len(k1_names) != 1:
+        raise AssertionError(
+            f"{label}: expected one GVA fused K1 node, got {k1_names!r}; "
+            f"all kernels={kernel_names!r}"
+        )
+    k1_match = _K1_FUSED_SYMBOL.search(k1_names[0])
+    if k1_match is None:
+        raise AssertionError(
+            f"{label}: cannot decode GVA K1 template flags: {k1_names[0]!r}"
+        )
+    k1_flags = tuple(
+        int(value) for value in re.findall(r"Lb([01])E", k1_match["flags"])
+    )
+    if len(k1_flags) != 13 or k1_flags[0] != 1 or k1_flags[12] != 1:
+        raise AssertionError(
+            f"{label}: K1 did not select its packed GVA specialization: "
+            f"flags={k1_flags!r}, name={k1_names[0]!r}"
+        )
+    if any(k1_flags[index] for index in range(8, 12)):
+        raise AssertionError(
+            f"{label}: GVA K1 selected an incompatible prefixless/dense-N1 "
+            f"specialization: flags={k1_flags!r}"
+        )
+
+    _assert_context_route_topology(
+        kernel_names,
+        ((32, 0, 4), (32, 1, 4), (32, 2, 4)),
+        label,
+    )
+    context_names = []
+    for name in kernel_names:
+        match = _CONTEXT_PIPELINE_SYMBOL.search(name)
+        if match is None:
+            continue
+        context_names.append(name)
+        expected_fields = {
+            "vl": 1,
+            "direct": 0,
+            "cached": 0,
+            "u_forward": 1,
+            "v_forward": 1,
+            "tail_first": 0,
+            "prefixless": 0,
+        }
+        mismatches = {
+            field: (int(match.group(field)), expected)
+            for field, expected in expected_fields.items()
+            if int(match.group(field)) != expected
+        }
+        if mismatches:
+            raise AssertionError(
+                f"{label}: GVA G32 context specialization mismatch "
+                f"{mismatches!r}: {name!r}"
+            )
+    if len(context_names) != 3:
+        raise AssertionError(
+            f"{label}: expected ordinary A/B/replay context nodes, got "
+            f"{context_names!r}"
+        )
+
+    forbidden = (
+        "k2_kda_context_affine_ab_fused",
+        "k2_kda_context_affine_scan_ksplit",
+        "equal_n4_g64",
+    )
+    leaked = [
+        name for name in kernel_names if any(token in name for token in forbidden)
+    ]
+    if leaked:
+        raise AssertionError(
+            f"{label}: GVA no-hint graph selected an incompatible fused, "
+            f"K-split, or equal-dense path: {leaked!r}"
+        )
+
+    scan_symbol = "k2_kda_context_affine_scan_nw4_kernel"
+    scan_names = [name for name in kernel_names if scan_symbol in name]
+    if len(scan_names) != 1 or re.search(
+        r"affine_scan_nw4_kernelI(?:Li)?32E(?:Li)?4E", scan_names[0]
+    ) is None:
+        raise AssertionError(
+            f"{label}: expected one ordinary G32/NW4 scan, got "
+            f"{scan_names!r}; all kernels={kernel_names!r}"
+        )
+
+
+def _assert_gva_mixed_boundary_no_hint_topology(
+    kernel_names: list[str], label: str
+) -> None:
+    """Require prefixless GVA K1 plus ordinary 2-D NW1 direct replay."""
+
+    if len(kernel_names) != 2:
+        raise AssertionError(
+            f"{label}: expected exactly two kernel nodes, got "
+            f"{kernel_names!r}"
+        )
+    prefix_names = [
+        name for name in kernel_names if "k1_build_tile_prefix" in name
+    ]
+    if prefix_names:
+        raise AssertionError(
+            f"{label}: prefixless GVA graph retained prefix nodes: "
+            f"{prefix_names!r}"
+        )
+
+    k1_names = [
+        name for name in kernel_names if "k1_kda_bt16_fused_kernel" in name
+    ]
+    if len(k1_names) != 1:
+        raise AssertionError(
+            f"{label}: expected one prefixless GVA K1, got {k1_names!r}; "
+            f"all kernels={kernel_names!r}"
+        )
+    k1_match = _K1_FUSED_SYMBOL.search(k1_names[0])
+    if k1_match is None:
+        raise AssertionError(
+            f"{label}: cannot decode GVA K1 template flags: {k1_names[0]!r}"
+        )
+    k1_flags = tuple(
+        int(value) for value in re.findall(r"Lb([01])E", k1_match["flags"])
+    )
+    if (
+        len(k1_flags) != 13
+        or k1_flags[0] != 1
+        or k1_flags[8] != 1
+        or k1_flags[12] != 1
+        or any(k1_flags[index] for index in range(9, 12))
+    ):
+        raise AssertionError(
+            f"{label}: K1 did not select packed-prefixless GVA: "
+            f"flags={k1_flags!r}, name={k1_names[0]!r}"
+        )
+
+    _assert_context_route_topology(kernel_names, ((1, 2, 1),), label)
+    context = []
+    for name in kernel_names:
+        match = _CONTEXT_PIPELINE_SYMBOL.search(name)
+        if match is not None:
+            context.append((name, match))
+    if len(context) != 1:
+        raise AssertionError(
+            f"{label}: expected one ordinary 2-D NW1 replay, got "
+            f"{context!r}; all kernels={kernel_names!r}"
+        )
+    name, match = context[0]
+    expected_fields = {
+        "vl": 1,
+        "direct": 1,
+        "cached": 0,
+        "u_forward": 1,
+        "v_forward": 1,
+        "lds_pipeline": 0,
+        "tail_first": 0,
+        "prefixless": 1,
+    }
+    mismatches = {
+        field: (int(match.group(field)), expected)
+        for field, expected in expected_fields.items()
+        if int(match.group(field)) != expected
+    }
+    if mismatches:
+        raise AssertionError(
+            f"{label}: GVA mixed NW1 specialization mismatch {mismatches!r}: "
+            f"{name!r}"
+        )
+
+
 def _capture_raw_v2_kernel_names(
     module,
     x,
@@ -11283,6 +12062,1330 @@ def _capture_raw_v2_kernel_names(
         return captured_graph_kernel_names(graph, device)
     finally:
         graph.reset()
+
+
+def _capture_raw_v3_kernel_names(
+    module,
+    x,
+    max_seqlen_upper_bound: int,
+) -> list[str]:
+    """Capture the public adapter's preferred raw-v3 ABI and return symbols."""
+
+    device = x["q"].device
+    out, final, workspace = allocate(x)
+    raw_v3_call(
+        module,
+        x,
+        out,
+        final,
+        workspace,
+        max_seqlen_upper_bound,
+    )
+    torch.cuda.synchronize(device)
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    try:
+        with torch.cuda.graph(graph):
+            raw_v3_call(
+                module,
+                x,
+                out,
+                final,
+                workspace,
+                max_seqlen_upper_bound,
+            )
+        return captured_graph_kernel_names(graph, device)
+    finally:
+        graph.reset()
+
+
+def _route_relative_rms(
+    actual: torch.Tensor,
+    reference: torch.Tensor,
+    label: str,
+    *,
+    tolerance: float = 1.0e-2,
+) -> float:
+    """Compare results from two valid routing topologies."""
+
+    if actual.shape != reference.shape or actual.dtype != reference.dtype:
+        raise AssertionError(
+            f"{label}: shape/dtype mismatch: "
+            f"{actual.shape}/{actual.dtype} vs "
+            f"{reference.shape}/{reference.dtype}"
+        )
+    actual_f = actual.float()
+    reference_f = reference.float()
+    if not bool(torch.isfinite(actual_f).all().item()):
+        raise AssertionError(f"{label}: candidate contains non-finite data")
+    if not bool(torch.isfinite(reference_f).all().item()):
+        raise AssertionError(f"{label}: reference contains non-finite data")
+    difference_rms = torch.sqrt(
+        torch.mean(torch.square(actual_f - reference_f))
+    )
+    reference_rms = torch.sqrt(torch.mean(torch.square(reference_f)))
+    error = float(
+        (difference_rms / reference_rms.clamp_min(1.0e-12)).item()
+    )
+    if not torch.isfinite(torch.tensor(error)) or error > tolerance:
+        raise AssertionError(
+            f"{label}: relative RMS {error:.6e} exceeds {tolerance:.1e}"
+        )
+    return error
+
+
+def _assert_packed_route_numerically_equivalent(
+    actual: tuple[torch.Tensor, torch.Tensor],
+    reference: tuple[torch.Tensor, torch.Tensor],
+    seq_lens: tuple[int, ...],
+    label: str,
+) -> tuple[float, float]:
+    """Compare packed output/state globally and for each nonempty sequence."""
+
+    output_errors = [
+        _route_relative_rms(actual[0], reference[0], f"{label} output")
+    ]
+    offset = 0
+    for sequence, length in enumerate(seq_lens):
+        next_offset = offset + length
+        if length:
+            output_errors.append(
+                _route_relative_rms(
+                    actual[0][:, offset:next_offset],
+                    reference[0][:, offset:next_offset],
+                    f"{label} output sequence {sequence}",
+                )
+            )
+        offset = next_offset
+    if offset != actual[0].shape[1]:
+        raise AssertionError(
+            f"{label}: packed sequence lengths cover {offset} tokens, "
+            f"output contains {actual[0].shape[1]}"
+        )
+    if actual[1].shape[0] != len(seq_lens):
+        raise AssertionError(
+            f"{label}: final state has {actual[1].shape[0]} sequences, "
+            f"expected {len(seq_lens)}"
+        )
+    state_errors = [
+        _route_relative_rms(actual[1], reference[1], f"{label} final state")
+    ]
+    for sequence in range(len(seq_lens)):
+        state_errors.append(
+            _route_relative_rms(
+                actual[1][sequence],
+                reference[1][sequence],
+                f"{label} final state sequence {sequence}",
+            )
+        )
+    return max(output_errors), max(state_errors)
+
+
+def _check_raw_v3_no_hint_changed_prefix_replay(
+    module,
+    device: torch.device,
+    x: dict[str, Any],
+    replay_lens: tuple[int, ...],
+    label: str,
+    clear_policy_environment,
+    configure_general_reference,
+    topology_assertion,
+) -> tuple[float, float]:
+    """Replay a zero-hint graph after changing only device prefix metadata."""
+
+    if x["cu_seqlens"] is None:
+        raise AssertionError(f"{label}: graph replay requires packed metadata")
+    if (
+        len(replay_lens) != x["N"]
+        or sum(replay_lens) != x["q"].shape[1]
+    ):
+        raise AssertionError(
+            f"{label}: invalid same-N/same-token replay fixture {replay_lens}"
+        )
+
+    initial_copy = x["initial_state"].clone()
+    clear_policy_environment()
+    graph_out, graph_final, graph_workspace = allocate(x)
+    raw_v3_call(module, x, graph_out, graph_final, graph_workspace, 0)
+    torch.cuda.synchronize(device)
+    assert_bitwise_same(
+        x["initial_state"], initial_copy, f"{label}: warmup mutated state"
+    )
+
+    stable_tensors = (
+        x["q"],
+        x["k"],
+        x["v"],
+        x["g"],
+        x["beta"],
+        x["A_log"],
+        x["dt_bias"],
+        x["initial_state"],
+        x["cu_seqlens"],
+        graph_out,
+        graph_final,
+        graph_workspace,
+    )
+    stable_addresses = tuple(tensor.data_ptr() for tensor in stable_tensors)
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    try:
+        with torch.cuda.graph(graph):
+            raw_v3_call(
+                module, x, graph_out, graph_final, graph_workspace, 0
+            )
+        topology_assertion(captured_graph_kernel_names(graph, device), label)
+        graph.instantiate()
+
+        offsets = [0]
+        for length in replay_lens:
+            offsets.append(offsets[-1] + length)
+        x["cu_seqlens"].copy_(
+            torch.tensor(offsets, device=device, dtype=torch.int32)
+        )
+        torch.cuda.synchronize(device)
+        if tuple(tensor.data_ptr() for tensor in stable_tensors) != (
+            stable_addresses
+        ):
+            raise AssertionError(
+                f"{label}: changed-prefix replay replaced a captured tensor"
+            )
+
+        configure_general_reference()
+        reference_out, reference_final, reference_workspace = allocate(x)
+        raw_v3_call(
+            module,
+            x,
+            reference_out,
+            reference_final,
+            reference_workspace,
+            0,
+        )
+        torch.cuda.synchronize(device)
+        assert_bitwise_same(
+            x["initial_state"],
+            initial_copy,
+            f"{label}: forced-general reference mutated state",
+        )
+
+        clear_policy_environment()
+        graph_out.fill_(float("nan"))
+        graph_final.fill_(float("nan"))
+        graph_workspace.fill_(0xA5)
+        torch.cuda.synchronize(device)
+        graph.replay()
+        torch.cuda.synchronize(device)
+        errors = _assert_packed_route_numerically_equivalent(
+            (graph_out, graph_final),
+            (reference_out, reference_final),
+            replay_lens,
+            f"{label} replay vs forced-general",
+        )
+        assert_bitwise_same(
+            x["initial_state"],
+            initial_copy,
+            f"{label}: graph replay mutated initial state",
+        )
+        return errors
+    finally:
+        graph.reset()
+
+
+def check_raw_v3_k3_mixed_boundary_no_hint(
+    module, device: torch.device
+) -> None:
+    """Pin K3 H12's no-hint/exact/over-hint results and direct graph."""
+
+    if flash_kda._device_arch(device) != "gfx950":
+        print("SKIP raw-v3 K3 no-hint route/graph matrix: gfx950 only")
+        return
+
+    previous_env = {
+        name: os.environ.get(name) for name in _RAW_V2_POLICY_ENV
+    }
+
+    def clear_policy_environment() -> None:
+        for name in _RAW_V2_POLICY_ENV:
+            os.environ.pop(name, None)
+
+    def configure_general_reference() -> None:
+        clear_policy_environment()
+        os.environ["FLASH_KDA_GFX950_CONTEXT_DIRECT"] = "1"
+
+    try:
+        for prefill_tokens in (1024, 1025):
+            for prefill_first in (False, True):
+                decodes = (1,) * 15
+                seq_lens = (
+                    (prefill_tokens,) + decodes
+                    if prefill_first
+                    else decodes + (prefill_tokens,)
+                )
+                order = "prefill-first" if prefill_first else "decode-first"
+                label = f"K3-H12-{order}-{prefill_tokens}"
+                x = make_inputs(
+                    seq_lens,
+                    12,
+                    device,
+                    packed=True,
+                    has_initial_state=True,
+                    output_final_state=True,
+                    seed=20260901 + prefill_tokens + int(prefill_first),
+                )
+                initial_copy = x["initial_state"].clone()
+
+                # A forced ordinary direct graph is an independent result oracle
+                # for the automatic prefixless/NW1-flat mapping.
+                configure_general_reference()
+                reference_out, reference_final, reference_workspace = allocate(x)
+                descriptor_call(
+                    x, reference_out, reference_final, reference_workspace
+                )
+                torch.cuda.synchronize(device)
+
+                no_hint_result = None
+                for bound, hint_label in (
+                    (0, "no-hint"),
+                    (prefill_tokens, "exact-hint"),
+                    (sum(seq_lens), "conservative-over-hint"),
+                ):
+                    clear_policy_environment()
+                    out, final, workspace = allocate(x)
+                    raw_v3_call(module, x, out, final, workspace, bound)
+                    torch.cuda.synchronize(device)
+                    result = (out, final)
+                    errors = _assert_packed_route_numerically_equivalent(
+                        result,
+                        (reference_out, reference_final),
+                        seq_lens,
+                        f"raw-v3 {label}/{hint_label} vs forced-direct",
+                    )
+                    if hint_label == "no-hint":
+                        no_hint_result = result
+                    else:
+                        if no_hint_result is None:
+                            raise AssertionError(
+                                f"raw-v3 {label}: no-hint result missing"
+                            )
+                        _assert_packed_route_numerically_equivalent(
+                            result,
+                            no_hint_result,
+                            seq_lens,
+                            f"raw-v3 {label}/{hint_label} vs no-hint",
+                        )
+                    assert_bitwise_same(
+                        x["initial_state"],
+                        initial_copy,
+                        f"raw-v3 {label}/{hint_label} mutated initial state",
+                    )
+                    # The strict over-hint intentionally falls off the exact
+                    # mixed-boundary recipe.  Its contract is result safety,
+                    # not preservation of the faster prefixless topology.
+                    if hint_label != "conservative-over-hint":
+                        names = _capture_raw_v3_kernel_names(module, x, bound)
+                        route_label = f"raw-v3 {label}/{hint_label}"
+                        _assert_context_route_topology(
+                            names,
+                            ((1, 2, 1),),
+                            route_label,
+                        )
+                        _assert_mixed_boundary_direct_topology(
+                            names,
+                            prefixless=True,
+                            nw=1,
+                            flat=True,
+                            label=route_label,
+                        )
+                    print(
+                        f"PASS raw-v3 {label}/{hint_label}: max output/state "
+                        f"rRMS={errors[0]:.3e}/{errors[1]:.3e}"
+                    )
+                if prefill_tokens == 1025 and not prefill_first:
+                    rollback_recipes = (
+                        (
+                            "prefixless-0",
+                            _CONTEXT_DIRECT_PREFIXLESS_ENV,
+                            "0",
+                            4,
+                            False,
+                        ),
+                        (
+                            "explicit-direct-nw1",
+                            "FLASH_KDA_GFX950_CONTEXT_DIRECT_NW",
+                            "1",
+                            1,
+                            False,
+                        ),
+                        (
+                            "explicit-nw1-flat",
+                            _CONTEXT_DIRECT_NW1_FLAT_ENV,
+                            "1",
+                            1,
+                            True,
+                        ),
+                    )
+                    for (
+                        rollback,
+                        environment_name,
+                        environment_value,
+                        rollback_nw,
+                        rollback_flat,
+                    ) in rollback_recipes:
+                        clear_policy_environment()
+                        os.environ[environment_name] = environment_value
+                        rollback_names = _capture_raw_v3_kernel_names(
+                            module, x, 0
+                        )
+                        rollback_label = (
+                            f"raw-v3 K3 no-hint rollback {rollback}"
+                        )
+                        _assert_context_route_topology(
+                            rollback_names,
+                            ((1, 2, rollback_nw),),
+                            rollback_label,
+                        )
+                        _assert_mixed_boundary_direct_topology(
+                            rollback_names,
+                            prefixless=False,
+                            nw=rollback_nw,
+                            flat=rollback_flat,
+                            label=rollback_label,
+                        )
+                assert_bitwise_same(
+                    x["initial_state"],
+                    initial_copy,
+                    f"raw-v3 {label} mutated initial state",
+                )
+                print(
+                    f"PASS raw-v3 K3 no-hint/exact/over-hint result: {label}"
+                )
+
+        # Capture the automatic prefixless/NW1-flat graph on the production
+        # layout, then replay it with fifteen empty sequences and the same
+        # N/total/pointers.  This validates the aggregate-only no-hint guard,
+        # not just its captured symbol names.
+        graph_x = make_inputs(
+            (1,) * 15 + (1024,),
+            12,
+            device,
+            packed=True,
+            has_initial_state=True,
+            output_final_state=True,
+            seed=20261012,
+        )
+
+        def assert_k3_mixed_topology(names: list[str], label: str) -> None:
+            _assert_context_route_topology(names, ((1, 2, 1),), label)
+            _assert_mixed_boundary_direct_topology(
+                names,
+                prefixless=True,
+                nw=1,
+                flat=True,
+                label=label,
+            )
+
+        replay_errors = _check_raw_v3_no_hint_changed_prefix_replay(
+            module,
+            device,
+            graph_x,
+            (0,) * 15 + (1039,),
+            "raw-v3 K3 mixed no-hint changed-prefix graph",
+            clear_policy_environment,
+            configure_general_reference,
+            assert_k3_mixed_topology,
+        )
+        print(
+            "PASS raw-v3 K3 mixed no-hint changed-prefix graph replay: "
+            f"max output/state rRMS={replay_errors[0]:.3e}/"
+            f"{replay_errors[1]:.3e}"
+        )
+    finally:
+        for name, value in previous_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def check_raw_v3_gva_mixed_boundary_no_hint(
+    module, device: torch.device
+) -> None:
+    """Validate Hq2/Hv4-or-8 prefixless 1K-boundary GVA graphs."""
+
+    if flash_kda._device_arch(device) != "gfx950":
+        print("SKIP raw-v3 GVA mixed-boundary no-hint matrix: gfx950 only")
+        return
+
+    previous_env = {
+        name: os.environ.get(name) for name in _RAW_V2_POLICY_ENV
+    }
+
+    def clear_policy_environment() -> None:
+        for name in _RAW_V2_POLICY_ENV:
+            os.environ.pop(name, None)
+
+    def configure_general_reference() -> None:
+        clear_policy_environment()
+        os.environ["FLASH_KDA_GFX950_CONTEXT_DIRECT"] = "1"
+        os.environ["FLASH_KDA_GFX950_CONTEXT_DIRECT_NW"] = "1"
+        os.environ[_CONTEXT_DIRECT_PREFIXLESS_ENV] = "0"
+
+    def run_raw_v3(
+        x: dict[str, Any],
+        initial_copy: torch.Tensor,
+        bound: int,
+        label: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        clear_policy_environment()
+        out, final, workspace = allocate(x)
+        out.fill_(float("nan"))
+        final.fill_(float("nan"))
+        workspace.fill_(0x35)
+        raw_v3_call(module, x, out, final, workspace, bound)
+        torch.cuda.synchronize(device)
+        assert_bitwise_same(
+            x["initial_state"], initial_copy, f"{label} mutated initial state"
+        )
+        return out, final
+
+    try:
+        case_index = 0
+        for value_heads in (4, 8):
+            for prefill_tokens in (1024, 1025):
+                for prefill_first in (False, True):
+                    decodes = (1,) * 15
+                    seq_lens = (
+                        (prefill_tokens,) + decodes
+                        if prefill_first
+                        else decodes + (prefill_tokens,)
+                    )
+                    order = (
+                        "prefill-first" if prefill_first else "decode-first"
+                    )
+                    label = (
+                        f"Hq2-Hv{value_heads}-{order}-{prefill_tokens}"
+                    )
+                    x = make_inputs(
+                        seq_lens,
+                        2,
+                        device,
+                        value_heads=value_heads,
+                        packed=True,
+                        has_initial_state=True,
+                        output_final_state=True,
+                        seed=20260960 + case_index,
+                    )
+                    case_index += 1
+                    initial_copy = x["initial_state"].clone()
+
+                    configure_general_reference()
+                    reference_out, reference_final, reference_workspace = (
+                        allocate(x)
+                    )
+                    raw_reference_out, raw_reference_final, raw_workspace = (
+                        allocate(x)
+                    )
+                    descriptor_call(
+                        x,
+                        reference_out,
+                        reference_final,
+                        reference_workspace,
+                    )
+                    raw_v3_call(
+                        module,
+                        x,
+                        raw_reference_out,
+                        raw_reference_final,
+                        raw_workspace,
+                        0,
+                    )
+                    torch.cuda.synchronize(device)
+                    assert_same(
+                        raw_reference_out,
+                        reference_out,
+                        f"raw-v3 GVA mixed {label} reference output mismatch",
+                    )
+                    assert_same(
+                        raw_reference_final,
+                        reference_final,
+                        f"raw-v3 GVA mixed {label} reference state mismatch",
+                    )
+                    assert_bitwise_same(
+                        x["initial_state"],
+                        initial_copy,
+                        f"raw-v3 GVA mixed {label} reference mutated state",
+                    )
+                    reference = (reference_out, reference_final)
+
+                    no_hint = run_raw_v3(
+                        x,
+                        initial_copy,
+                        0,
+                        f"raw-v3 GVA mixed {label}/no-hint",
+                    )
+                    no_hint_errors = (
+                        _assert_packed_route_numerically_equivalent(
+                            no_hint,
+                            reference,
+                            seq_lens,
+                            f"raw-v3 GVA mixed {label}/no-hint vs reference",
+                        )
+                    )
+
+                    clear_policy_environment()
+                    names = _capture_raw_v3_kernel_names(module, x, 0)
+                    _assert_gva_mixed_boundary_no_hint_topology(
+                        names, f"raw-v3 GVA mixed {label}/no-hint"
+                    )
+                    assert_bitwise_same(
+                        x["initial_state"],
+                        initial_copy,
+                        f"raw-v3 GVA mixed {label} graph mutated state",
+                    )
+
+                    for hint_label, bound in (
+                        ("exact-hint", prefill_tokens),
+                        ("conservative-over-hint", sum(seq_lens)),
+                    ):
+                        hinted = run_raw_v3(
+                            x,
+                            initial_copy,
+                            bound,
+                            f"raw-v3 GVA mixed {label}/{hint_label}",
+                        )
+                        _assert_packed_route_numerically_equivalent(
+                            hinted,
+                            no_hint,
+                            seq_lens,
+                            f"raw-v3 GVA mixed {label}/{hint_label} "
+                            "vs no-hint",
+                        )
+                        _assert_packed_route_numerically_equivalent(
+                            hinted,
+                            reference,
+                            seq_lens,
+                            f"raw-v3 GVA mixed {label}/{hint_label} "
+                            "vs reference",
+                        )
+
+                    # Do not test an aggregate-valid under-hint: the maximum
+                    # resides in device metadata and is a caller promise.
+                    print(
+                        "PASS raw-v3 GVA mixed no-hint topology/results/hints: "
+                        f"{label}, max output/state rRMS="
+                        f"{no_hint_errors[0]:.3e}/{no_hint_errors[1]:.3e}"
+                    )
+
+        # Capture one zero-hint two-node graph per supported GVA ratio, then
+        # change only the contents of its stable device cu_seqlens allocation.
+        # K1 and K2 must independently rebuild the same gapped C16 mapping on
+        # every replay; stale workspace slots from the capture distribution
+        # are poisoned below and must remain unreachable.
+        capture_lens = (1,) * 15 + (1024,)
+        replay_cases = (
+            ("extreme", (0,) * 15 + (1039,)),
+            ("near-even", (64,) * 15 + (79,)),
+        )
+        for value_heads in (4, 8):
+            x = make_inputs(
+                capture_lens,
+                2,
+                device,
+                value_heads=value_heads,
+                packed=True,
+                state_dtype=torch.float32,
+                has_initial_state=True,
+                output_final_state=True,
+                seed=20261020 + value_heads,
+            )
+            initial_copy = x["initial_state"].clone()
+            clear_policy_environment()
+            graph_out, graph_final, graph_workspace = allocate(x)
+
+            # Resolve all lazy module/runtime state before entering capture.
+            raw_v3_call(
+                module, x, graph_out, graph_final, graph_workspace, 0
+            )
+            torch.cuda.synchronize(device)
+            assert_bitwise_same(
+                x["initial_state"],
+                initial_copy,
+                f"raw-v3 GVA Hv{value_heads} graph warmup mutated state",
+            )
+
+            stable_tensors = (
+                x["q"],
+                x["k"],
+                x["v"],
+                x["g"],
+                x["beta"],
+                x["A_log"],
+                x["dt_bias"],
+                x["initial_state"],
+                x["cu_seqlens"],
+                graph_out,
+                graph_final,
+                graph_workspace,
+            )
+            stable_addresses = tuple(
+                tensor.data_ptr() for tensor in stable_tensors
+            )
+            graph = torch.cuda.CUDAGraph(keep_graph=True)
+            try:
+                with torch.cuda.graph(graph):
+                    raw_v3_call(
+                        module,
+                        x,
+                        graph_out,
+                        graph_final,
+                        graph_workspace,
+                        0,
+                    )
+                _assert_gva_mixed_boundary_no_hint_topology(
+                    captured_graph_kernel_names(graph, device),
+                    f"raw-v3 GVA Hv{value_heads} changed-prefix capture",
+                )
+                graph.instantiate()
+
+                for replay_label, replay_lens in replay_cases:
+                    if (
+                        len(replay_lens) != x["N"]
+                        or sum(replay_lens) != x["q"].shape[1]
+                    ):
+                        raise AssertionError(
+                            "invalid GVA changed-prefix replay fixture: "
+                            f"{replay_lens}"
+                        )
+                    offsets = [0]
+                    for length in replay_lens:
+                        offsets.append(offsets[-1] + length)
+                    x["cu_seqlens"].copy_(
+                        torch.tensor(
+                            offsets, device=device, dtype=torch.int32
+                        )
+                    )
+                    torch.cuda.synchronize(device)
+                    if tuple(
+                        tensor.data_ptr() for tensor in stable_tensors
+                    ) != stable_addresses:
+                        raise AssertionError(
+                            "GVA changed-prefix replay replaced a captured "
+                            "tensor allocation"
+                        )
+
+                    # Use the ordinary prefix-building direct graph as the
+                    # independent oracle for the changed device metadata.
+                    configure_general_reference()
+                    reference_out, reference_final, reference_workspace = (
+                        allocate(x)
+                    )
+                    raw_v3_call(
+                        module,
+                        x,
+                        reference_out,
+                        reference_final,
+                        reference_workspace,
+                        0,
+                    )
+                    torch.cuda.synchronize(device)
+                    assert_bitwise_same(
+                        x["initial_state"],
+                        initial_copy,
+                        "raw-v3 GVA changed-prefix reference mutated "
+                        f"initial state: Hv{value_heads}/{replay_label}",
+                    )
+
+                    clear_policy_environment()
+                    graph_out.fill_(float("nan"))
+                    graph_final.fill_(float("nan"))
+                    graph_workspace.fill_(0xA5)
+                    torch.cuda.synchronize(device)
+                    graph.replay()
+                    torch.cuda.synchronize(device)
+                    replay_errors = _assert_packed_route_numerically_equivalent(
+                        (graph_out, graph_final),
+                        (reference_out, reference_final),
+                        replay_lens,
+                        "raw-v3 GVA prefixless graph replay "
+                        f"Hv{value_heads}/{replay_label}",
+                    )
+                    assert_bitwise_same(
+                        x["initial_state"],
+                        initial_copy,
+                        "raw-v3 GVA prefixless graph replay mutated "
+                        f"initial state: Hv{value_heads}/{replay_label}",
+                    )
+                    print(
+                        "PASS raw-v3 GVA prefixless changed-prefix graph: "
+                        f"Hv{value_heads}/{replay_label}, max output/state "
+                        f"rRMS={replay_errors[0]:.3e}/"
+                        f"{replay_errors[1]:.3e}"
+                    )
+            finally:
+                graph.reset()
+    finally:
+        for name, value in previous_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def check_raw_v3_k3_16k_no_hint_matrix(
+    module, device: torch.device
+) -> None:
+    """Validate K3 H12 N4/N8 no-hint routes on adversarial prefixes."""
+
+    if flash_kda._device_arch(device) != "gfx950":
+        print("SKIP raw-v3 K3 16K no-hint route/graph matrix: gfx950 only")
+        return
+
+    previous_env = {
+        name: os.environ.get(name) for name in _RAW_V2_POLICY_ENV
+    }
+    tolerance = 1.0e-2
+
+    def clear_policy_environment() -> None:
+        for name in _RAW_V2_POLICY_ENV:
+            os.environ.pop(name, None)
+
+    def configure_general_reference() -> None:
+        """Force the unfused, non-K-split packed affine G64 oracle."""
+
+        clear_policy_environment()
+        os.environ["FLASH_KDA_GFX950_CONTEXT_AFFINE"] = "1"
+        os.environ["FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS"] = "64"
+        os.environ[_CONTEXT_AFFINE_AB_FUSED_ENV] = "0"
+        os.environ["FLASH_KDA_GFX950_CONTEXT_SCAN_NW"] = "2"
+        os.environ[_CONTEXT_SCAN_KSPLIT_ENV] = "0"
+        os.environ["FLASH_KDA_GFX950_CONTEXT_SCAN_B_STREAM"] = "0"
+        os.environ["FLASH_KDA_GFX950_CONTEXT_SCAN_A_GLL"] = "0"
+        os.environ["FLASH_KDA_GFX950_CONTEXT_SCAN_B_PHASED"] = "0"
+
+    def relative_rms(
+        actual: torch.Tensor, reference: torch.Tensor, label: str
+    ) -> float:
+        if actual.shape != reference.shape or actual.dtype != reference.dtype:
+            raise AssertionError(
+                f"{label}: shape/dtype mismatch: "
+                f"{actual.shape}/{actual.dtype} vs "
+                f"{reference.shape}/{reference.dtype}"
+            )
+        actual_f = actual.float()
+        reference_f = reference.float()
+        if not bool(torch.isfinite(actual_f).all().item()):
+            raise AssertionError(f"{label}: candidate contains non-finite data")
+        if not bool(torch.isfinite(reference_f).all().item()):
+            raise AssertionError(f"{label}: reference contains non-finite data")
+        difference_rms = torch.sqrt(
+            torch.mean(torch.square(actual_f - reference_f))
+        )
+        reference_rms = torch.sqrt(torch.mean(torch.square(reference_f)))
+        error = float(
+            (difference_rms / reference_rms.clamp_min(1.0e-12)).item()
+        )
+        if error > tolerance:
+            raise AssertionError(
+                f"{label}: relative RMS {error:.6e} exceeds {tolerance:.1e}"
+            )
+        return error
+
+    def assert_numerically_equivalent(
+        actual: tuple[torch.Tensor, torch.Tensor],
+        reference: tuple[torch.Tensor, torch.Tensor],
+        seq_lens: tuple[int, ...],
+        label: str,
+    ) -> tuple[float, float]:
+        """Compare route-dependent reductions globally and per sequence."""
+
+        output_errors = [
+            relative_rms(actual[0], reference[0], f"{label} output")
+        ]
+        offset = 0
+        for sequence, length in enumerate(seq_lens):
+            next_offset = offset + length
+            if length:
+                output_errors.append(
+                    relative_rms(
+                        actual[0][:, offset:next_offset],
+                        reference[0][:, offset:next_offset],
+                        f"{label} output sequence {sequence}",
+                    )
+                )
+            offset = next_offset
+        if offset != actual[0].shape[1]:
+            raise AssertionError(
+                f"{label}: packed sequence lengths cover {offset} tokens, "
+                f"output contains {actual[0].shape[1]}"
+            )
+
+        state_errors = [
+            relative_rms(actual[1], reference[1], f"{label} final state")
+        ]
+        for sequence in range(len(seq_lens)):
+            state_errors.append(
+                relative_rms(
+                    actual[1][sequence],
+                    reference[1][sequence],
+                    f"{label} final state sequence {sequence}",
+                )
+            )
+        return max(output_errors), max(state_errors)
+
+    def run_raw_v3(
+        x: dict[str, Any],
+        initial_copy: torch.Tensor,
+        bound: int,
+        label: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        clear_policy_environment()
+        out, final, workspace = allocate(x)
+        out.fill_(float("nan"))
+        final.fill_(float("nan"))
+        workspace.fill_(0x6D)
+        raw_v3_call(module, x, out, final, workspace, bound)
+        torch.cuda.synchronize(device)
+        assert_bitwise_same(
+            x["initial_state"], initial_copy, f"{label} mutated initial state"
+        )
+        return out, final
+
+    cases = (
+        ("n4-extreme-tail", (1, 1, 1, 16381), 4),
+        ("n4-empty-ragged", (0, 1, 8191, 8192), 4),
+        ("n4-mixed", (17, 255, 1025, 15087), 4),
+        ("n4-equal-4x4k", (4096, 4096, 4096, 4096), 4),
+        ("n8-extreme-tail", (1, 1, 1, 1, 1, 1, 1, 16377), 8),
+        (
+            "n8-empty-ragged",
+            (0, 1, 15, 255, 1025, 2048, 4096, 8944),
+            8,
+        ),
+        (
+            "n8-mixed",
+            (17, 63, 255, 1025, 2047, 3073, 4095, 5809),
+            8,
+        ),
+    )
+
+    try:
+        for case_index, (label, seq_lens, sequences) in enumerate(cases):
+            if len(seq_lens) != sequences or sum(seq_lens) != 16384:
+                raise AssertionError(f"invalid K3 16K fixture {label}: {seq_lens}")
+            x = make_inputs(
+                seq_lens,
+                12,
+                device,
+                packed=True,
+                has_initial_state=True,
+                output_final_state=True,
+                seed=20260920 + case_index,
+            )
+            initial_copy = x["initial_state"].clone()
+
+            # This descriptor/raw-v1 pair is intentionally forced onto the
+            # general packed G64 graph: separate A/B producers and the normal
+            # NW2 scan.  It is independent of both no-hint graduations.
+            configure_general_reference()
+            _, reference_out, reference_final = check_raw_vs_descriptor(
+                module, x, f"raw-v3 K3 16K {label} forced-general reference"
+            )
+            if reference_final is None:
+                raise AssertionError(f"{label}: reference omitted final state")
+            reference = (reference_out, reference_final)
+
+            no_hint = run_raw_v3(
+                x, initial_copy, 0, f"raw-v3 K3 16K {label}/no-hint"
+            )
+            no_hint_errors = assert_numerically_equivalent(
+                no_hint,
+                reference,
+                seq_lens,
+                f"raw-v3 K3 16K {label}/no-hint vs forced-general",
+            )
+
+            clear_policy_environment()
+            names = _capture_raw_v3_kernel_names(module, x, 0)
+            _assert_k3_16k_no_hint_topology(
+                names, sequences=sequences, label=f"raw-v3 K3 16K {label}"
+            )
+            assert_bitwise_same(
+                x["initial_state"],
+                initial_copy,
+                f"raw-v3 K3 16K {label} graph capture mutated initial state",
+            )
+
+            exact_bound = max(seq_lens)
+            conservative_bound = sum(seq_lens)
+            if not exact_bound < conservative_bound:
+                raise AssertionError(
+                    f"{label}: fixture cannot exercise a strict over-hint"
+                )
+            for hint_label, bound in (
+                ("exact-hint", exact_bound),
+                ("conservative-over-hint", conservative_bound),
+            ):
+                hinted = run_raw_v3(
+                    x,
+                    initial_copy,
+                    bound,
+                    f"raw-v3 K3 16K {label}/{hint_label}",
+                )
+                # A valid hint can change the selected reduction tree.  The
+                # contract is numerical equivalence, not bitwise identity.
+                assert_numerically_equivalent(
+                    hinted,
+                    no_hint,
+                    seq_lens,
+                    f"raw-v3 K3 16K {label}/{hint_label} vs no-hint",
+                )
+                assert_numerically_equivalent(
+                    hinted,
+                    reference,
+                    seq_lens,
+                    f"raw-v3 K3 16K {label}/{hint_label} vs forced-general",
+                )
+
+            # Deliberately do not launch with max(seq_lens)-1.  The hint is a
+            # caller promise about device-resident cu_seqlens; validating its
+            # true maximum on the host would require a synchronization/readback.
+            # An aggregate-valid but too-small value violates that promise and
+            # may select a specialization whose precondition is false.
+            print(
+                "PASS raw-v3 K3 16K no-hint route/result/hint contract: "
+                f"{label}, max output/state rRMS vs general="
+                f"{no_hint_errors[0]:.3e}/{no_hint_errors[1]:.3e}"
+            )
+
+        # The N4 fused/K-split and N8 ordinary G64 routes are separate
+        # automatic families.  Capture each on an even layout and replay it
+        # on an empty/ragged layout with identical host geometry and pointers.
+        graph_cases = (
+            (
+                4,
+                (4096, 4096, 4096, 4096),
+                (0, 1, 8191, 8192),
+            ),
+            (
+                8,
+                (2048,) * 8,
+                (0, 1, 15, 255, 1025, 2048, 4096, 8944),
+            ),
+        )
+        for graph_index, (
+            sequences,
+            capture_lens,
+            replay_lens,
+        ) in enumerate(graph_cases):
+            graph_x = make_inputs(
+                capture_lens,
+                12,
+                device,
+                packed=True,
+                has_initial_state=True,
+                output_final_state=True,
+                seed=20261040 + graph_index,
+            )
+
+            def assert_k3_16k_topology(
+                names: list[str],
+                graph_label: str,
+                expected_sequences: int = sequences,
+            ) -> None:
+                _assert_k3_16k_no_hint_topology(
+                    names,
+                    sequences=expected_sequences,
+                    label=graph_label,
+                )
+
+            replay_errors = _check_raw_v3_no_hint_changed_prefix_replay(
+                module,
+                device,
+                graph_x,
+                replay_lens,
+                f"raw-v3 K3 N{sequences}/16K no-hint changed-prefix graph",
+                clear_policy_environment,
+                configure_general_reference,
+                assert_k3_16k_topology,
+            )
+            print(
+                f"PASS raw-v3 K3 N{sequences}/16K no-hint graph replay: "
+                f"max output/state rRMS={replay_errors[0]:.3e}/"
+                f"{replay_errors[1]:.3e}"
+            )
+    finally:
+        for name, value in previous_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def check_raw_v3_gva_n4_16k_no_hint_matrix(
+    module, device: torch.device
+) -> None:
+    """Validate ratio-2/4 GVA no-hint G32/NW4 routes and hint results."""
+
+    if flash_kda._device_arch(device) != "gfx950":
+        print("SKIP raw-v3 GVA N4/16K no-hint route/graph matrix: gfx950 only")
+        return
+
+    previous_env = {
+        name: os.environ.get(name) for name in _RAW_V2_POLICY_ENV
+    }
+    tolerance = 1.0e-2
+
+    def clear_policy_environment() -> None:
+        for name in _RAW_V2_POLICY_ENV:
+            os.environ.pop(name, None)
+
+    def configure_general_reference() -> None:
+        """Force the ordinary packed G32 producer/NW4 scan oracle."""
+
+        clear_policy_environment()
+        os.environ["FLASH_KDA_GFX950_CONTEXT_AFFINE"] = "1"
+        os.environ["FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS"] = "32"
+        os.environ[_CONTEXT_AFFINE_AB_FUSED_ENV] = "0"
+        os.environ["FLASH_KDA_GFX950_CONTEXT_SCAN_NW"] = "4"
+        os.environ[_CONTEXT_SCAN_KSPLIT_ENV] = "0"
+        os.environ["FLASH_KDA_GFX950_CONTEXT_SCAN_B_STREAM"] = "0"
+        os.environ["FLASH_KDA_GFX950_CONTEXT_SCAN_A_GLL"] = "0"
+        os.environ["FLASH_KDA_GFX950_CONTEXT_SCAN_B_PHASED"] = "0"
+
+    def relative_rms(
+        actual: torch.Tensor, reference: torch.Tensor, label: str
+    ) -> float:
+        if actual.shape != reference.shape or actual.dtype != reference.dtype:
+            raise AssertionError(
+                f"{label}: shape/dtype mismatch: "
+                f"{actual.shape}/{actual.dtype} vs "
+                f"{reference.shape}/{reference.dtype}"
+            )
+        actual_f = actual.float()
+        reference_f = reference.float()
+        if not bool(torch.isfinite(actual_f).all().item()):
+            raise AssertionError(f"{label}: candidate contains non-finite data")
+        if not bool(torch.isfinite(reference_f).all().item()):
+            raise AssertionError(f"{label}: reference contains non-finite data")
+        difference_rms = torch.sqrt(
+            torch.mean(torch.square(actual_f - reference_f))
+        )
+        reference_rms = torch.sqrt(torch.mean(torch.square(reference_f)))
+        error = float(
+            (difference_rms / reference_rms.clamp_min(1.0e-12)).item()
+        )
+        if error > tolerance:
+            raise AssertionError(
+                f"{label}: relative RMS {error:.6e} exceeds {tolerance:.1e}"
+            )
+        return error
+
+    def assert_numerically_equivalent(
+        actual: tuple[torch.Tensor, torch.Tensor],
+        reference: tuple[torch.Tensor, torch.Tensor],
+        seq_lens: tuple[int, ...],
+        label: str,
+    ) -> tuple[float, float]:
+        output_errors = [
+            relative_rms(actual[0], reference[0], f"{label} output")
+        ]
+        offset = 0
+        for sequence, length in enumerate(seq_lens):
+            next_offset = offset + length
+            if length:
+                output_errors.append(
+                    relative_rms(
+                        actual[0][:, offset:next_offset],
+                        reference[0][:, offset:next_offset],
+                        f"{label} output sequence {sequence}",
+                    )
+                )
+            offset = next_offset
+        if offset != actual[0].shape[1]:
+            raise AssertionError(
+                f"{label}: packed sequence lengths cover {offset} tokens, "
+                f"output contains {actual[0].shape[1]}"
+            )
+
+        state_errors = [
+            relative_rms(actual[1], reference[1], f"{label} final state")
+        ]
+        for sequence in range(len(seq_lens)):
+            state_errors.append(
+                relative_rms(
+                    actual[1][sequence],
+                    reference[1][sequence],
+                    f"{label} final state sequence {sequence}",
+                )
+            )
+        return max(output_errors), max(state_errors)
+
+    def run_raw_v3(
+        x: dict[str, Any],
+        initial_copy: torch.Tensor,
+        bound: int,
+        label: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        clear_policy_environment()
+        out, final, workspace = allocate(x)
+        out.fill_(float("nan"))
+        final.fill_(float("nan"))
+        workspace.fill_(0x47)
+        raw_v3_call(module, x, out, final, workspace, bound)
+        torch.cuda.synchronize(device)
+        assert_bitwise_same(
+            x["initial_state"], initial_copy, f"{label} mutated initial state"
+        )
+        return out, final
+
+    cases = (
+        ("ratio2-equal-4x4k", 4, (4096, 4096, 4096, 4096)),
+        ("ratio2-extreme-tail", 4, (1, 1, 1, 16381)),
+        ("ratio2-empty-ragged", 4, (0, 1, 8191, 8192)),
+        ("ratio4-equal-4x4k", 8, (4096, 4096, 4096, 4096)),
+        ("ratio4-extreme-tail", 8, (1, 1, 1, 16381)),
+        ("ratio4-empty-ragged", 8, (0, 1, 8191, 8192)),
+    )
+
+    try:
+        for case_index, (label, value_heads, seq_lens) in enumerate(cases):
+            if len(seq_lens) != 4 or sum(seq_lens) != 16384:
+                raise AssertionError(f"invalid GVA N4/16K fixture: {seq_lens}")
+            x = make_inputs(
+                seq_lens,
+                2,
+                device,
+                value_heads=value_heads,
+                packed=True,
+                has_initial_state=True,
+                output_final_state=True,
+                seed=20260940 + case_index,
+            )
+            initial_copy = x["initial_state"].clone()
+
+            configure_general_reference()
+            descriptor_out, descriptor_final, descriptor_workspace = allocate(x)
+            raw_out, raw_final, raw_workspace = allocate(x)
+            descriptor_call(
+                x, descriptor_out, descriptor_final, descriptor_workspace
+            )
+            raw_v3_call(module, x, raw_out, raw_final, raw_workspace, 0)
+            torch.cuda.synchronize(device)
+            assert_same(
+                raw_out,
+                descriptor_out,
+                f"raw-v3 GVA {label} forced-general output mismatch",
+            )
+            assert_same(
+                raw_final,
+                descriptor_final,
+                f"raw-v3 GVA {label} forced-general final-state mismatch",
+            )
+            assert_bitwise_same(
+                x["initial_state"],
+                initial_copy,
+                f"raw-v3 GVA {label} forced-general mutated initial state",
+            )
+            reference = (descriptor_out, descriptor_final)
+
+            no_hint = run_raw_v3(
+                x, initial_copy, 0, f"raw-v3 GVA {label}/no-hint"
+            )
+            no_hint_errors = assert_numerically_equivalent(
+                no_hint,
+                reference,
+                seq_lens,
+                f"raw-v3 GVA {label}/no-hint vs forced-general",
+            )
+
+            clear_policy_environment()
+            names = _capture_raw_v3_kernel_names(module, x, 0)
+            _assert_gva_n4_16k_no_hint_topology(
+                names, f"raw-v3 GVA {label}/no-hint"
+            )
+            assert_bitwise_same(
+                x["initial_state"],
+                initial_copy,
+                f"raw-v3 GVA {label} graph capture mutated initial state",
+            )
+
+            exact_bound = max(seq_lens)
+            conservative_bound = sum(seq_lens)
+            for hint_label, bound in (
+                ("exact-hint", exact_bound),
+                ("conservative-over-hint", conservative_bound),
+            ):
+                hinted = run_raw_v3(
+                    x,
+                    initial_copy,
+                    bound,
+                    f"raw-v3 GVA {label}/{hint_label}",
+                )
+                # Exact and conservative hints may intentionally take their
+                # own routes (G16 for hinted ratio-2 equal, G32 for ratio-4,
+                # or a general fallback).  Compare numerically, not bitwise.
+                assert_numerically_equivalent(
+                    hinted,
+                    no_hint,
+                    seq_lens,
+                    f"raw-v3 GVA {label}/{hint_label} vs no-hint",
+                )
+                assert_numerically_equivalent(
+                    hinted,
+                    reference,
+                    seq_lens,
+                    f"raw-v3 GVA {label}/{hint_label} vs forced-general",
+                )
+
+            # Do not manufacture an aggregate-valid under-hint.  The actual
+            # maximum lives in device cu_seqlens; checking it on the host would
+            # require synchronization, so callers must honor the upper-bound
+            # contract before a specialized route may consume the hint.
+            print(
+                "PASS raw-v3 GVA N4/16K no-hint route/result/hint contract: "
+                f"{label}, max output/state rRMS vs general="
+                f"{no_hint_errors[0]:.3e}/{no_hint_errors[1]:.3e}"
+            )
+
+        # Ratio 2 and ratio 4 instantiate different GVA K1 templates.  Replay
+        # one graph from each after replacing only the device prefix with an
+        # empty/ragged distribution at the same N and total-token budget.
+        for graph_index, value_heads in enumerate((4, 8)):
+            graph_x = make_inputs(
+                (4096, 4096, 4096, 4096),
+                2,
+                device,
+                value_heads=value_heads,
+                packed=True,
+                has_initial_state=True,
+                output_final_state=True,
+                seed=20261060 + graph_index,
+            )
+
+            def assert_gva_n4_topology(
+                names: list[str], graph_label: str
+            ) -> None:
+                _assert_gva_n4_16k_no_hint_topology(names, graph_label)
+
+            replay_errors = _check_raw_v3_no_hint_changed_prefix_replay(
+                module,
+                device,
+                graph_x,
+                (0, 1, 8191, 8192),
+                f"raw-v3 GVA Hq2/Hv{value_heads} N4/16K no-hint graph",
+                clear_policy_environment,
+                configure_general_reference,
+                assert_gva_n4_topology,
+            )
+            print(
+                f"PASS raw-v3 GVA Hq2/Hv{value_heads} N4/16K graph replay: "
+                f"max output/state rRMS={replay_errors[0]:.3e}/"
+                f"{replay_errors[1]:.3e}"
+            )
+    finally:
+        for name, value in previous_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def check_raw_v2_invalid_bounds(
@@ -11851,6 +13954,10 @@ def main():
         module, x, "packed-primary"
     )
     check_raw_v2_invalid_bounds(module, device, min(args.heads, 2))
+    check_raw_v3_k3_mixed_boundary_no_hint(module, device)
+    check_raw_v3_gva_mixed_boundary_no_hint(module, device)
+    check_raw_v3_k3_16k_no_hint_matrix(module, device)
+    check_raw_v3_gva_n4_16k_no_hint_matrix(module, device)
     check_raw_v2_hint_policy_matrix(module, device, min(args.heads, 2))
     check_state_layout_matrix(module, device, min(args.heads, 2))
     check_forced_hybrid_route(module, device, min(args.heads, 2))

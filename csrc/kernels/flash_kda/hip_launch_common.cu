@@ -158,7 +158,7 @@ void launch_fwd_common(
     // guards here before suppressing architecture-neutral work so a partial or
     // future policy cannot expose uninitialized prefix storage.
     const bool use_context_direct_prefixless =
-        use_context_parallel && !is_gva && is_varlen &&
+        use_context_parallel && is_varlen &&
         !use_context_equal_dense_n4_g64 &&
         policy.context_direct_prefixless &&
         policy.launch_bt16_k1 != nullptr &&

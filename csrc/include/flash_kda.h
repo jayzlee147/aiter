@@ -131,7 +131,15 @@ void flash_kda_fwd_hip_raw(
 
 // Additive raw ABI carrying a graph-safe host routing hint.  The original
 // 25-argument symbol above is retained byte-for-byte at the call boundary;
-// zero keeps its legacy policy semantics.
+// zero means absent hint and may still select a strictly guarded
+// host-aggregate specialization.  A nonzero value is a caller promise that
+// it is at least the maximum sequence length stored in device cu_seqlens for
+// this launch (and for every replay of a captured graph).  The raw ABI cannot
+// validate that promise without a device-to-host synchronization; violating
+// it is invalid and may select a specialization with insufficient scratch or
+// incompatible geometry.  Any truthful, possibly conservative upper bound
+// preserves the mathematical result but may choose a different reduction
+// topology and therefore need not be bitwise identical.
 void flash_kda_fwd_hip_raw_v2(
     std::uintptr_t q_ptr,
     std::uintptr_t k_ptr,
