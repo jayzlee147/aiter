@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import importlib
 import math
+import os
 
 import pytest
 import torch
@@ -181,6 +182,29 @@ def _relative_rms(actual: torch.Tensor, reference: torch.Tensor) -> float:
     rms = (actual - reference).square().mean().sqrt()
     denominator = reference.square().mean().sqrt().clamp_min(1e-8)
     return float((rms / denominator).item())
+
+
+def _max_packed_relative_rms(
+    actual: torch.Tensor,
+    reference: torch.Tensor,
+    seq_lens: tuple[int, ...],
+) -> float:
+    """Return the worst global or nonempty-sequence relative RMS error."""
+
+    errors = [_relative_rms(actual, reference)]
+    offset = 0
+    for length in seq_lens:
+        next_offset = offset + length
+        if length:
+            errors.append(
+                _relative_rms(
+                    actual[:, offset:next_offset],
+                    reference[:, offset:next_offset],
+                )
+            )
+        offset = next_offset
+    assert offset == actual.shape[1] == reference.shape[1]
+    return max(errors)
 
 
 def _require_native(inputs: dict[str, object]) -> None:
@@ -478,6 +502,147 @@ def test_public_default_backend_reaches_real_native_kernel(
     assert direct_ht is not None and public_ht is not None
     assert torch.equal(public_o, direct_o)
     assert torch.equal(public_ht, direct_ht)
+
+
+@pytest.mark.parametrize(
+    ("heads", "value_heads"),
+    [
+        pytest.param(12, 12, id="k3-h12"),
+        pytest.param(2, 4, id="gva-hq2-hv4"),
+        pytest.param(2, 8, id="gva-hq2-hv8"),
+    ],
+)
+@requires_rocm_gpu
+def test_public_native_mixed_hint_resume_chain_is_equivalent(
+    monkeypatch, heads, value_heads
+):
+    """Valid no/exact/over hints may change routing, never KDA semantics."""
+
+    device = torch.device("cuda")
+    if _NATIVE_MODULE._device_arch(device) != "gfx950":  # noqa: SLF001
+        pytest.skip("mixed-hint production routing is gfx950-specific")
+
+    # Exercise the production policy even when a developer shell carries an
+    # unrelated route experiment. monkeypatch restores every value afterwards.
+    monkeypatch.delenv("AITER_TRITON_ONLY", raising=False)
+    monkeypatch.delenv("AITER_KDA_BACKEND", raising=False)
+    for name in tuple(os.environ):
+        if name.startswith("FLASH_KDA_"):
+            monkeypatch.delenv(name, raising=False)
+
+    # A source-only cold start may use the descriptor ABI while JIT builds the
+    # extension.  Warm it once, then retain the real raw-v3 callable so the spy
+    # below observes ABI transport without replacing native execution.
+    warmup_inputs = _make_k3_inputs(
+        (1,),
+        heads=heads,
+        value_heads=value_heads,
+        resume=True,
+        device=device,
+        seed=20261100 + value_heads,
+    )
+    _require_native(warmup_inputs)
+    _PUBLIC_MODULE.chunk_kimi_delta_attn(
+        **warmup_inputs,
+        backend="native",
+        max_seqlen_upper_bound=None,
+    )
+    torch.cuda.synchronize(device)
+    real_binding = _NATIVE_MODULE._get_raw_pointer_binding()  # noqa: SLF001
+    assert real_binding is not None and real_binding[1] == 3, (
+        "mixed-hint coverage requires the native FlashKDA raw-v3 ABI"
+    )
+    real_raw_v3 = real_binding[0]
+    raw_v3_tail_args: list[tuple[int, int]] = []
+
+    def raw_v3_spy(*args):
+        assert len(args) == 27
+        raw_v3_tail_args.append((int(args[-2]), int(args[-1])))
+        return real_raw_v3(*args)
+
+    monkeypatch.setattr(
+        _NATIVE_MODULE, "_RAW_POINTER_BINDING", (raw_v3_spy, 3)
+    )
+
+    decodes = (1,) * 15
+    steps = (
+        ("no-hint", decodes + (1024,), None),
+        ("exact-hint", (1025,) + decodes, 1025),
+        ("truthful-over-hint", decodes + (1025,), 1040),
+    )
+    tolerance = 1.0e-3
+    candidate_state = None
+    reference_state = None
+
+    for step_index, (hint_label, seq_lens, bound) in enumerate(steps):
+        inputs = _make_k3_inputs(
+            seq_lens,
+            heads=heads,
+            value_heads=value_heads,
+            resume=step_index == 0,
+            device=device,
+            seed=20261200 + value_heads * 10 + step_index,
+        )
+        if step_index == 0:
+            candidate_state = inputs["initial_state"].clone()
+            reference_state = inputs["initial_state"].clone()
+        assert candidate_state is not None and reference_state is not None
+
+        candidate_inputs = {**inputs, "initial_state": candidate_state}
+        reference_inputs = {**inputs, "initial_state": reference_state}
+        _require_native(candidate_inputs)
+        candidate_input_copy = candidate_state.clone()
+        reference_input_copy = reference_state.clone()
+
+        raw_v3_tail_args.clear()
+        candidate_o, candidate_final = _PUBLIC_MODULE.chunk_kimi_delta_attn(
+            **candidate_inputs,
+            backend="native",
+            max_seqlen_upper_bound=bound,
+        )
+        reference_o, reference_final = _PUBLIC_MODULE.chunk_kimi_delta_attn(
+            **reference_inputs,
+            backend="native",
+            max_seqlen_upper_bound=None,
+        )
+        torch.cuda.synchronize(device)
+
+        # This proves public API -> raw-v3 ABI transport.  The existing raw
+        # graph route validator separately proves that C++ consumes the hint.
+        candidate_bound = 0 if bound is None else bound
+        assert raw_v3_tail_args == [
+            (candidate_bound, heads),
+            (0, heads),
+        ], f"{hint_label} raw-v3 tail args were {raw_v3_tail_args}"
+        assert candidate_final is not None and reference_final is not None
+        assert torch.isfinite(candidate_o).all()
+        assert torch.isfinite(candidate_final).all()
+        assert torch.equal(candidate_state, candidate_input_copy)
+        assert torch.equal(reference_state, reference_input_copy)
+        output_error = _max_packed_relative_rms(
+            candidate_o, reference_o, seq_lens
+        )
+        state_error = _relative_rms(candidate_final, reference_final)
+        for sequence in range(len(seq_lens)):
+            state_error = max(
+                state_error,
+                _relative_rms(
+                    candidate_final[sequence], reference_final[sequence]
+                ),
+            )
+        assert output_error <= tolerance, (
+            f"{hint_label} step {step_index} output rRMS "
+            f"{output_error:.6e} exceeds {tolerance:.1e}"
+        )
+        assert state_error <= tolerance, (
+            f"{hint_label} step {step_index} state rRMS "
+            f"{state_error:.6e} exceeds {tolerance:.1e}"
+        )
+
+        # Feed the actual returned allocations into the next public API call;
+        # cloning here would weaken the resume-chain coverage.
+        candidate_state = candidate_final
+        reference_state = reference_final
 
 
 @pytest.mark.parametrize("arch", ["gfx942", "gfx950"])
