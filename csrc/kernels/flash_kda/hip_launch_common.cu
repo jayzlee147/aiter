@@ -119,11 +119,12 @@ void launch_fwd_common(
         policy.launch_context_parallel != nullptr &&
         (!is_gva || (policy.launch_bt16_k1 != nullptr &&
                      policy.bt16_k1_supports_gva));
-    // Close the producer/consumer cache ABI before either callback runs.  GVA
-    // deliberately stays on raw beta/ws_gt: keeping a single uncached GVA K1
-    // specialization avoids a large compile-time/code-size expansion.
+    // Close the producer/consumer cache ABI before either callback runs.  The
+    // architecture capability is resolved per launch, so it may admit a
+    // narrowly matched GVA producer/consumer graph while leaving every other
+    // grouped-head route on the uncached ABI.
     const bool request_context_operand_cache =
-        use_context_parallel && !is_gva &&
+        use_context_parallel &&
         policy.launch_bt16_k1 != nullptr &&
         policy.bt16_k1_context_operand_cache;
     // The raw-v2 maximum is a caller promise: every packed sequence is no

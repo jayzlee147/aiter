@@ -138,6 +138,7 @@ _RAW_V2_POLICY_ENV = (
     "FLASH_KDA_K2",
     "FLASH_KDA_GFX950_BT16_K1",
     "FLASH_KDA_GFX950_BT16_FUSED",
+    "FLASH_KDA_GFX950_BT16_FUSED_OPT",
     _BT16_DENSE_N1_ALL_FULL_C16_ENV,
     _BT16_DENSE_N1_PADDED_SOLVE_ENV,
     _BT16_DENSE_N1_EARLY_BETA_ENV,
@@ -1304,8 +1305,7 @@ def _check_context_direct_prefixless_policy_static(
     flat_guard = context_launch[flat_guard_start : flat_guard_end + 1]
     flat_guard_contracts = (
         "const bool automatic_mixed_boundary_nw1_flat = "
-        "!a.is_gva && a.packed_direct_prefixless && "
-        "a.is_varlen && a.N == 16",
+        "a.packed_direct_prefixless && a.is_varlen && a.N == 16",
         "a.total_tiles == 81 && "
         "(a.T_seq == 64 || a.T_seq == 65)",
         f'std::getenv( "{_CONTEXT_DIRECT_PREFIXLESS_ENV}") == nullptr',
@@ -1457,6 +1457,7 @@ def _check_context_direct_prefixless_policy_static(
         pure_direct: bool = True,
         q_heads: int = 12,
         value_heads: int = 12,
+        cache_enabled: bool = True,
     ) -> tuple[bool, bool]:
         equal_heads = q_heads == value_heads
         supported_gva = q_heads == 2 and value_heads in (4, 8)
@@ -1500,7 +1501,7 @@ def _check_context_direct_prefixless_policy_static(
             and nw1_flat_value is None
             and all(value is None for value in route_values)
             and pure_direct
-            and equal_heads
+            and cache_enabled
         )
         return prefixless, automatic_flat
 
@@ -1578,9 +1579,20 @@ def _check_context_direct_prefixless_policy_static(
     for value_heads in (4, 8):
         if selected(
             target, None, 81, q_heads=2, value_heads=value_heads
-        ) != (True, False):
+        ) != (True, True):
             raise AssertionError(
                 f"no-hint GVA Hq2/Hv{value_heads} mixed route changed"
+            )
+        if selected(
+            target,
+            None,
+            81,
+            q_heads=2,
+            value_heads=value_heads,
+            cache_enabled=False,
+        ) != (True, False):
+            raise AssertionError(
+                f"no-hint GVA Hq2/Hv{value_heads} cache rollback changed"
             )
     if selected(target, None, 81, q_heads=2, value_heads=6) != (False, False):
         raise AssertionError("no-hint K3 specialization admitted unsupported GVA")
@@ -3483,7 +3495,7 @@ def check_gva_whole_route_policy_static() -> None:
         "(!is_gva || (policy.launch_bt16_k1 != nullptr && "
         "policy.bt16_k1_supports_gva));",
         "const bool request_context_operand_cache = "
-        "use_context_parallel && !is_gva && "
+        "use_context_parallel && "
         "policy.launch_bt16_k1 != nullptr && "
         "policy.bt16_k1_context_operand_cache;",
         "const bool use_csplit_bt16_k1 = use_default_csplit64 && "
@@ -3507,10 +3519,19 @@ def check_gva_whole_route_policy_static() -> None:
     # while all persistent workspaces and K2 launches remain value-head major.
     k1_contracts = (
         "bool DENSE_N1_ALL_FULL_C16, bool GVA = false>",
-        "static_assert(!GVA || (!CACHE_CONTEXT_OPERANDS && "
-        "!PUBLISH_ACTIVATED_BETA && !DENSE_N1_ALL_FULL_C16)",
-        "if (a.H_q != a.H) { auto launch_gva = [&]<bool VL, "
-        "bool PACKED_DIRECT_PREFIXLESS>()",
+        "VL && CACHE_CONTEXT_OPERANDS && PUBLISH_ACTIVATED_BETA && "
+        "PACKED_DIRECT_PREFIXLESS",
+        "const bool gva_prefixless_context_cache = p.H_q == 2 && "
+        "(p.H == 4 || p.H == 8) && p.cu_seqlens != nullptr && "
+        "p.N == 16 && (p.T_total == 1039 || p.T_total == 1040) && "
+        "p.total_tiles == 81 && use_context_direct_prefixless && "
+        "bt16_fused_mode() == Bt16FusedMode::vector_x32;",
+        "p.H_q == p.H || gva_prefixless_context_cache",
+        "if (a.cache_context_operands && a.is_varlen && "
+        "a.packed_direct_prefixless)",
+        "true, false, true, true, true, true, false, true>( a, grid);",
+        "if (a.H_q != a.H) {",
+        "auto launch_gva = [&]<bool VL, bool PACKED_DIRECT_PREFIXLESS>()",
         "VL, true, false, false, false, PACKED_DIRECT_PREFIXLESS, "
         "false, true>(a, grid);",
         "VL, true, true, false, false, PACKED_DIRECT_PREFIXLESS, "
@@ -3563,8 +3584,7 @@ def check_gva_whole_route_policy_static() -> None:
         "const bool automatic_gva_equal_n4_g16 = "
         "a.automatic_gva_equal_n4_g16 && "
         "automatic_gva_packed_nw4 && group_chunks == 16;",
-        "const bool cache_context_operands = "
-        "a.context_operands_cached && !a.is_gva;",
+        "const bool cache_context_operands = a.context_operands_cached;",
         "const bool automatic_gva_disable_b_stream = "
         "automatic_gva_equal_n4_g16 && automatic_gva_scan_nw4 && "
         "scan_b_stream_env == nullptr;",
@@ -11950,9 +11970,9 @@ def _assert_gva_n4_16k_no_hint_topology(
 
 
 def _assert_gva_mixed_boundary_no_hint_topology(
-    kernel_names: list[str], label: str
+    kernel_names: list[str], label: str, *, cached_flat: bool = True
 ) -> None:
-    """Require prefixless GVA K1 plus ordinary 2-D NW1 direct replay."""
+    """Require the matched cached-flat or uncached-2D GVA direct graph."""
 
     if len(kernel_names) != 2:
         raise AssertionError(
@@ -11984,16 +12004,16 @@ def _assert_gva_mixed_boundary_no_hint_topology(
     k1_flags = tuple(
         int(value) for value in re.findall(r"Lb([01])E", k1_match["flags"])
     )
-    if (
-        len(k1_flags) != 13
-        or k1_flags[0] != 1
-        or k1_flags[8] != 1
-        or k1_flags[12] != 1
-        or any(k1_flags[index] for index in range(9, 12))
-    ):
+    expected_k1_flags = (
+        (1, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1)
+        if cached_flat
+        else (1, 0, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 1)
+    )
+    if k1_flags != expected_k1_flags:
         raise AssertionError(
-            f"{label}: K1 did not select packed-prefixless GVA: "
-            f"flags={k1_flags!r}, name={k1_names[0]!r}"
+            f"{label}: K1 did not select cached packed-prefixless GVA: "
+            f"flags={k1_flags!r}, expected={expected_k1_flags!r}, "
+            f"name={k1_names[0]!r}"
         )
 
     _assert_context_route_topology(kernel_names, ((1, 2, 1),), label)
@@ -12004,18 +12024,18 @@ def _assert_gva_mixed_boundary_no_hint_topology(
             context.append((name, match))
     if len(context) != 1:
         raise AssertionError(
-            f"{label}: expected one ordinary 2-D NW1 replay, got "
+            f"{label}: expected one matched NW1 replay, got "
             f"{context!r}; all kernels={kernel_names!r}"
         )
     name, match = context[0]
     expected_fields = {
         "vl": 1,
         "direct": 1,
-        "cached": 0,
+        "cached": int(cached_flat),
         "u_forward": 1,
         "v_forward": 1,
         "lds_pipeline": 0,
-        "tail_first": 0,
+        "tail_first": int(cached_flat),
         "prefixless": 1,
     }
     mismatches = {
@@ -12640,6 +12660,47 @@ def check_raw_v3_gva_mixed_boundary_no_hint(
                         initial_copy,
                         f"raw-v3 GVA mixed {label} graph mutated state",
                     )
+
+                    if (
+                        value_heads == 4
+                        and prefill_tokens == 1025
+                        and not prefill_first
+                    ):
+                        clear_policy_environment()
+                        os.environ[
+                            "FLASH_KDA_GFX950_CONTEXT_OPERAND_CACHE"
+                        ] = "0"
+                        rollback_out, rollback_final, rollback_workspace = (
+                            allocate(x)
+                        )
+                        raw_v3_call(
+                            module,
+                            x,
+                            rollback_out,
+                            rollback_final,
+                            rollback_workspace,
+                            0,
+                        )
+                        torch.cuda.synchronize(device)
+                        assert_numerically_equivalent(
+                            (rollback_out, rollback_final),
+                            reference,
+                            seq_lens,
+                            f"raw-v3 GVA mixed {label}/cache-0 rollback",
+                        )
+                        rollback_names = _capture_raw_v3_kernel_names(
+                            module, x, 0
+                        )
+                        _assert_gva_mixed_boundary_no_hint_topology(
+                            rollback_names,
+                            f"raw-v3 GVA mixed {label}/cache-0 rollback",
+                            cached_flat=False,
+                        )
+                        assert_bitwise_same(
+                            x["initial_state"],
+                            initial_copy,
+                            f"raw-v3 GVA mixed {label}/cache-0 mutated state",
+                        )
 
                     for hint_label, bound in (
                         ("exact-hint", prefill_tokens),

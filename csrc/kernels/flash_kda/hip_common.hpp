@@ -361,10 +361,10 @@ struct ContextParallelLaunch {
     // context decay operands.  Consumers must use this launch-time handshake
     // instead of independently re-reading process environment.
     bool context_operands_cached = false;
-    // Whole-launch geometry bit used to keep grouped-value attention on the
-    // generic uncached context graph.  Context K2 itself is value-head based,
-    // but cache-dependent and metadata-eliding specializations are not yet
-    // part of the GVA producer/consumer contract.
+    // Whole-launch grouped-value geometry bit.  Context K2 is value-head
+    // based; only a policy-advertised producer/consumer handshake may enable
+    // its operand cache for GVA, while metadata-eliding specializations remain
+    // equal-head-only.
     bool is_gva = false;
     // Policy-resolved routing facts.  Carry these across common dispatch so
     // the architecture callback does not reconstruct an automatic route from

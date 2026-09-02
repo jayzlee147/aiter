@@ -231,8 +231,20 @@ public:
         // for that diagnostic setting; the production fused mode supports it.
         policy.bt16_k1_supports_gva =
             bt16_fused_mode() != Bt16FusedMode::disabled;
+        // The general GVA graph deliberately stays uncached to control code
+        // size.  The two-node mixed-boundary graph is different: its matched
+        // prefixless producer/replay pair can publish and consume the same
+        // value-head-major beta/decay cache as equal-head KDA.  Restrict that
+        // extension to the vector-X32 producer used by the zero-env route.
+        const bool gva_prefixless_context_cache =
+            p.H_q == 2 && (p.H == 4 || p.H == 8) &&
+            p.cu_seqlens != nullptr && p.N == 16 &&
+            (p.T_total == 1039 || p.T_total == 1040) &&
+            p.total_tiles == 81 && use_context_direct_prefixless &&
+            bt16_fused_mode() == Bt16FusedMode::vector_x32;
         policy.bt16_k1_context_operand_cache =
-            context_operand_cache_active();
+            context_operand_cache_active() &&
+            (p.H_q == p.H || gva_prefixless_context_cache);
         policy.plain_csplit_supports_gva =
             policy.bt16_k1_supports_gva &&
             policy.launch_bt16_k1 != nullptr &&
@@ -259,12 +271,14 @@ private:
               bool DENSE_N1_ALL_FULL_C16, bool GVA = false>
     static void launch_bt16_fused(
             const Bt16K1Launch& a, const dim3& grid) {
-        static_assert(!GVA ||
-                          (!CACHE_CONTEXT_OPERANDS &&
-                           !PUBLISH_ACTIVATED_BETA &&
-                           !DENSE_N1_ALL_FULL_C16),
-                      "GVA fused K1 cannot use equal-head-only cache/dense "
-                      "specializations");
+        static_assert(
+            !GVA ||
+                ((!CACHE_CONTEXT_OPERANDS && !PUBLISH_ACTIVATED_BETA) ||
+                 (VL && CACHE_CONTEXT_OPERANDS &&
+                  PUBLISH_ACTIVATED_BETA && PACKED_DIRECT_PREFIXLESS)) &&
+                    !DENSE_N1_ALL_FULL_C16,
+            "GVA fused K1 cache is restricted to matched packed-prefixless "
+            "publication");
         static_assert(!PACKED_DIRECT_PREFIXLESS || VL,
                       "prefixless fused K1 launch is packed-only");
         static_assert(!DENSE_N1_ALL_FULL_C16 || !VL,
@@ -397,6 +411,18 @@ private:
         const Bt16FusedMode fused = bt16_fused_mode();
         if (fused != Bt16FusedMode::disabled) {
             if (a.H_q != a.H) {
+                // Policy construction admits this cache only for the matched
+                // GVA packed-prefixless/vector-X32 graph.  Publishing the
+                // already-computed activated beta and complete-chunk decay
+                // lets all eight V16 replay CTAs reuse them, and also enables
+                // the compact cached NW1-flat consumer below.
+                if (a.cache_context_operands && a.is_varlen &&
+                    a.packed_direct_prefixless) {
+                    launch_bt16_fused<
+                        true, false, true, true, true, true, false, true>(
+                            a, grid);
+                    return;
+                }
                 auto launch_gva = [&]<bool VL,
                                       bool PACKED_DIRECT_PREFIXLESS>() {
                     if (fused == Bt16FusedMode::exact_x16)
@@ -1913,8 +1939,7 @@ private:
         // Consume the exact K1 publication fact supplied by common dispatch.
         // The cache is value-head-major, so the same ABI covers GVA after K1
         // has applied the grouped q/k-head mapping to its raw inputs.
-        const bool cache_context_operands =
-            a.context_operands_cached && !a.is_gva;
+        const bool cache_context_operands = a.context_operands_cached;
         const bool forward_u = context_u_forward_enabled();
         const bool forward_v = context_v_forward_enabled();
         const bool context_nw8 = context_nw8_enabled() &&
@@ -1991,8 +2016,7 @@ private:
             // while the zero-environment production recipe changes both
             // mapping and schedule as one measured unit.
             const bool automatic_mixed_boundary_nw1_flat =
-                !a.is_gva && a.packed_direct_prefixless &&
-                a.is_varlen && a.N == 16 &&
+                a.packed_direct_prefixless && a.is_varlen && a.N == 16 &&
                 a.total_tiles == 81 &&
                 (a.T_seq == 64 || a.T_seq == 65) &&
                 std::getenv(
@@ -2004,11 +2028,11 @@ private:
                 std::getenv(
                     "FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS") == nullptr &&
                 direct_nw_value == nullptr && nw1_flat_value == nullptr;
-            // GVA cannot use the cached-operand NW1-flat kernel, but removing
-            // the prefix launch and using the ordinary 2-D NW1 replay still
-            // provides enough independent (head,V16) work at this boundary.
-            // The policy-side aggregate guard limits this automatic recipe to
-            // Hq=2/Hv=4 or 8; explicit scheduling controls remain authoritative.
+            // If the matched cache capability is disabled, GVA still removes
+            // the prefix launch and falls back to the ordinary 2-D NW1 replay.
+            // With the default cache handshake it joins the common NW1-flat
+            // recipe above.  The policy-side aggregate guard limits both to
+            // Hq=2/Hv=4 or 8; explicit controls remain authoritative.
             const bool automatic_gva_mixed_boundary_nw1 =
                 a.is_gva && a.packed_direct_prefixless && a.is_varlen &&
                 a.N == 16 && (a.H == 4 || a.H == 8) &&
