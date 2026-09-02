@@ -553,10 +553,14 @@ def _build_backends(
     inputs: dict[str, object], selected: tuple[str, ...], *, public_k3: bool = False
 ) -> dict[str, Callable[[], tuple[torch.Tensor, torch.Tensor | None]]]:
     def public(backend: str | None):
-        # ATOM omits both ``backend`` and the default scale.  The input fixture
-        # selects whether to pass an exact host hint or None; only comparison
-        # rows force a backend.
+        # ATOM omits ``backend``, the default scale, and the optional length
+        # hint.  When the fixture requests no hint, omit the keyword itself so
+        # the public-K3 acceptance reproduces that call contract literally.
         backend_kwargs = {} if backend is None else {"backend": backend}
+        hint = inputs["max_seqlen_upper_bound"]
+        hint_kwargs = (
+            {} if hint is None else {"max_seqlen_upper_bound": hint}
+        )
         return chunk_kimi_delta_attn(
             q=inputs["q"],
             k=inputs["k"],
@@ -574,7 +578,7 @@ def _build_backends(
             lower_bound=LOWER_BOUND,
             state_v_first=True,
             cu_seqlens=inputs["cu_seqlens"],
-            max_seqlen_upper_bound=inputs["max_seqlen_upper_bound"],
+            **hint_kwargs,
             **backend_kwargs,
         )
 
@@ -874,14 +878,39 @@ def _classify_graph_route(
         for name, low in zip(names, lowered)
         if "flash_kda_segment" in low or "flash_kda_seg_scan" in low
     ]
+    # Equal-head FlashKDA uses the compact prepare/segment implementation.
+    # GVA currently dispatches through the established Triton chunk-KDA
+    # pipeline instead, so prove that route with independent stage anchors.
+    triton_gva_stage_patterns = (
+        "l2norm_fwd_kernel",
+        "beta_sigmoid_fwd_kernel",
+        "chunk_gate_cumsum_kernel",
+        "chunk_delta_attn_fwd_kernel_intra_sub_chunk",
+        "chunk_delta_attn_fwd_kernel_inter_solve",
+        "recompute_w_u_fwd_kernel",
+        "chunk_gated_delta_rule_fwd_kernel",
+        "chunk_gla_fwd_kernel_o",
+    )
+    triton_gva_stages = {
+        pattern: [name for name, low in zip(names, lowered) if pattern in low]
+        for pattern in triton_gva_stage_patterns
+    }
+    triton_compact_route = bool(triton_prepare and triton_segment)
+    triton_compact_present = bool(triton_prepare or triton_segment)
+    triton_gva_route = all(triton_gva_stages.values())
+    triton_gva_present = any(triton_gva_stages.values())
     native_route = backend in ("native", "explicit-native")
     verified = (
         not unresolved
         and bool(native_k1 and native_k2)
         and not (triton_prepare or triton_segment)
+        and not triton_gva_present
         if native_route
         else not unresolved
-        and bool(triton_prepare and triton_segment)
+        and (
+            (triton_compact_route and not triton_gva_present)
+            or (triton_gva_route and not triton_compact_present)
+        )
         and not (native_k1 or native_k2)
     )
     if not verified:
@@ -890,6 +919,8 @@ def _classify_graph_route(
             f"native_k1={len(native_k1)}, native_k2={len(native_k2)}, "
             f"triton_prepare={len(triton_prepare)}, "
             f"triton_segment={len(triton_segment)}, "
+            f"triton_gva_stages="
+            f"{dict((key, len(value)) for key, value in triton_gva_stages.items())}, "
             f"unresolved={len(unresolved)}, names={names}"
         )
     for record in kernels:
@@ -902,10 +933,17 @@ def _classify_graph_route(
                     f"{backend}: invalid {field} for {record.get('name')}: "
                     f"{dimensions}"
                 )
-    return {
-        "route": "native-hip-k1-k2"
+    route = (
+        "native-hip-k1-k2"
         if native_route
-        else "triton-flash-kda-prepare-segment",
+        else (
+            "triton-flash-kda-prepare-segment"
+            if triton_compact_route
+            else "triton-gva-chunk-kda"
+        )
+    )
+    return {
+        "route": route,
         "route_verified": True,
         "node_count": len(records),
         "kernel_node_count": len(kernels),
@@ -1100,6 +1138,10 @@ def _benchmark_case(
             # than merely producing a numerically close Triton result.
             explicit_native = outputs.get("explicit-native")
             if explicit_native is None:
+                hint = inputs["max_seqlen_upper_bound"]
+                hint_kwargs = (
+                    {} if hint is None else {"max_seqlen_upper_bound": hint}
+                )
                 explicit_native = chunk_kimi_delta_attn(
                     q=inputs["q"],
                     k=inputs["k"],
@@ -1117,9 +1159,7 @@ def _benchmark_case(
                     lower_bound=LOWER_BOUND,
                     state_v_first=True,
                     cu_seqlens=inputs["cu_seqlens"],
-                    max_seqlen_upper_bound=inputs[
-                        "max_seqlen_upper_bound"
-                    ],
+                    **hint_kwargs,
                     backend="native",
                 )
                 torch.cuda.synchronize()

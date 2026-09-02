@@ -10,7 +10,7 @@ ROCm graph capture, and alternating paired timing.  This runner fixes the
 promotion matrix and adds deterministic stratified-bootstrap evidence plus a
 fail-closed, three-seed performance decision.
 
-The formal matrix has 30 logical cells at each of seeds 42, 43, and 44:
+The formal matrix has 31 logical cells at each of seeds 42, 43, and 44:
 
 * single lengths 128 through 16K, including 4K, crossed with materialized
   zero FP32 and nonzero FP32 resume state;
@@ -19,7 +19,8 @@ The formal matrix has 30 logical cells at each of seeds 42, 43, and 44:
 * both 1024/1025 mixed-boundary cases; and
 * a nonduplicating N4/N8 16K adversarial route cross.  The established
   ``resume-4x4k`` and ``ragged-16k`` cells supply N4-equal and N8-ragged;
-  four explicit extensions add N4 extreme-tail/mixed and N8 equal/extreme-tail.
+  five explicit extensions add N4 extreme-tail/mixed and N8
+  equal/extreme-tail/mixed.
 
 The mature benchmark intentionally requires every sequence length to be
 positive, so an empty-sequence *performance* cell cannot be represented here.
@@ -75,10 +76,10 @@ MAX_TOLERANCE = 0.04
 PUBLIC_BACKEND = "public-zero-env"
 TRITON_BACKEND = "forced-triton"
 EXPECTED_PLAN_SHA256 = (
-    "5a9a537c38f9d061a4c1675eed5c969a6c96dba24af7bb8321144594ddaa9b29"
+    "026ab17c1f2808441d488084c19884b62215ea59daedf332833fb853efedb7a7"
 )
 
-# These four cases are deliberately local to the formal public-K3 promotion
+# These five cases are deliberately local to the formal public-K3 promotion
 # runner.  Two complementary route cells already exist in the mature source
 # suites and are reused below rather than timed twice.
 K3_16K_ADVERSARIAL_EXTENSIONS = (
@@ -97,6 +98,10 @@ K3_16K_ADVERSARIAL_EXTENSIONS = (
     (
         "n8-extreme-tail-16k",
         (1, 2, 4, 8, 16, 32, 64, 16257),
+    ),
+    (
+        "n8-mixed-16k",
+        (17, 63, 255, 1025, 2047, 3073, 4095, 5809),
     ),
 )
 
@@ -138,6 +143,12 @@ K3_16K_ROUTE_COVERAGE = (
         "ragged-16k-fresh-zero-fp32",
         (127, 255, 511, 1023, 2047, 3073, 4095, 5253),
         True,
+    ),
+    (
+        "n8-mixed",
+        "n8-mixed-16k-fresh-zero-fp32",
+        (17, 63, 255, 1025, 2047, 3073, 4095, 5809),
+        False,
     ),
 )
 
@@ -997,7 +1008,7 @@ def _plan_sha256(plan: dict[str, Any]) -> str:
 def _static_self_test() -> dict[str, Any]:
     if _RUNTIME_LOADED:
         raise RuntimeError("CPU self-test unexpectedly loaded the GPU benchmark")
-    if len(ALL_SPECS) != 30 or len({spec.logical_name for spec in ALL_SPECS}) != 30:
+    if len(ALL_SPECS) != 31 or len({spec.logical_name for spec in ALL_SPECS}) != 31:
         raise RuntimeError("fixed matrix cardinality or names changed")
     if {spec.state_variant for spec in ALL_SPECS if spec.family == "single"} != set(
         STATE_VARIANTS
@@ -1018,8 +1029,8 @@ def _static_self_test() -> dict[str, Any]:
         raise RuntimeError("mixed-production source set changed")
     route_manifest = _k3_16k_route_manifest()
     if (
-        route_manifest["logical_cells"] != 6
-        or route_manifest["new_logical_cells"] != 4
+        route_manifest["logical_cells"] != 7
+        or route_manifest["new_logical_cells"] != 5
         or route_manifest["reused_logical_cells"] != 2
     ):
         raise RuntimeError("K3 N4/N8 16K route coverage cardinality changed")
@@ -1030,6 +1041,7 @@ def _static_self_test() -> dict[str, Any]:
         "n8-equal",
         "n8-extreme-tail",
         "n8-ragged",
+        "n8-mixed",
     }
     if {
         cell["scenario"] for cell in route_manifest["cells"]
@@ -1059,11 +1071,11 @@ def _static_self_test() -> dict[str, Any]:
     if SEEDS != (42, 43, 44) or FORMAL_MIN_SPEEDUP != 1.05:
         raise RuntimeError("formal three-seed per-cell speedup gate changed")
     plan = _plan(SEEDS)
-    if plan["total_seed_cells"] != 90:
+    if plan["total_seed_cells"] != 93:
         raise RuntimeError("formal seed-cell count changed")
     if plan["family_counts_per_seed"].get(
         "k3-16k-no-hint-adversarial"
-    ) != 4:
+    ) != 5:
         raise RuntimeError("formal K3 16K adversarial extension count changed")
     if any(
         cell["max_seqlen_upper_bound"] is not None
@@ -1172,8 +1184,17 @@ def _run_gpu(args: argparse.Namespace) -> dict[str, Any]:
     total_seed_cells = len(ALL_SPECS) * len(args.seed)
     active_seed: int | None = None
     active_spec: CaseSpec | None = None
-    phase = "runtime-import"
+    phase = "plan-identity"
     try:
+        formal_plan = _plan(args.seed)
+        formal_plan_sha256 = _plan_sha256(formal_plan)
+        if formal_plan_sha256 != EXPECTED_PLAN_SHA256:
+            raise RuntimeError(
+                "formal public-K3 matrix identity changed: "
+                f"{formal_plan_sha256} != {EXPECTED_PLAN_SHA256}"
+            )
+
+        phase = "runtime-import"
         benchmark = _load_benchmark()
         suite_identity = _assert_runtime_suite_identity(benchmark)
         torch = benchmark.torch
@@ -1302,8 +1323,8 @@ def _run_gpu(args: argparse.Namespace) -> dict[str, Any]:
                 "initial_state_dtype": "torch.float32",
                 "paired_order": "alternating-position-balanced",
             },
-            "plan": _plan(args.seed),
-            "plan_sha256": _plan_sha256(_plan(args.seed)),
+            "plan": formal_plan,
+            "plan_sha256": formal_plan_sha256,
             "environment": environment,
             "suite_identity": suite_identity,
             "raw_evidence": {
@@ -1389,6 +1410,26 @@ def main(argv: list[str] | None = None) -> None:
                 },
             )
             raise
+        if payload["performance_gate_passed"] is not True:
+            failed = payload["performance_gate"]["failed_logical_cells"]
+            _append_checkpoint(
+                checkpoint,
+                {
+                    "schema": SCHEMA,
+                    "event": "run-failed",
+                    "complete": False,
+                    "capture_complete": True,
+                    "result_json_written": True,
+                    "phase": "performance-gate",
+                    "completed_seed_cells": len(payload["results"]),
+                    "total_seed_cells": len(ALL_SPECS) * len(args.seed),
+                    "performance_gate_passed": False,
+                    "failed_logical_cells": failed,
+                },
+            )
+            raise SystemExit(
+                "formal public-K3 performance gate failed for: " + ", ".join(failed)
+            )
         _append_checkpoint(
             checkpoint,
             {
@@ -1399,16 +1440,9 @@ def main(argv: list[str] | None = None) -> None:
                 "result_json_written": True,
                 "completed_seed_cells": len(payload["results"]),
                 "total_seed_cells": len(ALL_SPECS) * len(args.seed),
-                "performance_gate_passed": payload[
-                    "performance_gate_passed"
-                ],
+                "performance_gate_passed": True,
             },
         )
-        if payload["performance_gate_passed"] is not True:
-            failed = payload["performance_gate"]["failed_logical_cells"]
-            raise SystemExit(
-                "formal public-K3 performance gate failed for: " + ", ".join(failed)
-            )
         return
     _emit(payload, args.output)
 
