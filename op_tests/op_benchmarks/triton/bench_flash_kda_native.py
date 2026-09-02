@@ -3,7 +3,7 @@
 
 """Compare native HIP FlashKDA with both aiter Triton KDA implementations.
 
-All backends receive the same Kimi-K3 TP8-style packed tensors in one process:
+All backends receive the same Kimi-K3 TP8-style tensors in one process:
 
 * ``native`` calls :func:`aiter.ops.flash_kda.flash_kda_fwd` directly;
 * ``triton`` selects the PR #4683 Triton path through the public wrapper; and
@@ -102,10 +102,17 @@ class Case:
     # legacy ``resume`` flag remains the compact spelling for all-or-nothing
     # cases and for the ``--seq-lens --resume`` CLI.
     resume_mask: tuple[bool, ...] | None = None
+    # Packed cases use B=1 plus cu_seqlens.  Dense cases use B=N, equal T,
+    # and pass cu_seqlens=None through the same public API.
+    packed: bool = True
 
     def __post_init__(self) -> None:
         if not self.seq_lens or any(length <= 0 for length in self.seq_lens):
             raise ValueError(f"{self.name}: sequence lengths must be positive")
+        if not self.packed and len(set(self.seq_lens)) != 1:
+            raise ValueError(
+                f"{self.name}: dense cases require one common sequence length"
+            )
         if self.resume and self.resume_mask is not None:
             raise ValueError(f"{self.name}: use either resume or resume_mask")
         if self.resume_mask is not None and len(self.resume_mask) != len(
@@ -395,33 +402,54 @@ def _max_sequence_relative_rms(
     return float(relative_rms.max().item())
 
 
-def _packed_output_max_sequence_relative_rms(
+def _output_max_sequence_relative_rms(
     actual: torch.Tensor,
     reference: torch.Tensor,
-    seq_lens: tuple[int, ...],
+    case: Case,
 ) -> float:
-    """Maximum output relative RMS after slicing the packed token axis."""
+    """Maximum output relative RMS over packed or dense sequences."""
 
-    start = 0
     values = []
-    for length in seq_lens:
-        end = start + length
-        relative_rms, _ = _errors(
-            actual[:, start:end], reference[:, start:end]
-        )
-        values.append(relative_rms)
-        start = end
-    if start != actual.shape[1]:
-        raise ValueError(
-            f"packed lengths cover {start} tokens, output has {actual.shape[1]}"
-        )
+    if case.packed:
+        start = 0
+        for length in case.seq_lens:
+            end = start + length
+            if length > 0:
+                relative_rms, _ = _errors(
+                    actual[:, start:end], reference[:, start:end]
+                )
+                values.append(relative_rms)
+            start = end
+        if start != actual.shape[1]:
+            raise ValueError(
+                f"packed lengths cover {start} tokens, "
+                f"output has {actual.shape[1]}"
+            )
+    else:
+        if actual.shape[0] != len(case.seq_lens):
+            raise ValueError(
+                f"dense batch has {actual.shape[0]} sequences, "
+                f"expected {len(case.seq_lens)}"
+            )
+        for sequence in range(actual.shape[0]):
+            relative_rms, _ = _errors(
+                actual[sequence : sequence + 1],
+                reference[sequence : sequence + 1],
+            )
+            values.append(relative_rms)
+    if not values:
+        raise ValueError(f"{case.name}: no nonempty output sequence")
     return max(values)
 
 
 def _mixed_decode_output(output: torch.Tensor, case: Case) -> torch.Tensor | None:
     """Select resumed one-token outputs from an explicitly mixed case."""
 
-    if case.resume_mask is None or _case_state_label(case) != "mixed":
+    if (
+        not case.packed
+        or case.resume_mask is None
+        or _case_state_label(case) != "mixed"
+    ):
         return None
     pieces = []
     start = 0
@@ -481,8 +509,10 @@ def _make_inputs(
 ) -> dict[str, object]:
     torch.manual_seed(seed)
     total = sum(case.seq_lens)
-    qk_shape = (1, total, heads, HEAD_DIM)
-    value_shape = (1, total, value_heads, HEAD_DIM)
+    batch = 1 if case.packed else len(case.seq_lens)
+    tokens_per_batch = total if case.packed else case.seq_lens[0]
+    qk_shape = (batch, tokens_per_batch, heads, HEAD_DIM)
+    value_shape = (batch, tokens_per_batch, value_heads, HEAD_DIM)
 
     def projection(shape: tuple[int, ...]) -> torch.Tensor:
         return F.silu(torch.randn(shape, device=device, dtype=torch.float32)).to(
@@ -501,7 +531,9 @@ def _make_inputs(
         # This mirrors ATOM: the beta projection is BF16 and is widened before
         # the fused in-kernel sigmoid.
         "beta": torch.randn(
-            (1, total, value_heads), device=device, dtype=torch.bfloat16
+            (batch, tokens_per_batch, value_heads),
+            device=device,
+            dtype=torch.bfloat16,
         ).float(),
         "A_log": torch.empty(value_heads, device=device, dtype=torch.float32)
         .uniform_(1.0, 16.0)
@@ -516,14 +548,21 @@ def _make_inputs(
             resume_mask=_case_resume_mask(case),
             device=device,
         ),
-        "cu_seqlens": torch.tensor(offsets, device=device, dtype=torch.int32),
+        "cu_seqlens": (
+            torch.tensor(offsets, device=device, dtype=torch.int32)
+            if case.packed
+            else None
+        ),
         # The general benchmark uses the exact batch maximum by default.  The
         # caller may replace this with None to reproduce integrations that omit
         # the optional host routing hint (notably ATOM commit 16c20d3048).
         "max_seqlen_upper_bound": max(case.seq_lens),
     }
     assert inputs["dt_bias"].ndim == 1
-    assert inputs["cu_seqlens"].dtype == torch.int32
+    assert inputs["cu_seqlens"] is None or (
+        isinstance(inputs["cu_seqlens"], torch.Tensor)
+        and inputs["cu_seqlens"].dtype == torch.int32
+    )
     return inputs
 
 
@@ -1045,6 +1084,24 @@ def _benchmark_case(
     )
     if omit_max_seqlen_hint:
         inputs["max_seqlen_upper_bound"] = None
+    def public_max_seqlen_keyword_omitted(backend: str) -> bool:
+        """Report the actual call spelling, not merely the normalized value."""
+
+        # In ordinary benchmark mode ``native`` calls flash_kda_native_fwd
+        # directly and always spells the keyword, even when its value is None.
+        # Formal public-K3 mode routes that same label through the public
+        # wrapper, where _build_backends deliberately omits a None-valued
+        # hint.  Triton/baseline/explicit-native always use that public helper.
+        uses_public_helper = public_k3 or backend != "native"
+        return (
+            uses_public_helper
+            and inputs["max_seqlen_upper_bound"] is None
+        )
+    native_policy_effective_max_seqlen = (
+        int(inputs["q"].shape[1])
+        if inputs["cu_seqlens"] is None
+        else inputs["max_seqlen_upper_bound"]
+    )
     if initial_state_none:
         if any(_case_resume_mask(case)):
             raise ValueError(
@@ -1192,10 +1249,8 @@ def _benchmark_case(
                         f"{case.name}/{name} produced non-finite {tensor_name}"
                     )
             output_rms, output_max = _errors(output, reference_o)
-            output_max_sequence_rms = (
-                _packed_output_max_sequence_relative_rms(
-                    output, reference_o, case.seq_lens
-                )
+            output_max_sequence_rms = _output_max_sequence_relative_rms(
+                output, reference_o, case
             )
             state_rms, state_max = _errors(final_state, reference_state)
             state_max_sequence_rms = _max_sequence_relative_rms(
@@ -1333,10 +1388,18 @@ def _benchmark_case(
                         "tokens": sum(case.seq_lens),
                         "heads": heads,
                         "value_heads": value_heads,
+                        "packed": case.packed,
+                        "cu_seqlens_is_none": inputs["cu_seqlens"] is None,
                         "state": _case_state_label(case),
                         "max_seqlen_upper_bound": inputs[
                             "max_seqlen_upper_bound"
                         ],
+                        "public_max_seqlen_upper_bound_keyword_omitted": (
+                            public_max_seqlen_keyword_omitted(name)
+                        ),
+                        "native_policy_effective_max_seqlen_upper_bound": (
+                            native_policy_effective_max_seqlen
+                        ),
                         "latency_ms": elapsed,
                     }
                 )
@@ -1432,9 +1495,17 @@ def _benchmark_case(
             "tokens": total_tokens,
             "heads": heads,
             "value_heads": value_heads,
+            "packed": case.packed,
+            "cu_seqlens_is_none": inputs["cu_seqlens"] is None,
             "seed": seed,
             "state": _case_state_label(case),
             "max_seqlen_upper_bound": inputs["max_seqlen_upper_bound"],
+            "public_max_seqlen_upper_bound_keyword_omitted": (
+                public_max_seqlen_keyword_omitted(name)
+            ),
+            "native_policy_effective_max_seqlen_upper_bound": (
+                native_policy_effective_max_seqlen
+            ),
             "latency_min_ms": min(values),
             "latency_p10_ms": _percentile(values, 0.10),
             "latency_median_ms": median,
@@ -1616,7 +1687,8 @@ def _print_environment(heads: int, value_heads: int) -> dict[str, object]:
     print(
         f"KDA per rank: TP={K3_TP_SIZE}, Hq={heads}, HV={value_heads}, "
         f"K=V={HEAD_DIM}; "
-        "packed cu_seqlens=int32, beta/state=fp32"
+        "layout=packed int32 cu_seqlens or dense cu_seqlens=None, "
+        "beta/state=fp32"
     )
     return metadata
 
@@ -1829,6 +1901,8 @@ def _write_json(
                 "resume_mask": (
                     list(case.resume_mask) if case.resume_mask is not None else None
                 ),
+                "packed": case.packed,
+                "cu_seqlens_is_none": not case.packed,
                 "state": _case_state_label(case),
                 "max_seqlen_upper_bound": (
                     None
@@ -2054,6 +2128,7 @@ def main(argv=None) -> None:
             print(
                 f"{case.name:16s} N={len(case.seq_lens):2d} "
                 f"tokens={sum(case.seq_lens):6d} "
+                f"layout={'packed' if case.packed else 'dense'} "
                 f"state={_case_state_label(case)}"
             )
         return
@@ -2095,7 +2170,9 @@ def main(argv=None) -> None:
     for case in cases:
         print(
             f"Running {case.name}: N={len(case.seq_lens)}, "
-            f"tokens={sum(case.seq_lens)}, state={_case_state_label(case)}, "
+            f"tokens={sum(case.seq_lens)}, "
+            f"layout={'packed' if case.packed else 'dense'}, "
+            f"state={_case_state_label(case)}, "
             f"execution={args.execution}",
             flush=True,
         )

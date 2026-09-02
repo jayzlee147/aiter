@@ -919,7 +919,10 @@ for entry in manifest:
             require(set(raw_reader.fieldnames or ()) == {
                 "backend", "case", "execution", "heads", "latency_ms",
                 "max_seqlen_upper_bound", "order", "round", "seed",
-                "sequences", "state", "tokens", "value_heads",
+                "sequences", "state", "tokens", "value_heads", "packed",
+                "cu_seqlens_is_none",
+                "public_max_seqlen_upper_bound_keyword_omitted",
+                "native_policy_effective_max_seqlen_upper_bound",
             }, f"{stem}: raw CSV schema")
         require(len(raw_rows) == len(entry["cases"]) * 2 * 50,
                 f"{stem}: raw CSV row count")
@@ -957,6 +960,22 @@ for entry in manifest:
                     f"{stem}: raw CSV execution")
             require(raw.get("max_seqlen_upper_bound") == "",
                     f"{stem}: raw CSV max-seqlen hint")
+            require(raw.get("packed") == "True",
+                    f"{stem}: raw CSV packed layout")
+            require(raw.get("cu_seqlens_is_none") == "False",
+                    f"{stem}: raw CSV cu_seqlens contract")
+            require(
+                raw.get(
+                    "public_max_seqlen_upper_bound_keyword_omitted"
+                ) == "True",
+                f"{stem}: raw CSV public max-seqlen keyword",
+            )
+            require(
+                raw.get(
+                    "native_policy_effective_max_seqlen_upper_bound"
+                ) == "",
+                f"{stem}: raw CSV native effective max-seqlen",
+            )
             require(raw_seed == seed, f"{stem}: raw CSV seed")
             require(raw_heads == entry["heads"], f"{stem}: raw CSV Hq")
             require(raw_value_heads == entry["value_heads"],
@@ -1055,6 +1074,10 @@ for entry in manifest:
         for case in actual_cases:
             require(case.get("max_seqlen_upper_bound") is None,
                     f"{stem}/{case.get('name')}: max-seqlen hint is present")
+            require(case.get("packed") is True,
+                    f"{stem}/{case.get('name')}: packed layout")
+            require(case.get("cu_seqlens_is_none") is False,
+                    f"{stem}/{case.get('name')}: cu_seqlens contract")
             require(case.get("observed_max_seqlen") == max(case["seq_lens"]),
                     f"{stem}/{case.get('name')}: observed maximum")
             stripped_cases.append(
@@ -1103,6 +1126,22 @@ for entry in manifest:
                         f"{stem}: row execution")
                 require(row.get("max_seqlen_upper_bound") is None,
                         f"{stem}: row max-seqlen hint")
+                require(row.get("packed") is True,
+                        f"{stem}: row packed layout")
+                require(row.get("cu_seqlens_is_none") is False,
+                        f"{stem}: row cu_seqlens contract")
+                require(
+                    row.get(
+                        "public_max_seqlen_upper_bound_keyword_omitted"
+                    ) is True,
+                    f"{stem}: row public max-seqlen keyword",
+                )
+                require(
+                    row.get(
+                        "native_policy_effective_max_seqlen_upper_bound"
+                    ) is None,
+                    f"{stem}: row native effective max-seqlen",
+                )
                 require(row.get("samples") == 50, f"{stem}: sample count")
                 require(row.get("output_contract_verified") is True,
                         f"{stem}/{case['name']}/{backend}: output contract")

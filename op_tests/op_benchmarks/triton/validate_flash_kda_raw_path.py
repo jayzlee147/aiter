@@ -1282,7 +1282,8 @@ def _check_context_direct_prefixless_policy_static(
         "automatic_short_single_direct || hinted_direct || "
         "automatic_mixed_boundary_direct",
         "automatic_gva_equal_n4_g32 || automatic_gva_n4_16k_nohint || "
-        "automatic_k3_n4_16k_g64 || automatic_k3_n8_16k_hybrid_g32;",
+        "automatic_k3_dense_n4_h12_g64 || automatic_k3_n4_16k_g64 || "
+        "automatic_k3_n8_16k_hybrid_g32;",
         "else if (automatic_k3_n8_16k_hybrid_g32) { "
         "group_chunks = 32;",
         "automatic_k3_n8_16k_hybrid_g32 ? "
@@ -1426,7 +1427,7 @@ def _check_context_direct_prefixless_policy_static(
         "policy.context_group_chunks == 0 && "
         "policy.context_direct_max_chunks == 0",
         "if (is_varlen && !use_context_direct_prefixless && "
-        "!use_context_equal_dense_n4_g64)",
+        "!normalize_packed_equal_dense_n4_g64)",
         "use_context_direct_prefixless ? nullptr : "
         "(k1_is_varlen ? tile_prefix : nullptr)",
         "use_context_direct_prefixless ? nullptr : "
@@ -1734,13 +1735,23 @@ def check_context_direct_tail_first_policy_static() -> None:
 def _check_context_equal_dense_n4_g64_policy_static(
     policy: str, kernel: str
 ) -> None:
-    """Audit the strict whole-graph packed-equal to dense-N4 candidate."""
+    """Audit packed normalization and exact true-dense N4/G64 admission."""
 
     common = (
         _REPO_ROOT / "csrc/kernels/flash_kda/hip_launch_common.cu"
     ).read_text()
     common_abi = (
         _REPO_ROOT / "csrc/kernels/flash_kda/hip_common.hpp"
+    ).read_text()
+    scan_kernel = (
+        _REPO_ROOT
+        / "csrc/kernels/flash_kda/gfx950/"
+        "k2_kda_context_affine_scan_ksplit_kernel.hpp"
+    ).read_text()
+    replay_kernel = (
+        _REPO_ROOT
+        / "csrc/kernels/flash_kda/gfx950/"
+        "k2_kda_context_parallel_kernel.hpp"
     ).read_text()
     compact_policy = " ".join(policy.split())
     compact_kernel = " ".join(kernel.split())
@@ -1762,16 +1773,44 @@ def _check_context_equal_dense_n4_g64_policy_static(
                     return " ".join(source[start : position + 1].split())
         raise AssertionError(f"cannot delimit C++ block {signature!r}")
 
+    dense_shape = cpp_block(policy, "static bool is_k3_dense_n4_4k_nohint(")
+    dense_shape_contracts = (
+        "p.cu_seqlens == nullptr",
+        "p.H_q == 12 && p.H == 12",
+        "p.N == kSequences",
+        "p.T_total == kSequences * kSequenceTokens",
+        "p.total_tiles == kDenseTiles",
+    )
+    for contract in dense_shape_contracts:
+        if contract not in dense_shape:
+            raise AssertionError(
+                "true-dense K3 N4/G64 shape lost contract: " + contract
+            )
+    if "max_seqlen_upper_bound" in dense_shape:
+        raise AssertionError(
+            "true-dense K3 N4/G64 shape must not depend on a packed hint"
+        )
+
     capability = cpp_block(
         policy, "static bool context_equal_dense_n4_g64_enabled("
     )
     capability_contracts = (
-        f'env_exact( "{_CONTEXT_EQUAL_DENSE_N4_G64_ENV}", "1")',
-        "p.H_q != p.H || p.cu_seqlens == nullptr || "
-        "p.N != kSequences || p.H <= 0",
+        f'std::getenv( "{_CONTEXT_EQUAL_DENSE_N4_G64_ENV}")',
+        "const bool explicit_packed = equal_dense != nullptr && "
+        'std::strcmp(equal_dense, "1") == 0',
+        "const bool automatic_dense = equal_dense == nullptr && "
+        "is_k3_dense_n4_4k_nohint(p)",
+        "if (!explicit_packed && !automatic_dense)",
+        "const bool packed_geometry = explicit_packed && "
+        "p.cu_seqlens != nullptr",
+        "p.max_seqlen_upper_bound == kSequenceTokens",
+        "p.total_tiles == kPackedTiles",
+        "const bool dense_geometry = automatic_dense && "
+        "p.cu_seqlens == nullptr",
+        "p.total_tiles == kDenseTiles",
+        "p.H_q != p.H || p.N != kSequences || p.H <= 0",
         "p.T_total != kSequences * kSequenceTokens",
-        "p.max_seqlen_upper_bound != kSequenceTokens",
-        "p.total_tiles != kPackedTiles",
+        "(!packed_geometry && !dense_geometry)",
         "default_k2_route != K2DefaultRoute::context_parallel",
         "!route.force_context || route.group_chunks != 64",
         "route.direct_max_chunks != 0",
@@ -1791,6 +1830,24 @@ def _check_context_equal_dense_n4_g64_policy_static(
         if contract not in capability:
             raise AssertionError(
                 "equal-dense N4/G64 capability lost contract: " + contract
+            )
+
+    automatic_route_contracts = (
+        "const bool automatic_k3_dense_n4_h12_g64 = "
+        "is_k3_dense_n4_4k_nohint(p)",
+        "group_env == nullptr && direct_value == nullptr && "
+        "affine_value == nullptr && hybrid_value == nullptr",
+        f'std::getenv( "{_CONTEXT_EQUAL_DENSE_N4_G64_ENV}") == nullptr',
+        "automatic_k3_dense_n4_h12_g64 || "
+        "automatic_k3_n4_16k_g64",
+        "automatic_dense_n1_h96_g64 || "
+        "automatic_k3_dense_n4_h12_g64 || "
+        "automatic_k3_n4_16k_g64",
+    )
+    for contract in automatic_route_contracts:
+        if contract not in compact_policy:
+            raise AssertionError(
+                "true-dense K3 N4/G64 automatic route changed: " + contract
             )
 
     policy_wiring = (
@@ -1817,29 +1874,39 @@ def _check_context_equal_dense_n4_g64_policy_static(
             )
 
     common_contracts = (
+        "const int equal_dense_nt = is_varlen ?",
+        "const bool packed_equal_dense_n4_g64 = "
+        "is_varlen && N == 4 && H > 0",
+        "equal_dense_nt == 256",
+        "int64_t(total_tiles) == equal_dense_total_tiles + N",
+        "const bool true_dense_n4_h12_g64 = "
+        "!is_varlen && H_q == 12 && H == 12 && N == 4",
+        "T_seq == 4096 && p.T_total == 4 * 4096 && NT == 256",
+        "int64_t(total_tiles) == equal_dense_total_tiles",
         "const bool use_context_equal_dense_n4_g64 = "
         "!is_gva && policy.context_equal_dense_n4_g64 && "
-        "use_context_parallel && "
-        "is_varlen && N == 4 && H > 0",
+        "use_context_parallel && (packed_equal_dense_n4_g64 || "
+        "true_dense_n4_h12_g64)",
         "p.max_seqlen_upper_bound == 4096",
         "int64_t(p.max_seqlen_upper_bound) * int64_t(N) == "
         "int64_t(p.T_total)",
         "policy.context_group_chunks == 64",
         "equal_dense_total_tiles == int64_t(4 * 256)",
-        "int64_t(total_tiles) == equal_dense_total_tiles + N",
         "!policy.context_direct_prefixless",
         "policy.launch_context_prefix == nullptr",
         "policy.context_persistent_blocks == 0",
+        "const bool normalize_packed_equal_dense_n4_g64 = "
+        "use_context_equal_dense_n4_g64 && packed_equal_dense_n4_g64;",
         "if (is_varlen && !use_context_direct_prefixless && "
-        "!use_context_equal_dense_n4_g64)",
+        "!normalize_packed_equal_dense_n4_g64)",
         "const bool k1_is_varlen = is_varlen && "
-        "!use_context_equal_dense_n4_g64;",
-        "const int k1_total_tiles = use_context_equal_dense_n4_g64 ? "
+        "!normalize_packed_equal_dense_n4_g64;",
+        "const int k1_total_tiles = normalize_packed_equal_dense_n4_g64 ? "
         "int(equal_dense_total_tiles) : total_tiles;",
-        "const int k1_nt = use_context_equal_dense_n4_g64 ? "
+        "const int k1_nt = normalize_packed_equal_dense_n4_g64 ? "
         "equal_dense_nt : NT;",
         "const bool context_is_varlen = is_varlen && "
-        "!use_context_equal_dense_n4_g64;",
+        "!normalize_packed_equal_dense_n4_g64;",
         "use_context_direct_prefixless, use_context_equal_dense_n4_g64, "
         "context_operands_cached, is_gva, "
         "policy.context_automatic_gva_packed_nw4, "
@@ -1858,6 +1925,9 @@ def _check_context_equal_dense_n4_g64_policy_static(
         "a.total_tiles == 1024",
         "packed_automatic_n4_16k_g64 || equal_dense_n4_g64",
         "(!a.is_varlen && a.N == 1) || equal_dense_n4_g64",
+        "context_upper = a.N * groups_per_sequence;",
+        "GROUP_CHUNKS, KdaContextMode::kReplay, HO, FP, VL, false, "
+        "CONTEXT_NW, 0",
         "k2_kda_context_affine_ab_fused_equal_n4_g64_nw4_kernel",
         "k2_kda_context_affine_ab_fused_equal_n4_g64_stage_early_nw4_kernel",
     )
@@ -1891,9 +1961,55 @@ def _check_context_equal_dense_n4_g64_policy_static(
                 "equal-dense N4/G64 kernel mapping changed: " + contract
             )
 
+    dense_scan = cpp_block(
+        scan_kernel, "k2_kda_context_affine_scan_ksplit_wg4_kernel("
+    )
+    scan_contracts = (
+        "const int seq = bh / H;",
+        "const int groups_per_sequence = "
+        "(NT + GROUP_CHUNKS - 1) / GROUP_CHUNKS;",
+        "context_base = seq * groups_per_sequence;",
+        "context_count = groups_per_sequence;",
+        "const int64_t state_slab = (int64_t(seq) * H + h) * D * D;",
+        "const int global_context = context_base + local_group;",
+        "const int64_t context_slab = "
+        "(int64_t(global_context) * H + h) * D * D;",
+    )
+    for contract in scan_contracts:
+        if contract not in dense_scan:
+            raise AssertionError(
+                "equal-dense N4/G64 K-split mapping changed: " + contract
+            )
+
+    dense_replay = cpp_block(
+        replay_kernel, "k2_kda_context_parallel_nw4_kernel("
+    )
+    replay_contracts = (
+        "if (global_context >= N * groups_per_sequence) return;",
+        "const int launch_seq = global_context / groups_per_sequence;",
+        "seq = launch_seq;",
+        "local_group = global_context - launch_seq * groups_per_sequence;",
+        "seq_len = T_seq;",
+        "seq_chunks = NT;",
+        "ht_sequence_base = (seq * H + h) * NT;",
+        "t_sequence_base = seq * T_seq;",
+        "const int first_chunk = DIRECT ? 0 : local_group * GROUP_CHUNKS;",
+        "const bool is_last_group = DENSE_N1_H12 || "
+        "first_chunk + group_chunks == seq_chunks;",
+        ": (int64_t(seq) * H + h) * D * D;",
+    )
+    for contract in replay_contracts:
+        if contract not in dense_replay:
+            raise AssertionError(
+                "equal-dense N4/G64 replay mapping changed: " + contract
+            )
+
     def selected(
         value: str | None,
         *,
+        packed: bool = True,
+        q_heads: int = 12,
+        value_heads: int = 12,
         sequences: int = 4,
         bound: int = 4096,
         tokens: int = 16384,
@@ -1901,34 +2017,78 @@ def _check_context_equal_dense_n4_g64_policy_static(
         group_chunks: int = 64,
         direct_max_chunks: int = 0,
     ) -> bool:
-        return (
+        explicit_packed = (
             value == "1"
-            and sequences == 4
+            and packed
             and bound == 4096
-            and tokens == sequences * bound
             and total_tiles == 1028
+        )
+        automatic_dense = (
+            value is None
+            and not packed
+            and q_heads == value_heads == 12
+            and total_tiles == 1024
+        )
+        return (
+            q_heads == value_heads
+            and sequences == 4
+            and tokens == 16384
+            and (explicit_packed or automatic_dense)
             and group_chunks == 64
             and direct_max_chunks == 0
         )
 
     for spelling in (None, "", "0", "01", "true", "1 ", " 1"):
-        if selected(spelling):
+        if selected(spelling, packed=True):
             raise AssertionError(
                 f"equal-dense parser accepted fallback {spelling!r}"
             )
-    if not selected("1"):
+    if not selected("1", packed=True):
         raise AssertionError("equal-dense parser rejected canonical '1'")
+    for bound in (0, 4096):
+        if not selected(
+            None, packed=False, bound=bound, total_tiles=1024
+        ):
+            raise AssertionError(
+                "true-dense K3 route depended on optional max-seqlen hint"
+            )
     for mismatch in (
         {"sequences": 3},
         {"bound": 4095},
         {"tokens": 16383},
-        {"total_tiles": 1024},
+        {"total_tiles": 1027},
         {"group_chunks": 32},
         {"direct_max_chunks": 64},
     ):
-        if selected("1", **mismatch):
+        if selected("1", packed=True, **mismatch):
             raise AssertionError(
                 f"equal-dense whole-graph guard accepted {mismatch}"
+            )
+    for mismatch in (
+        {"q_heads": 2, "value_heads": 4},
+        {"q_heads": 11, "value_heads": 12},
+        {"q_heads": 24, "value_heads": 24},
+        {"sequences": 3},
+        {"tokens": 16383},
+        {"total_tiles": 1028},
+        {"group_chunks": 32},
+        {"direct_max_chunks": 64},
+        # Internally consistent neighboring dense geometries must not inherit
+        # the exact B4x4K/H12 graduation through one coincident aggregate.
+        {"tokens": 4 * 4080, "total_tiles": 4 * 255},
+        {"tokens": 4 * 4095},
+        {"sequences": 8, "tokens": 8 * 4096, "total_tiles": 8 * 256},
+    ):
+        dense_args = {"packed": False, "bound": 0, "total_tiles": 1024}
+        dense_args.update(mismatch)
+        if selected(None, **dense_args):
+            raise AssertionError(
+                f"true-dense K3 whole-graph guard accepted {mismatch}"
+            )
+    for spelling in ("", "0", "1", "01", "true", "1 ", " 1"):
+        if selected(spelling, packed=False, bound=0, total_tiles=1024):
+            raise AssertionError(
+                f"true-dense K3 automatic route accepted env {spelling!r}"
             )
 
 
@@ -1973,9 +2133,10 @@ def _check_dense_n1_h96_policy_static(policy: str) -> None:
     group_contracts = (
         "requested_group == 128 || automatic_dense_n1_h96_g128",
         "requested_group == 64 || automatic_equal_n4_g64 || "
-        "automatic_dense_n1_h96_g64",
-        "automatic_equal_n4_g64 || automatic_k3_n4_16k_g64 || "
-        "automatic_dense_n1_h96_g64",
+        "automatic_dense_n1_h96_g64 || "
+        "automatic_k3_dense_n4_h12_g64",
+        "automatic_equal_n4_g64 || automatic_k3_dense_n4_h12_g64 || "
+        "automatic_k3_n4_16k_g64 || automatic_dense_n1_h96_g64",
         "else if (automatic_dense_n1_h96_g128) { group_chunks = 128; }",
     )
     for contract in group_contracts:
@@ -3592,7 +3753,7 @@ def check_gva_whole_route_policy_static() -> None:
         "group_env == nullptr && "
         "!force_direct && !force_affine && !force_hybrid;",
         "automatic_gva_equal_n4_g32 || automatic_gva_n4_16k_nohint || "
-        "automatic_k3_n4_16k_g64",
+        "automatic_k3_dense_n4_h12_g64 || automatic_k3_n4_16k_g64",
         "const bool hinted_n8_g64 = !is_gva && has_length_hint && "
         "p.N == 8 && hinted_bound >= 4096;",
         "requested_g16 || automatic_dense_g16 || "
@@ -3675,7 +3836,7 @@ def check_gva_whole_route_policy_static() -> None:
     # This list is intentionally structural: adding GVA to one of these routes
     # requires a matched producer/consumer proof and a validator update.
     equal_head_only_contracts = (
-        "if (p.H_q != p.H || p.cu_seqlens == nullptr ||",
+        "if (p.H_q != p.H || p.N != kSequences || p.H <= 0 ||",
         "if (!a.is_gva && a.context_persistent_blocks > 0",
         "const bool direct_dense_n1_h12 = !a.is_gva &&",
         "const bool direct_global_n1_h12 = !a.is_gva &&",
@@ -4476,18 +4637,22 @@ def assert_bitwise_same(actual, reference, label: str):
         )
 
 
-def seed_empty_state_bit_patterns(x, seq_lens, device):
+def seed_empty_state_bit_patterns(
+    x, seq_lens, device, *, include_nonfinite: bool = True
+):
     """Poison empty input-state slabs with conversion-sensitive raw bits."""
 
     if not x["has_initial_state"]:
         return
     if x["state_dtype"] == torch.float32:
         integer_dtype = torch.int32
-        unsigned_patterns = (
+        finite_patterns = (
             0x00000000,  # +0
             0x80000000,  # -0
             0x00000001,  # minimum subnormal
             0x007FFFFF,  # maximum subnormal
+        )
+        nonfinite_patterns = (
             0x7F800000,  # +Inf
             0xFF800000,  # -Inf
             0x7FC00001,  # quiet NaN, payload 1
@@ -4497,11 +4662,13 @@ def seed_empty_state_bit_patterns(x, seq_lens, device):
         sign_bit = 1 << 31
     else:
         integer_dtype = torch.int16
-        unsigned_patterns = (
+        finite_patterns = (
             0x0000,  # +0
             0x8000,  # -0
             0x0001,  # minimum BF16 subnormal
             0x007F,  # maximum BF16 subnormal
+        )
+        nonfinite_patterns = (
             0x7F80,  # +Inf
             0xFF80,  # -Inf
             0x7FC1,  # quiet NaN, payload 1
@@ -4509,6 +4676,9 @@ def seed_empty_state_bit_patterns(x, seq_lens, device):
         )
         modulus = 1 << 16
         sign_bit = 1 << 15
+    unsigned_patterns = finite_patterns + (
+        nonfinite_patterns if include_nonfinite else ()
+    )
     signed_patterns = tuple(
         value if value < sign_bit else value - modulus
         for value in unsigned_patterns
@@ -12042,6 +12212,151 @@ def _assert_k3_16k_no_hint_topology(
         )
 
 
+def _assert_k3_dense_n4_g64_topology(
+    kernel_names: list[str], label: str
+) -> None:
+    """Require the exact four-node true-dense K3 N4/G64 graph."""
+
+    if len(kernel_names) != 4:
+        raise AssertionError(
+            f"{label}: expected exactly four kernel nodes, got "
+            f"{kernel_names!r}"
+        )
+    prefix_names = [
+        name for name in kernel_names if "k1_build_tile_prefix" in name
+    ]
+    if prefix_names:
+        raise AssertionError(
+            f"{label}: true-dense graph retained packed prefix nodes: "
+            f"{prefix_names!r}"
+        )
+
+    k1_names = [
+        name for name in kernel_names if "k1_kda_bt16_fused_kernel" in name
+    ]
+    if len(k1_names) != 1:
+        raise AssertionError(
+            f"{label}: expected one fused K1 node, got {k1_names!r}; "
+            f"all kernels={kernel_names!r}"
+        )
+    k1_match = _K1_FUSED_SYMBOL.search(k1_names[0])
+    if k1_match is None:
+        raise AssertionError(
+            f"{label}: cannot decode fused K1 template flags: {k1_names[0]!r}"
+        )
+    k1_flags = tuple(
+        int(value) for value in re.findall(r"Lb([01])E", k1_match["flags"])
+    )
+    expected_k1_flags = (0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0)
+    if k1_flags != expected_k1_flags:
+        raise AssertionError(
+            f"{label}: K1 did not select dense cached vector-X32 publication: "
+            f"flags={k1_flags!r}, expected={expected_k1_flags!r}, "
+            f"name={k1_names[0]!r}"
+        )
+
+    producer_symbol = (
+        "k2_kda_context_affine_ab_fused_equal_n4_g64_nw4_kernel"
+    )
+    producer_names = [
+        name for name in kernel_names if producer_symbol in name
+    ]
+    if len(producer_names) != 1 or any(
+        "equal_n4_g64_stage_early" in name for name in kernel_names
+    ):
+        raise AssertionError(
+            f"{label}: expected the zero-environment exact-N4 fused producer, "
+            f"got {producer_names!r}; all kernels={kernel_names!r}"
+        )
+
+    ksplit_symbol = "k2_kda_context_affine_scan_ksplit_wg4_kernel"
+    ksplit_names = [name for name in kernel_names if ksplit_symbol in name]
+    if len(ksplit_names) != 1 or re.search(
+        r"ksplit_wg4_kernelI(?:Li)?64E", ksplit_names[0]
+    ) is None:
+        raise AssertionError(
+            f"{label}: expected one dense G64 K-split scan, got "
+            f"{ksplit_names!r}; all kernels={kernel_names!r}"
+        )
+    if any(
+        "k2_kda_context_affine_scan_nw4_kernel" in name
+        for name in kernel_names
+    ):
+        raise AssertionError(
+            f"{label}: automatic graph retained the ordinary affine scan: "
+            f"{kernel_names!r}"
+        )
+
+    _assert_context_route_topology(kernel_names, ((64, 2, 4),), label)
+    replay = []
+    for name in kernel_names:
+        match = _CONTEXT_PIPELINE_SYMBOL.search(name)
+        if match is not None:
+            replay.append((name, match))
+    if len(replay) != 1:
+        raise AssertionError(
+            f"{label}: expected one dense G64 replay node, got {replay!r}; "
+            f"all kernels={kernel_names!r}"
+        )
+    replay_name, replay_match = replay[0]
+    expected_replay = {
+        "group": 64,
+        "mode": 2,
+        "ho": 1,
+        "fp": 1,
+        "vl": 0,
+        "direct": 0,
+        "nw": 4,
+        "direct_max": 0,
+        "cached": 1,
+        "u_forward": 1,
+        "v_forward": 1,
+        "lds_pipeline": 0,
+        "tail_first": 0,
+        "prefixless": 0,
+    }
+    replay_mismatches = {
+        field: (int(replay_match.group(field)), expected)
+        for field, expected in expected_replay.items()
+        if int(replay_match.group(field)) != expected
+    }
+    if replay_mismatches:
+        raise AssertionError(
+            f"{label}: dense G64 replay specialization mismatch "
+            f"{replay_mismatches!r}: {replay_name!r}"
+        )
+
+
+def _assert_k3_dense_n4_g64_rollback_topology(
+    kernel_names: list[str], label: str
+) -> None:
+    """Require exact env-0 rollback to the established plain C-split graph."""
+
+    forbidden = (
+        "equal_n4_g64",
+        "k2_kda_context_affine_scan_ksplit",
+        "k2_kda_context_parallel",
+    )
+    leaked = [
+        name for name in kernel_names if any(token in name for token in forbidden)
+    ]
+    if leaked:
+        raise AssertionError(
+            f"{label}: env-0 rollback retained automatic context nodes: "
+            f"{leaked!r}; all kernels={kernel_names!r}"
+        )
+    plain_scan_names = [
+        name
+        for name in kernel_names
+        if "k2_kda_csplit_bt64_plain_kernel" in name
+    ]
+    if len(plain_scan_names) != 1:
+        raise AssertionError(
+            f"{label}: expected one established plain C-split scan, got "
+            f"{plain_scan_names!r}; all kernels={kernel_names!r}"
+        )
+
+
 def _assert_gva_n4_16k_no_hint_topology(
     kernel_names: list[str], label: str
 ) -> None:
@@ -12392,6 +12707,230 @@ def _assert_packed_route_numerically_equivalent(
     return max(output_errors), max(state_errors)
 
 
+def check_raw_v3_k3_dense_n4_g64(
+    module, device: torch.device
+) -> None:
+    """Validate the automatic true-dense K3 B4x4K whole graph."""
+
+    if flash_kda._device_arch(device) != "gfx950":
+        print("SKIP raw-v3 K3 true-dense N4/G64 matrix: gfx950 only")
+        return
+
+    previous_env = {
+        name: os.environ.get(name) for name in _RAW_V2_POLICY_ENV
+    }
+    seq_lens = (4096,) * 4
+    tolerance = 1.0e-2
+
+    def clear_policy_environment() -> None:
+        for name in _RAW_V2_POLICY_ENV:
+            os.environ.pop(name, None)
+
+    def configure_general_reference() -> None:
+        # Keep the same dense indexing and G64 grouping, but independently
+        # force separate A/B producers plus the established NW2 map scan.
+        clear_policy_environment()
+        os.environ["FLASH_KDA_GFX950_CONTEXT_AFFINE"] = "1"
+        os.environ["FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS"] = "64"
+        os.environ[_CONTEXT_AFFINE_AB_FUSED_ENV] = "0"
+        os.environ[_CONTEXT_AFFINE_AB_STAGE_EARLY_ENV] = "0"
+        os.environ[_CONTEXT_EQUAL_DENSE_N4_G64_ENV] = "0"
+        os.environ["FLASH_KDA_GFX950_CONTEXT_SCAN_NW"] = "2"
+        os.environ[_CONTEXT_SCAN_KSPLIT_ENV] = "0"
+        os.environ["FLASH_KDA_GFX950_CONTEXT_SCAN_B_STREAM"] = "0"
+        os.environ["FLASH_KDA_GFX950_CONTEXT_SCAN_A_GLL"] = "0"
+        os.environ["FLASH_KDA_GFX950_CONTEXT_SCAN_B_PHASED"] = "0"
+
+    def run_raw_v3_dense(
+        x: dict[str, Any],
+        initial_copy: torch.Tensor,
+        bound: int,
+        label: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        out, final, workspace = allocate(x)
+        out.fill_(float("nan"))
+        final.fill_(float("nan"))
+        workspace.fill_(0x6B)
+        raw_v3_call(module, x, out, final, workspace, bound)
+        torch.cuda.synchronize(device)
+        if not bool(torch.isfinite(out).all().item()):
+            raise AssertionError(f"{label}: output contains non-finite data")
+        if not bool(torch.isfinite(final).all().item()):
+            raise AssertionError(
+                f"{label}: final state contains non-finite data"
+            )
+        assert_bitwise_same(
+            x["initial_state"], initial_copy, f"{label}: mutated initial state"
+        )
+        return out, final
+
+    def assert_dense_equivalent(
+        actual: tuple[torch.Tensor, torch.Tensor],
+        reference: tuple[torch.Tensor, torch.Tensor],
+        label: str,
+    ) -> tuple[float, float]:
+        if actual[0].shape[0] != len(seq_lens):
+            raise AssertionError(
+                f"{label}: dense output batch is {actual[0].shape[0]}, "
+                f"expected {len(seq_lens)}"
+            )
+        output_errors = [
+            _route_relative_rms(
+                actual[0], reference[0], f"{label} output", tolerance=tolerance
+            )
+        ]
+        state_errors = [
+            _route_relative_rms(
+                actual[1],
+                reference[1],
+                f"{label} final state",
+                tolerance=tolerance,
+            )
+        ]
+        for sequence in range(len(seq_lens)):
+            output_errors.append(
+                _route_relative_rms(
+                    actual[0][sequence],
+                    reference[0][sequence],
+                    f"{label} output sequence {sequence}",
+                    tolerance=tolerance,
+                )
+            )
+            state_errors.append(
+                _route_relative_rms(
+                    actual[1][sequence],
+                    reference[1][sequence],
+                    f"{label} final state sequence {sequence}",
+                    tolerance=tolerance,
+                )
+            )
+        return max(output_errors), max(state_errors)
+
+    state_modes = (
+        ("fresh-none", False, torch.float32),
+        ("resume-fp32", True, torch.float32),
+        ("resume-bf16", True, torch.bfloat16),
+    )
+    try:
+        for mode_index, (mode, has_initial_state, state_dtype) in enumerate(
+            state_modes
+        ):
+            x = make_inputs(
+                seq_lens,
+                12,
+                device,
+                packed=False,
+                state_dtype=state_dtype,
+                has_initial_state=has_initial_state,
+                output_final_state=True,
+                seed=20261210 + mode_index,
+            )
+            if x["cu_seqlens"] is not None or x["q"].shape[:2] != (4, 4096):
+                raise AssertionError(
+                    f"raw-v3 K3 dense {mode}: fixture lost true-dense B4x4K"
+                )
+            initial_copy = x["initial_state"].clone()
+
+            configure_general_reference()
+            reference = run_raw_v3_dense(
+                x,
+                initial_copy,
+                0,
+                f"raw-v3 K3 dense {mode}/forced-general",
+            )
+
+            candidates: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+            errors = []
+            for bound in (0, 4096):
+                clear_policy_environment()
+                candidate = run_raw_v3_dense(
+                    x,
+                    initial_copy,
+                    bound,
+                    f"raw-v3 K3 dense {mode}/hint-{bound}",
+                )
+                candidates[bound] = candidate
+                errors.append(
+                    assert_dense_equivalent(
+                        candidate,
+                        reference,
+                        f"raw-v3 K3 dense {mode}/hint-{bound} "
+                        "vs forced-general",
+                    )
+                )
+
+            # Dense geometry is already exact host metadata.  The optional
+            # zero/T hint spellings must therefore select identical arithmetic.
+            assert_bitwise_same(
+                candidates[0][0],
+                candidates[4096][0],
+                f"raw-v3 K3 dense {mode}: hint 0/4096 output",
+            )
+            assert_bitwise_same(
+                candidates[0][1],
+                candidates[4096][1],
+                f"raw-v3 K3 dense {mode}: hint 0/4096 final state",
+            )
+
+            if mode == "resume-fp32":
+                captured_by_hint = {}
+                for bound in (0, 4096):
+                    clear_policy_environment()
+                    names = _capture_raw_v3_kernel_names(module, x, bound)
+                    _assert_k3_dense_n4_g64_topology(
+                        names,
+                        f"raw-v3 K3 dense {mode}/hint-{bound} topology",
+                    )
+                    captured_by_hint[bound] = sorted(names)
+                if captured_by_hint[0] != captured_by_hint[4096]:
+                    raise AssertionError(
+                        "raw-v3 K3 dense hint 0/4096 selected different graphs: "
+                        f"zero={captured_by_hint[0]!r}, "
+                        f"exact={captured_by_hint[4096]!r}"
+                    )
+
+                clear_policy_environment()
+                os.environ[_CONTEXT_EQUAL_DENSE_N4_G64_ENV] = "0"
+                rollback = run_raw_v3_dense(
+                    x,
+                    initial_copy,
+                    0,
+                    "raw-v3 K3 dense resume-fp32/equal-dense-0 rollback",
+                )
+                assert_dense_equivalent(
+                    rollback,
+                    reference,
+                    "raw-v3 K3 dense resume-fp32/equal-dense-0 rollback "
+                    "vs forced-general",
+                )
+                rollback_names = _capture_raw_v3_kernel_names(module, x, 0)
+                _assert_k3_dense_n4_g64_rollback_topology(
+                    rollback_names,
+                    "raw-v3 K3 dense resume-fp32/equal-dense-0 rollback",
+                )
+                assert_bitwise_same(
+                    x["initial_state"],
+                    initial_copy,
+                    "raw-v3 K3 dense rollback graph capture mutated state",
+                )
+
+            max_output = max(value[0] for value in errors)
+            max_state = max(value[1] for value in errors)
+            print(
+                f"PASS raw-v3 K3 true-dense N4/G64 {mode}: "
+                "hint 0/4096, max output/state rRMS="
+                f"{max_output:.3e}/{max_state:.3e}"
+            )
+            del x, initial_copy, reference, candidates
+            torch.cuda.empty_cache()
+    finally:
+        for name, value in previous_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def _check_raw_v3_no_hint_changed_prefix_replay(
     module,
     device: torch.device,
@@ -12446,6 +12985,11 @@ def _check_raw_v3_no_hint_changed_prefix_replay(
             )
         topology_assertion(captured_graph_kernel_names(graph, device), label)
         graph.instantiate()
+        assert_bitwise_same(
+            x["initial_state"],
+            initial_copy,
+            f"{label}: graph capture mutated initial state",
+        )
 
         offsets = [0]
         for length in replay_lens:
@@ -12453,6 +12997,13 @@ def _check_raw_v3_no_hint_changed_prefix_replay(
         x["cu_seqlens"].copy_(
             torch.tensor(offsets, device=device, dtype=torch.int32)
         )
+        # Make zero-length ownership observable independently of the forced
+        # reference route.  Finite signed-zero/subnormal patterns preserve the
+        # numerical comparator while catching state conversion or overwrite.
+        seed_empty_state_bit_patterns(
+            x, replay_lens, device, include_nonfinite=False
+        )
+        initial_copy = x["initial_state"].clone()
         torch.cuda.synchronize(device)
         if tuple(tensor.data_ptr() for tensor in stable_tensors) != (
             stable_addresses
@@ -12477,6 +13028,13 @@ def _check_raw_v3_no_hint_changed_prefix_replay(
             initial_copy,
             f"{label}: forced-general reference mutated state",
         )
+        for sequence, length in enumerate(replay_lens):
+            if length == 0:
+                assert_bitwise_same(
+                    reference_final[sequence],
+                    initial_copy[sequence],
+                    f"{label}: forced-general empty-state[{sequence}]",
+                )
 
         clear_policy_environment()
         graph_out.fill_(float("nan"))
@@ -12496,6 +13054,13 @@ def _check_raw_v3_no_hint_changed_prefix_replay(
             initial_copy,
             f"{label}: graph replay mutated initial state",
         )
+        for sequence, length in enumerate(replay_lens):
+            if length == 0:
+                assert_bitwise_same(
+                    graph_final[sequence],
+                    initial_copy[sequence],
+                    f"{label}: graph replay empty-state[{sequence}]",
+                )
         return errors
     finally:
         graph.reset()
@@ -12853,11 +13418,7 @@ def check_raw_v3_gva_mixed_boundary_no_hint(
                         f"raw-v3 GVA mixed {label} graph mutated state",
                     )
 
-                    if (
-                        value_heads == 4
-                        and prefill_tokens == 1025
-                        and not prefill_first
-                    ):
+                    if prefill_tokens == 1025 and not prefill_first:
                         clear_policy_environment()
                         os.environ[
                             "FLASH_KDA_GFX950_CONTEXT_OPERAND_CACHE"
@@ -13083,7 +13644,7 @@ def check_raw_v3_gva_mixed_boundary_no_hint(
 
 
 def check_raw_v3_mixed_hint_resume_chains(
-    module, device: torch.device
+    module, device: torch.device, *, k3_only: bool = False
 ) -> None:
     """Chain legal hint modes while feeding each final state into the next step."""
 
@@ -13118,6 +13679,8 @@ def check_raw_v3_mixed_hint_resume_chains(
         ("GVA-Hq2-Hv4", 2, 4),
         ("GVA-Hq2-Hv8", 2, 8),
     )
+    if k3_only:
+        cases = cases[:1]
 
     try:
         for case_index, (case_label, q_heads, value_heads) in enumerate(cases):
@@ -13296,7 +13859,7 @@ def check_raw_v3_mixed_hint_resume_chains(
 
 
 def check_raw_v3_k3_16k_no_hint_matrix(
-    module, device: torch.device
+    module, device: torch.device, *, empty_only: bool = False
 ) -> None:
     """Validate K3 H12 N4/N8 no-hint routes on adversarial prefixes."""
 
@@ -13436,9 +13999,21 @@ def check_raw_v3_k3_16k_no_hint_matrix(
             8,
         ),
     )
+    indexed_cases = tuple(enumerate(cases))
+    if empty_only:
+        indexed_cases = tuple(
+            indexed_case
+            for indexed_case in indexed_cases
+            if "empty" in indexed_case[1][0]
+        )
+        if {case[0] for _, case in indexed_cases} != {
+            "n4-empty-ragged",
+            "n8-empty-ragged",
+        }:
+            raise AssertionError("targeted K3 empty fixture set changed")
 
     try:
-        for case_index, (label, seq_lens, sequences) in enumerate(cases):
+        for case_index, (label, seq_lens, sequences) in indexed_cases:
             if len(seq_lens) != sequences or sum(seq_lens) != 16384:
                 raise AssertionError(f"invalid K3 16K fixture {label}: {seq_lens}")
             x = make_inputs(
@@ -13450,7 +14025,21 @@ def check_raw_v3_k3_16k_no_hint_matrix(
                 output_final_state=True,
                 seed=20260920 + case_index,
             )
+            seed_empty_state_bit_patterns(
+                x, seq_lens, device, include_nonfinite=False
+            )
             initial_copy = x["initial_state"].clone()
+
+            def assert_empty_state_identity(
+                final: torch.Tensor, result_label: str
+            ) -> None:
+                for sequence, length in enumerate(seq_lens):
+                    if length == 0:
+                        assert_bitwise_same(
+                            final[sequence],
+                            initial_copy[sequence],
+                            f"{result_label}: empty-state[{sequence}]",
+                        )
 
             # This descriptor/raw-v1 pair is intentionally forced onto the
             # general packed G64 graph: separate A/B producers and the normal
@@ -13462,9 +14051,15 @@ def check_raw_v3_k3_16k_no_hint_matrix(
             if reference_final is None:
                 raise AssertionError(f"{label}: reference omitted final state")
             reference = (reference_out, reference_final)
+            assert_empty_state_identity(
+                reference_final, f"raw-v3 K3 16K {label}/forced-general"
+            )
 
             no_hint = run_raw_v3(
                 x, initial_copy, 0, f"raw-v3 K3 16K {label}/no-hint"
+            )
+            assert_empty_state_identity(
+                no_hint[1], f"raw-v3 K3 16K {label}/no-hint"
             )
             no_hint_errors = assert_numerically_equivalent(
                 no_hint,
@@ -13499,6 +14094,9 @@ def check_raw_v3_k3_16k_no_hint_matrix(
                     initial_copy,
                     bound,
                     f"raw-v3 K3 16K {label}/{hint_label}",
+                )
+                assert_empty_state_identity(
+                    hinted[1], f"raw-v3 K3 16K {label}/{hint_label}"
                 )
                 # A valid hint can change the selected reduction tree.  The
                 # contract is numerical equivalence, not bitwise identity.
@@ -14406,7 +15004,23 @@ def main():
     parser.add_argument("--tokens", type=int, default=2048)
     parser.add_argument("--heads", type=int, default=12)
     parser.add_argument("--cpu-only", action="store_true")
+    parser.add_argument(
+        "--k3-no-hint-only",
+        action="store_true",
+        help=(
+            "After the common CPU/static checks, run only the H12 K3 "
+            "public-contract GPU acceptance: true-dense B4x4K raw-v3 "
+            "hint/rollback/topology checks, no/exact/over-hint resume-chain "
+            "equivalence, 1K mixed-boundary result/topology/graph checks, "
+            "and N4/N8 packed empty-prefix correctness plus changed-prefix "
+            "graph replay."
+        ),
+    )
     args = parser.parse_args()
+    if args.cpu_only and args.k3_no_hint_only:
+        parser.error("--cpu-only and --k3-no-hint-only are mutually exclusive")
+    if args.k3_no_hint_only and args.heads != 12:
+        parser.error("--k3-no-hint-only requires --heads 12")
     check_cpu_parameter_validation()
     check_packed_n1_entry_dense_normalization_static()
     check_bt16_dense_n1_all_full_c16_policy_static()
@@ -14434,6 +15048,8 @@ def main():
     get_module = get_jit_module
 
     device = torch.device("cuda:0")
+    if args.k3_no_hint_only and flash_kda._device_arch(device) != "gfx950":
+        raise RuntimeError("--k3-no-hint-only requires a gfx950 GPU")
     # Enter through the decorated descriptor op first.  Under AITER_REBUILD=1
     # this ensures the raw symbol fetched below belongs to the just-built
     # module instead of a stale extension loaded before the rebuild.
@@ -14443,6 +15059,17 @@ def main():
     torch.cuda.synchronize(device)
     module = get_module(flash_kda.MD_NAME)
     check_module_abi_surface(module)
+    if args.k3_no_hint_only:
+        check_raw_v3_k3_dense_n4_g64(module, device)
+        check_raw_v3_mixed_hint_resume_chains(
+            module, device, k3_only=True
+        )
+        check_raw_v3_k3_mixed_boundary_no_hint(module, device)
+        check_raw_v3_k3_16k_no_hint_matrix(
+            module, device, empty_only=True
+        )
+        print("TARGETED K3 NO-HINT ABI CHECKS PASSED")
+        return
     check_raw_v3_gva_vs_descriptor(module, device)
 
     x = make_inputs(split_packed_tokens(args.tokens), args.heads, device)
@@ -14450,6 +15077,7 @@ def main():
         module, x, "packed-primary"
     )
     check_raw_v2_invalid_bounds(module, device, min(args.heads, 2))
+    check_raw_v3_k3_dense_n4_g64(module, device)
     check_raw_v3_k3_mixed_boundary_no_hint(module, device)
     check_raw_v3_gva_mixed_boundary_no_hint(module, device)
     check_raw_v3_mixed_hint_resume_chains(module, device)
