@@ -85,6 +85,27 @@ def _cpu_gva_public_inputs() -> dict[str, object]:
     }
 
 
+def _cpu_k3_mixed_boundary_inputs(prefill_tokens: int) -> dict[str, object]:
+    """Build the two exact K3 TP8 mixed-prefill routing signatures."""
+
+    seq_lens = (1,) * 15 + (prefill_tokens,)
+    offsets = [0]
+    for length in seq_lens:
+        offsets.append(offsets[-1] + length)
+    total_tokens = offsets[-1]
+    shape = (1, total_tokens, 12, 128)
+    return {
+        "q": torch.empty(shape, dtype=torch.bfloat16),
+        "k": torch.empty(shape, dtype=torch.bfloat16),
+        "v": torch.empty(shape, dtype=torch.bfloat16),
+        "g": torch.empty(shape, dtype=torch.bfloat16),
+        "beta": torch.empty((1, total_tokens, 12), dtype=torch.float32),
+        "A_log": torch.empty(12, dtype=torch.float32),
+        "dt_bias": torch.empty(12 * 128, dtype=torch.float32),
+        "cu_seqlens": torch.tensor(offsets, dtype=torch.int32),
+    }
+
+
 @pytest.fixture(autouse=True)
 def _reset_raw_binding_cache(monkeypatch):
     monkeypatch.setattr(_FLASH_KDA, "_RAW_POINTER_BINDING", None)
@@ -312,6 +333,55 @@ def test_public_wrapper_passes_bound_to_native_route(monkeypatch):
 
     assert len(calls) == 1
     assert calls[0]["max_seqlen_upper_bound"] == 6
+
+
+@pytest.mark.parametrize("prefill_tokens", [1024, 1025])
+def test_public_zero_env_k3_mixed_boundary_preserves_absent_bound(
+    monkeypatch, prefill_tokens
+):
+    """ATOM's public call omits the optional hint; keep raw-v3's zero sentinel."""
+
+    support_calls: list[dict[str, object]] = []
+    native_calls: list[dict[str, object]] = []
+
+    def fake_supported(**kwargs):
+        support_calls.append(kwargs)
+        return True
+
+    def fake_native(**kwargs):
+        native_calls.append(kwargs)
+        return torch.empty_like(kwargs["v"]), None
+
+    monkeypatch.delenv("AITER_KDA_BACKEND", raising=False)
+    monkeypatch.delenv("AITER_TRITON_ONLY", raising=False)
+    monkeypatch.setattr(_PUBLIC_KDA, "_device_arch", lambda _device: "gfx950")
+    monkeypatch.setattr(_PUBLIC_KDA, "flash_kda_native_supported", fake_supported)
+    monkeypatch.setattr(_PUBLIC_KDA, "flash_kda_native_fwd", fake_native)
+    monkeypatch.setattr(
+        _PUBLIC_KDA,
+        "chunk_delta_attn_fwd",
+        lambda **_kwargs: pytest.fail("supported K3 call unexpectedly reached Triton"),
+    )
+
+    inputs = _cpu_k3_mixed_boundary_inputs(prefill_tokens)
+    output, final_state = _PUBLIC_KDA.chunk_kimi_delta_attn(
+        **inputs,
+        output_final_state=False,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        use_beta_sigmoid_in_kernel=True,
+        safe_gate=True,
+        lower_bound=-5.0,
+        state_v_first=True,
+    )
+
+    assert inputs["q"].shape == (1, prefill_tokens + 15, 12, 128)
+    assert inputs["cu_seqlens"].numel() == 17
+    assert len(support_calls) == len(native_calls) == 1
+    assert support_calls[0]["max_seqlen_upper_bound"] is None
+    assert native_calls[0]["max_seqlen_upper_bound"] is None
+    assert output.shape == inputs["v"].shape
+    assert final_state is None
 
 
 def test_public_wrapper_logs_bound_but_does_not_pass_it_to_triton(monkeypatch):

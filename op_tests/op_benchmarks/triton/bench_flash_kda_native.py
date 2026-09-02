@@ -33,7 +33,8 @@ Examples::
         --suite mixed --backend native --backend triton
 
     python op_tests/op_benchmarks/triton/bench_flash_kda_native.py \
-        --suite mixed-boundary --backend native --backend triton
+        --suite mixed-boundary --backend native --backend triton \
+        --public-k3 --omit-max-seqlen-hint --execution graph
 
     python op_tests/op_benchmarks/triton/bench_flash_kda_native.py \
         --case resume-4x4k --execution graph --backend native --backend triton
@@ -290,7 +291,8 @@ def _assert_output_contract(
         raise RuntimeError(
             f"{case.name}/{backend}: output_final_state=True returned None"
         )
-    expected_output_shape = (*q.shape[:-1], v.shape[-1])
+    # GVA returns one output vector per value head, not per shared Q/K head.
+    expected_output_shape = tuple(v.shape)
     expected_state_shape = (
         len(case.seq_lens),
         v.shape[-2],
@@ -513,10 +515,9 @@ def _make_inputs(
             device=device,
         ),
         "cu_seqlens": torch.tensor(offsets, device=device, dtype=torch.int32),
-        # ATOM/vLLM supplies the graph-bucket maximum from host metadata.  A
-        # standalone eager benchmark has the exact batch lengths available,
-        # so use their true maximum rather than silently exercising raw-v2
-        # with its legacy zero hint.
+        # The general benchmark uses the exact batch maximum by default.  The
+        # caller may replace this with None to reproduce integrations that omit
+        # the optional host routing hint (notably ATOM commit 16c20d3048).
         "max_seqlen_upper_bound": max(case.seq_lens),
     }
     assert inputs["dt_bias"].ndim == 1
@@ -550,9 +551,9 @@ def _build_backends(
     inputs: dict[str, object], selected: tuple[str, ...], *, public_k3: bool = False
 ) -> dict[str, Callable[[], tuple[torch.Tensor, torch.Tensor | None]]]:
     def public(backend: str | None):
-        # ATOM omits both ``backend`` and the default scale, but supplies the
-        # static query-length bucket.  Preserve that resolver contract; only
-        # comparison rows force a backend.
+        # ATOM omits both ``backend`` and the default scale.  The input fixture
+        # selects whether to pass an exact host hint or None; only comparison
+        # rows force a backend.
         backend_kwargs = {} if backend is None else {"backend": backend}
         return chunk_kimi_delta_attn(
             q=inputs["q"],
@@ -973,6 +974,7 @@ def _benchmark_case(
     tolerance: float,
     execution: str = "eager",
     public_k3: bool = False,
+    omit_max_seqlen_hint: bool = False,
     initial_state_none: bool = False,
     check_input_state_immutability: bool = False,
     timed_selected: tuple[str, ...] | None = None,
@@ -1001,6 +1003,8 @@ def _benchmark_case(
         seed=seed,
         device=torch.device("cuda"),
     )
+    if omit_max_seqlen_hint:
+        inputs["max_seqlen_upper_bound"] = None
     if initial_state_none:
         if any(_case_resume_mask(case)):
             raise ValueError(
@@ -1288,6 +1292,9 @@ def _benchmark_case(
                         "heads": heads,
                         "value_heads": value_heads,
                         "state": _case_state_label(case),
+                        "max_seqlen_upper_bound": inputs[
+                            "max_seqlen_upper_bound"
+                        ],
                         "latency_ms": elapsed,
                     }
                 )
@@ -1385,6 +1392,7 @@ def _benchmark_case(
             "value_heads": value_heads,
             "seed": seed,
             "state": _case_state_label(case),
+            "max_seqlen_upper_bound": inputs["max_seqlen_upper_bound"],
             "latency_min_ms": min(values),
             "latency_p10_ms": _percentile(values, 0.10),
             "latency_median_ms": median,
@@ -1756,6 +1764,12 @@ def _write_json(
             "tolerance": args.tolerance,
             "backends": list(args.backend),
             "public_k3": args.public_k3,
+            "omit_max_seqlen_hint": args.omit_max_seqlen_hint,
+            "max_seqlen_hint_contract": (
+                "omitted-none"
+                if args.omit_max_seqlen_hint
+                else "exact-observed-maximum"
+            ),
             "min_speedup": args.min_speedup,
             "min_geomean_speedup": args.min_geomean_speedup,
             "min_paired_win_fraction": args.min_paired_win_fraction,
@@ -1771,7 +1785,12 @@ def _write_json(
                     list(case.resume_mask) if case.resume_mask is not None else None
                 ),
                 "state": _case_state_label(case),
-                "max_seqlen_upper_bound": max(case.seq_lens),
+                "max_seqlen_upper_bound": (
+                    None
+                    if args.omit_max_seqlen_hint
+                    else max(case.seq_lens)
+                ),
+                "observed_max_seqlen": max(case.seq_lens),
             }
             for case in cases
         ],
@@ -1850,6 +1869,14 @@ def _parse_args(argv=None) -> argparse.Namespace:
         help=(
             "Time the public chunk_kimi_delta_attn resolver: the 'native' row "
             "uses its zero-env default and the 'triton' row forces Triton."
+        ),
+    )
+    parser.add_argument(
+        "--omit-max-seqlen-hint",
+        action="store_true",
+        help=(
+            "Pass max_seqlen_upper_bound=None to every selected backend, "
+            "matching callers that omit the optional host routing hint."
         ),
     )
     parser.add_argument(
@@ -2014,6 +2041,7 @@ def main(argv=None) -> None:
                 tolerance=args.tolerance,
                 execution=args.execution,
                 public_k3=args.public_k3,
+                omit_max_seqlen_hint=args.omit_max_seqlen_hint,
                 raw_rows=raw_rows,
             )
         )

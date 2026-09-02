@@ -173,6 +173,14 @@ def chunk_kimi_delta_attn(
             HIP uses it only for host route selection; this wrapper validates
             it, while Triton execution ignores it. CUDA/HIP graphs must pass
             the capture bucket bound, not a replay batch's dynamic maximum.
+            This is a caller promise and is not checked against device-resident
+            ``cu_seqlens`` because doing so would synchronize the host. Passing
+            a value below the actual maximum, including after graph replay
+            inputs change, is invalid and may select an inapplicable route.
+            Truthful bounds preserve the mathematical result but can select a
+            different topology and floating-point association, so different
+            valid bounds need not produce bitwise-identical values. A looser
+            bound is safe but may reduce performance.
             A non-``None`` value must be a built-in Python ``int`` (not
             ``bool`` or an ``int`` subclass). Dense calls always use the exact
             shape-derived length. Default: ``None``.

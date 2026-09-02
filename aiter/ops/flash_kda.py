@@ -572,8 +572,18 @@ def flash_kda_fwd(
     It must be a built-in Python ``int`` (not ``bool`` or an ``int`` subclass),
     lie in ``[ceil(total_tokens / N), total_tokens]``, and should be a static
     bucket bound when this call is captured in a CUDA/HIP graph.  Dense calls
-    always use the exact shape-derived sequence length.  Older native modules
-    without the additive raw-v3 symbol retain their legacy equal-head route.
+    always use the exact shape-derived sequence length.  The value is a caller
+    promise: validating it against device-resident ``cu_seqlens`` would require
+    a host synchronization.  Passing a value below the actual longest sequence,
+    or replaying a captured graph with a batch that exceeds its bound, is
+    invalid and may select a specialization whose assumptions do not hold.
+    Any truthful value at least as large as the actual maximum preserves the
+    mathematical result, but may choose a different topology and therefore
+    need not be bitwise identical; it must remain equivalent within the normal
+    dtype-appropriate floating-point tolerance.  A looser bound is safe but
+    can be slower. ``None`` retains the conservative no-hint policy. Older
+    native modules without the additive raw-v3 symbol retain their legacy
+    equal-head route.
     """
 
     # Validate the public scalar before architecture admission so malformed

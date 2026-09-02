@@ -262,9 +262,9 @@ private:
         static_assert(!GVA ||
                           (!CACHE_CONTEXT_OPERANDS &&
                            !PUBLISH_ACTIVATED_BETA &&
-                           !PACKED_DIRECT_PREFIXLESS &&
                            !DENSE_N1_ALL_FULL_C16),
-                      "GVA fused K1 is restricted to the ordinary route");
+                      "GVA fused K1 cannot use equal-head-only cache/dense "
+                      "specializations");
         static_assert(!PACKED_DIRECT_PREFIXLESS || VL,
                       "prefixless fused K1 launch is packed-only");
         static_assert(!DENSE_N1_ALL_FULL_C16 || !VL,
@@ -397,24 +397,29 @@ private:
         const Bt16FusedMode fused = bt16_fused_mode();
         if (fused != Bt16FusedMode::disabled) {
             if (a.H_q != a.H) {
-                auto launch_gva = [&]<bool VL>() {
+                auto launch_gva = [&]<bool VL,
+                                      bool PACKED_DIRECT_PREFIXLESS>() {
                     if (fused == Bt16FusedMode::exact_x16)
                         launch_bt16_fused<
-                            VL, true, false, false, false, false, false,
-                            true>(a, grid);
+                            VL, true, false, false, false,
+                            PACKED_DIRECT_PREFIXLESS, false, true>(a, grid);
                     else if (fused == Bt16FusedMode::exact_x32)
                         launch_bt16_fused<
-                            VL, true, true, false, false, false, false,
-                            true>(a, grid);
+                            VL, true, true, false, false,
+                            PACKED_DIRECT_PREFIXLESS, false, true>(a, grid);
                     else
                         launch_bt16_fused<
-                            VL, false, true, false, false, false, false,
-                            true>(a, grid);
+                            VL, false, true, false, false,
+                            PACKED_DIRECT_PREFIXLESS, false, true>(a, grid);
                 };
-                if (a.is_varlen)
-                    launch_gva.template operator()<true>();
-                else
-                    launch_gva.template operator()<false>();
+                if (a.is_varlen) {
+                    if (a.packed_direct_prefixless)
+                        launch_gva.template operator()<true, true>();
+                    else
+                        launch_gva.template operator()<true, false>();
+                } else {
+                    launch_gva.template operator()<false, false>();
+                }
                 return;
             }
             // Common dispatch has already matched this request to the policy
@@ -1072,6 +1077,45 @@ private:
         return value != nullptr && value[0] == '1' && value[1] == '\0';
     }
 
+    static bool is_k3_mixed_boundary_nohint_aggregate(const FwdParams& p) {
+        // ATOM does not currently pass max_seqlen_upper_bound.  The two
+        // production mixed batches (15 one-token decodes plus a 1024/1025
+        // prefill) are nevertheless identifiable from host metadata alone:
+        // N=16, total=1039/1040 and the packed C16 upper bound is 81 tiles.
+        // Do not infer the actual distribution from those aggregates.  Pure
+        // direct replay and the prefixless mapping are valid for every legal
+        // cu_seqlens with this signature, including empty or highly skewed
+        // sequences; the largest possible sequence still has only 65 C16
+        // chunks.  Equal-head K3 TP8 and the validated Hq=2/Hv=4 or 8 GVA
+        // layouts share the same distribution-independent mapping.
+        const bool supported_heads =
+            (p.H_q == p.H && p.H == 12) ||
+            (p.H_q == 2 && (p.H == 4 || p.H == 8));
+        return p.max_seqlen_upper_bound == 0 &&
+            supported_heads &&
+            p.cu_seqlens != nullptr && p.N == 16 &&
+            (p.T_total == 15 + 1024 || p.T_total == 15 + 1025) &&
+            p.total_tiles == 81;
+    }
+
+    static bool is_k3_n4_16k_nohint_aggregate(const FwdParams& p) {
+        // This proves only the K3/TP8 packed token budget, not four equal
+        // lengths.  The context kernels must continue consuming cu_seqlens.
+        return p.max_seqlen_upper_bound == 0 &&
+            p.H_q == p.H && p.H == 12 &&
+            p.cu_seqlens != nullptr && p.N == 4 &&
+            p.T_total == 16384 && p.total_tiles == 1028;
+    }
+
+    static bool is_k3_n8_16k_nohint_aggregate(const FwdParams& p) {
+        // As above, all sequence distributions sharing this aggregate are
+        // admitted; no dense/equal-length mapping may be inferred from it.
+        return p.max_seqlen_upper_bound == 0 &&
+            p.H_q == p.H && p.H == 12 &&
+            p.cu_seqlens != nullptr && p.N == 8 &&
+            p.T_total == 16384 && p.total_tiles == 1032;
+    }
+
     static bool context_direct_prefixless_enabled(
             const FwdParams& p,
             const ContextRouteConfig& route,
@@ -1081,20 +1125,24 @@ private:
         const bool explicit_prefixless =
             value != nullptr && value[0] == '1' && value[1] == '\0';
         // Fifteen one-token decodes plus one 1K prefill are the measured ATOM
-        // boundary batch.  Its aggregate raw-v2 signature is N=16,
-        // total==bound+15, total_tiles=81.  The bound is a caller promise, not
-        // a device-verified maximum, so other packed distributions can share
-        // that signature; both prefixless mappings remain general for every
-        // N<=16 distribution.  NW1-flat plus the prefixless full-chunk
-        // specialization wins all four decode-first/prefill-first 1024/1025
-        // cases.  Keep this graduation narrow: equal 16x1K is materially
-        // faster on the established NW4 topology.
-        const bool automatic_mixed_boundary_prefixless =
-            value == nullptr && p.cu_seqlens != nullptr && p.N == 16 &&
+        // boundary batch.  Use only its host-visible aggregate signature, not
+        // a route hint that the ATOM call site does not provide and not an
+        // inferred device-side distribution.  Both prefixless mappings are
+        // general for every legal N<=16 distribution.  NW1-flat plus the
+        // prefixless full-chunk specialization wins all four
+        // decode-first/prefill-first 1024/1025 cases.  Keep this graduation
+        // narrow: equal 16x1K is materially faster on the established NW4
+        // topology.
+        const bool hinted_mixed_boundary =
+            p.cu_seqlens != nullptr && p.N == 16 &&
             (p.max_seqlen_upper_bound == 1024 ||
              p.max_seqlen_upper_bound == 1025) &&
             p.T_total == p.max_seqlen_upper_bound + 15 &&
-            p.total_tiles == 81 &&
+            p.total_tiles == 81;
+        const bool automatic_mixed_boundary_prefixless =
+            value == nullptr &&
+            (hinted_mixed_boundary ||
+             is_k3_mixed_boundary_nohint_aggregate(p)) &&
             std::getenv("FLASH_KDA_GFX950_CONTEXT_DIRECT") == nullptr &&
             std::getenv("FLASH_KDA_GFX950_CONTEXT_AFFINE") == nullptr &&
             std::getenv("FLASH_KDA_GFX950_CONTEXT_HYBRID") == nullptr &&
@@ -1113,7 +1161,10 @@ private:
         // the established prefix topology.
         if (!explicit_prefixless && !automatic_mixed_boundary_prefixless)
             return false;
-        return p.H_q == p.H && p.cu_seqlens != nullptr && p.N > 0 &&
+        const bool supported_head_layout = p.H_q == p.H ||
+            (automatic_mixed_boundary_prefixless && p.H_q == 2 &&
+             (p.H == 4 || p.H == 8));
+        return supported_head_layout && p.cu_seqlens != nullptr && p.N > 0 &&
             p.N <= kPackedDirectPrefixlessMaxSequences && p.H > 0 &&
             default_k2_route == K2DefaultRoute::context_parallel &&
             route.group_chunks == 0 && route.direct_max_chunks == 0 &&
@@ -1418,6 +1469,40 @@ private:
         const char* group_env =
             std::getenv("FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS");
 
+        // ATOM's K3 call does not provide the optional maximum-length hint.
+        // Recognize only the two measured mixed-boundary aggregates.  Direct
+        // replay is distribution-independent here: any sequence is bounded
+        // by the 1039/1040-token total, hence by 65 C16 chunks.  The device
+        // prefix remains the sole source of per-sequence geometry.
+        const bool automatic_mixed_boundary_direct =
+            is_k3_mixed_boundary_nohint_aggregate(p) &&
+            group_env == nullptr &&
+            !force_direct && !force_affine && !force_hybrid;
+        // The ATOM call also omits the hint for its 16K token-budget batches.
+        // These predicates select only a packed affine schedule.  They do not
+        // claim equal sequence lengths and therefore cannot enable the dense
+        // metadata-elision capability below.
+        const bool automatic_k3_n4_16k_g64 =
+            is_k3_n4_16k_nohint_aggregate(p) &&
+            group_env == nullptr &&
+            !force_direct && !force_affine && !force_hybrid;
+        const bool automatic_k3_n8_16k_g64 =
+            is_k3_n8_16k_nohint_aggregate(p) &&
+            group_env == nullptr &&
+            !force_direct && !force_affine && !force_hybrid;
+        // The public GVA acceptance uses Hq=2 with four or eight value heads.
+        // For an N4/16K packed batch, generic G32 affine storage is safe for
+        // every legal distribution sharing the aggregate (including one
+        // 16K tail), unlike the faster G16 equal-length specialization.  This
+        // gives omitted-hint callers a distribution-independent route while
+        // preserving the exact-hint G16 proof below for Hq=2/Hv=4.
+        const bool automatic_gva_n4_16k_nohint =
+            p.max_seqlen_upper_bound == 0 && is_varlen && is_gva &&
+            p.H_q == 2 && (p.H == 4 || p.H == 8) && p.N == 4 &&
+            p.T_total == 16384 && p.total_tiles == 1028 &&
+            group_env == nullptr &&
+            !force_direct && !force_affine && !force_hybrid;
+
         // A single 256/512-token K3 sequence is faster as one fused-K1 plus
         // pure-direct replay pair than through the four-launch plain C-split
         // topology.  This covers both dense input and the one-sequence packed
@@ -1447,6 +1532,21 @@ private:
             !is_varlen && p.N == 1 && T_seq >= 2048 &&
             !force_direct && !force_affine && !force_hybrid;
 
+        // PR #4683 publishes dense single-sequence H=96 rows at 8K and 16K.
+        // The ordinary length-only schedule leaves those wide-head cases on
+        // G32/G64 respectively.  Paired gfx950 measurements select one larger
+        // affine group at each exact bucket when used with the fused A/B
+        // producer below.  Keep this graduation exact and zero-environment;
+        // explicit route/group controls remain diagnostic overrides.
+        const bool automatic_dense_n1_h96_g64 =
+            !is_varlen && !is_gva && p.N == 1 && p.H == 96 &&
+            T_seq == 8192 && group_env == nullptr &&
+            !force_direct && !force_affine && !force_hybrid;
+        const bool automatic_dense_n1_h96_g128 =
+            !is_varlen && !is_gva && p.N == 1 && p.H == 96 &&
+            T_seq == 16384 && group_env == nullptr &&
+            !force_direct && !force_affine && !force_hybrid;
+
         // The raw-v2 bound is a host-routing promise.  Ordinary routes never
         // replace device-prefix geometry with it; the one exact-equality
         // proof below may additionally select an equivalent compact dense
@@ -1457,8 +1557,9 @@ private:
         // * an equal-length batch proven by max_bound*N == total_tokens,
         //   inside the K3 token-budget range covered by the boundary screen.
         //
-        // Explicit diagnostic routes retain precedence, and a zero hint is
-        // byte-for-byte the legacy policy decision.
+        // Explicit diagnostic routes retain precedence.  A zero value means
+        // the caller supplied no distribution bound; only the separately
+        // guarded K3 host-aggregate rules above may specialize that case.
         const bool hinted_equal_lengths = has_length_hint &&
             hinted_bound * int64_t(p.N) == int64_t(p.T_total);
         // The production resume bucket is four equal 4K sequences.  Its
@@ -1476,7 +1577,16 @@ private:
         // four G16 affine ranges per sequence and an NW4 map scan; do not
         // reuse the equal-head G64/cache/metadata-elision specialization.
         const bool automatic_gva_equal_n4_g16 =
-            is_gva && hinted_equal_lengths && p.N == 4 &&
+            is_gva && p.H_q == 2 && p.H == 4 &&
+            hinted_equal_lengths && p.N == 4 &&
+            hinted_bound == 4096 && p.T_total == 4 * 4096 &&
+            group_env == nullptr &&
+            !force_direct && !force_affine && !force_hybrid;
+        // Ratio-4 GVA has enough value-head parallelism that the general G32
+        // producer plus NW4 scan is faster than the G16 equal-bucket recipe.
+        const bool automatic_gva_equal_n4_g32 =
+            is_gva && p.H_q == 2 && p.H == 8 &&
+            hinted_equal_lengths && p.N == 4 &&
             hinted_bound == 4096 && p.T_total == 4 * 4096 &&
             group_env == nullptr &&
             !force_direct && !force_affine && !force_hybrid;
@@ -1498,9 +1608,12 @@ private:
         // allowed CSPLIT64_MIN_T to win instead.
         const bool force_context =
             force_direct || force_affine || (force_hybrid && is_varlen) ||
-            hinted_direct || automatic_short_single_direct ||
+            hinted_direct || automatic_mixed_boundary_direct ||
+            automatic_short_single_direct ||
             automatic_dense_single_g8 || automatic_dense_single_affine ||
-            automatic_equal_n4_g64 || automatic_gva_equal_n4_g16;
+            automatic_equal_n4_g64 || automatic_gva_equal_n4_g16 ||
+            automatic_gva_equal_n4_g32 || automatic_gva_n4_16k_nohint ||
+            automatic_k3_n4_16k_g64 || automatic_k3_n8_16k_g64;
 
         const int requested_group = group_env ? std::atoi(group_env) : 0;
         const bool requested_g8 = env_exact(
@@ -1537,9 +1650,11 @@ private:
             : requested_g16 || automatic_dense_g16 ||
                     automatic_gva_equal_n4_g16
             ? 16
-            : requested_group == 128
+            : requested_group == 128 || automatic_dense_n1_h96_g128
             ? 128
             : requested_group == 64 || automatic_equal_n4_g64 ||
+                automatic_dense_n1_h96_g64 ||
+                automatic_k3_n4_16k_g64 || automatic_k3_n8_16k_g64 ||
                 (requested_group == 0 &&
                  (T_seq >= 12288 || hinted_n8_g64))
                 ? 64
@@ -1583,11 +1698,13 @@ private:
         // prefill.  Hybrid dispatch keeps the short sequences register-local
         // and forms affine maps only for the long contexts.
         const bool hybrid = is_varlen && !hinted_direct &&
+            !automatic_mixed_boundary_direct &&
             ((!force_affine &&
               (force_hybrid || (!force_direct && p.N >= 9))) ||
              (force_affine && !scratch_safe));
         const bool direct = !hybrid &&
             (automatic_short_single_direct || hinted_direct ||
+             automatic_mixed_boundary_direct ||
              (force_affine && !scratch_safe) ||
              (!force_affine &&
               (force_direct || (p.N >= 16 && T_seq <= 1024))));
@@ -1599,8 +1716,12 @@ private:
             group_chunks = 8;
         } else if (eligible_g16) {
             group_chunks = 16;
-        } else if (automatic_equal_n4_g64) {
+        } else if (automatic_equal_n4_g64 || automatic_k3_n4_16k_g64 ||
+                   automatic_k3_n8_16k_g64 ||
+                   automatic_dense_n1_h96_g64) {
             group_chunks = 64;
+        } else if (automatic_dense_n1_h96_g128) {
+            group_chunks = 128;
         } else if (requested_group == 32 || requested_group == 64 ||
                    requested_group == 128) {
             group_chunks = requested_group;
@@ -1747,13 +1868,13 @@ private:
         }
         const bool direct = group_chunks == 0;
         const bool hybrid = direct_max_chunks > 0;
-        // The proven equal packed 4x4K bucket reaches this callback as a G64
-        // affine route.  Its measured recipe uses the fused producer and the
-        // K-split scan.  The strict whole-graph candidate reaches the same
-        // callback after common dispatch has normalized all four stages to
-        // dense indexing; keep that fact explicit instead of inferring it
-        // from null metadata.
-        const bool packed_automatic_equal_n4_g64 =
+        // The packed N4/16K budget reaches this callback as a G64 affine
+        // route either through a caller hint proving equal 4K lengths or the
+        // K3/TP8 no-hint aggregate graduation.  Its fused producer/K-split
+        // recipe is valid for arbitrary packed distributions; this predicate
+        // must not be treated as an equal-length proof.  Only the separate
+        // a.equal_dense_n4_g64 capability below permits metadata elision.
+        const bool packed_automatic_n4_16k_g64 =
             !a.is_gva && a.is_varlen && a.N == 4 && a.T_seq == 4096 &&
             group_chunks == 64 && direct_max_chunks == 0 &&
             !env_exact("FLASH_KDA_GFX950_CONTEXT_DIRECT", "1") &&
@@ -1767,8 +1888,20 @@ private:
             group_chunks == 64 && direct_max_chunks == 0 &&
             a.cu_seqlens == nullptr && a.tile_prefix == nullptr &&
             a.context_prefix == nullptr;
-        const bool automatic_equal_n4_g64 =
-            packed_automatic_equal_n4_g64 || equal_dense_n4_g64;
+        const bool automatic_n4_16k_g64 =
+            packed_automatic_n4_16k_g64 || equal_dense_n4_g64;
+        // Match resolve_context_route's exact zero-environment H96 buckets.
+        // Fusing the two independent affine-map producers removes one launch
+        // and redundant operand traffic; G64 wins at 8K and G128 at 16K.
+        const bool automatic_dense_n1_h96_fused =
+            !a.is_gva && !a.is_varlen && a.N == 1 && a.H == 96 &&
+            ((a.T_seq == 8192 && group_chunks == 64) ||
+             (a.T_seq == 16384 && group_chunks == 128)) &&
+            std::getenv("FLASH_KDA_GFX950_CONTEXT_DIRECT") == nullptr &&
+            std::getenv("FLASH_KDA_GFX950_CONTEXT_AFFINE") == nullptr &&
+            std::getenv("FLASH_KDA_GFX950_CONTEXT_HYBRID") == nullptr &&
+            std::getenv("FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS") == nullptr &&
+            std::getenv("FLASH_KDA_GFX950_CONTEXT_AFFINE_AB_FUSED") == nullptr;
         // Consume the exact policy-time route facts rather than reconstructing
         // them after common dispatch has normalized launch metadata.
         const bool automatic_gva_packed_nw4 =
@@ -1795,7 +1928,8 @@ private:
             (pipeline_lds_global || context_lds_pipeline_replay_enabled());
         const bool fuse_affine_ab =
             (context_affine_ab_fused_enabled(group_chunks) ||
-             (automatic_equal_n4_g64 &&
+             automatic_dense_n1_h96_fused ||
+             (automatic_n4_16k_g64 &&
               std::getenv(
                   "FLASH_KDA_GFX950_CONTEXT_AFFINE_AB_FUSED") == nullptr)) &&
             !direct &&
@@ -1857,7 +1991,27 @@ private:
             // while the zero-environment production recipe changes both
             // mapping and schedule as one measured unit.
             const bool automatic_mixed_boundary_nw1_flat =
-                a.packed_direct_prefixless && a.is_varlen && a.N == 16 &&
+                !a.is_gva && a.packed_direct_prefixless &&
+                a.is_varlen && a.N == 16 &&
+                a.total_tiles == 81 &&
+                (a.T_seq == 64 || a.T_seq == 65) &&
+                std::getenv(
+                    "FLASH_KDA_GFX950_CONTEXT_DIRECT_PREFIXLESS") ==
+                    nullptr &&
+                std::getenv("FLASH_KDA_GFX950_CONTEXT_DIRECT") == nullptr &&
+                std::getenv("FLASH_KDA_GFX950_CONTEXT_AFFINE") == nullptr &&
+                std::getenv("FLASH_KDA_GFX950_CONTEXT_HYBRID") == nullptr &&
+                std::getenv(
+                    "FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS") == nullptr &&
+                direct_nw_value == nullptr && nw1_flat_value == nullptr;
+            // GVA cannot use the cached-operand NW1-flat kernel, but removing
+            // the prefix launch and using the ordinary 2-D NW1 replay still
+            // provides enough independent (head,V16) work at this boundary.
+            // The policy-side aggregate guard limits this automatic recipe to
+            // Hq=2/Hv=4 or 8; explicit scheduling controls remain authoritative.
+            const bool automatic_gva_mixed_boundary_nw1 =
+                a.is_gva && a.packed_direct_prefixless && a.is_varlen &&
+                a.N == 16 && (a.H == 4 || a.H == 8) &&
                 a.total_tiles == 81 &&
                 (a.T_seq == 64 || a.T_seq == 65) &&
                 std::getenv(
@@ -1884,7 +2038,9 @@ private:
                 env_unset_or_exact(
                     "FLASH_KDA_GFX950_CONTEXT_DIRECT_NW", "1");
             const int direct_nw = use_deep_n4_nw4
-                ? 4 : requested_direct_nw;
+                ? 4
+                : automatic_gva_mixed_boundary_nw1 ? 1
+                                                    : requested_direct_nw;
             // Flatten all eight NW1 V16 CTAs of one (sequence, head) next to
             // each other.  Form the product in 64 bits and reject the
             // specialization unless dim3.x remains representable by the
@@ -2286,13 +2442,13 @@ private:
         // the launch tax worse until a compact persistent worklist exists.
         // Keep every other scan experiment orthogonal: requesting one of
         // those axes must not silently turn it into a K-split comparison.
-        const bool automatic_equal_n4_g64_ksplit =
-            automatic_equal_n4_g64 && scan_nw_env == nullptr &&
+        const bool automatic_n4_16k_g64_ksplit =
+            automatic_n4_16k_g64 && scan_nw_env == nullptr &&
             std::getenv(
                 "FLASH_KDA_GFX950_CONTEXT_SCAN_KSPLIT") == nullptr;
         const bool scan_ksplit =
             (context_scan_ksplit_enabled() ||
-             automatic_equal_n4_g64_ksplit) &&
+             automatic_n4_16k_g64_ksplit) &&
             !direct && !hybrid && scan_nw == 2 && !scan_b_stream &&
             !scan_a_gll && !scan_b_phased &&
             (a.is_varlen || (!a.is_varlen && a.N == 1) ||

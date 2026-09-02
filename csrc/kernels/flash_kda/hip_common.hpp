@@ -51,8 +51,10 @@ struct FwdParams {
     const int32_t* cu_seqlens;
     hipStream_t stream;
     // Optional caller-provided upper bound used only by host route policy.
-    // Zero preserves the legacy packed policy.  Execution geometry continues
-    // to come from T_total/N and device prefix metadata.
+    // Zero means that no bound was supplied; policy may still recognize a
+    // strictly guarded host-aggregate specialization.  Unless a truthful
+    // equality proof explicitly permits metadata elision, execution geometry
+    // continues to come from T_total/N and device prefix metadata.
     int max_seqlen_upper_bound = 0;
 };
 
