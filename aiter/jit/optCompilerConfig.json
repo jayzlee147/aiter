@@ -1996,7 +1996,7 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
-    "module_flash_kda_hip": {
+    "module_flash_kda_hip_v2": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/flash_kda_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/flash_kda/flash_kda_aiter.cu'",

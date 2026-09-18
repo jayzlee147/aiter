@@ -144,7 +144,8 @@ void flash_kda_fwd_hip(
     double lower_bound,
     bool has_initial_state,
     bool output_final_state,
-    bool is_varlen)
+    bool is_varlen,
+    int64_t max_seqlen_upper_bound)
 {
     check_gpu_contiguous(q, "q");
     check_gpu_contiguous(k, "k");
@@ -215,8 +216,9 @@ void flash_kda_fwd_hip(
                     "2D dt_bias must have shape [H,128]");
     }
 
-    AITER_CHECK(std::isfinite(scale) && scale > 0.0,
-                "scale must be finite and positive, got ",
+    AITER_CHECK(std::isfinite(scale) && scale > 0.0 &&
+                    scale <= std::numeric_limits<float>::max(),
+                "scale must be finite, positive, and representable as float, got ",
                 scale);
     AITER_CHECK(std::isfinite(lower_bound) && lower_bound >= -5.0 &&
                     lower_bound < 0.0,
@@ -254,6 +256,28 @@ void flash_kda_fwd_hip(
     constexpr int64_t max_grid_y = 65535;
     AITER_CHECK(is_varlen ? H <= max_grid_y : H <= max_grid_y / N,
                 "FlashKDA dense N*H_v (or packed H_v) exceeds grid.y limit");
+
+    AITER_CHECK(max_seqlen_upper_bound >= 0,
+                "max_seqlen_upper_bound must be nonnegative");
+    AITER_CHECK(max_seqlen_upper_bound <= std::numeric_limits<int>::max(),
+                "max_seqlen_upper_bound exceeds the native int policy ABI");
+    if(max_seqlen_upper_bound > 0)
+    {
+        if(is_varlen)
+        {
+            const int64_t minimum_upper = total_tokens / N +
+                                          (total_tokens % N != 0 ? 1 : 0);
+            AITER_CHECK(max_seqlen_upper_bound >= minimum_upper &&
+                            max_seqlen_upper_bound <= total_tokens,
+                        "packed max_seqlen_upper_bound must be in "
+                        "[ceil(B*T/N), B*T]");
+        }
+        else
+        {
+            AITER_CHECK(max_seqlen_upper_bound == T,
+                        "dense max_seqlen_upper_bound must be zero or equal T");
+        }
+    }
 
     bool state_fp32 = false;
     if(has_initial_state)
@@ -343,7 +367,7 @@ void flash_kda_fwd_hip(
         state_fp32,
         single_sequence_packed ? nullptr : cu_seqlens_ptr,
         stream,
-        0);
+        static_cast<int>(max_seqlen_upper_bound));
     HIP_CALL_LAUNCH(hipGetLastError());
 }
 

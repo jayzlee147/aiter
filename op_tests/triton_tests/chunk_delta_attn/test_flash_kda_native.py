@@ -3,13 +3,11 @@
 
 """Kimi-K3 contract tests for the native gfx942/gfx950 FlashKDA path.
 
-The native implementation has a deliberately narrower surface than the public
-KDA wrapper.  These tests keep the production contract explicit: packed B=1
-BF16 activations, FP32 beta/gate parameters, one-dimensional ``dt_bias``, GPU
-int32 sequence metadata, and an FP32 V-first recurrent state.  The numerical
-tests select the Triton implementation explicitly through the public wrapper,
-so the public ``auto`` selector cannot accidentally compare one backend with
-itself.
+The native implementation has a deliberately narrower surface than the Triton
+KDA API. These tests keep its contract explicit: BF16 activations, FP32
+beta/gate parameters, one-dimensional ``dt_bias``, GPU int32 sequence metadata,
+and FP32/BF16 V-first recurrent state. Comparisons invoke the native and Triton
+entry points independently; backend selection belongs to the caller.
 """
 
 from __future__ import annotations
@@ -24,6 +22,8 @@ import torch.nn.functional as F
 
 from aiter.ops.flash_kda import (
     flash_kda_fwd as flash_kda_native_fwd,
+)
+from aiter.ops.flash_kda import (
     flash_kda_native_supported,
 )
 from op_tests.triton_tests.utils.kda_ref import chunk_kda_ref
@@ -42,7 +42,12 @@ requires_rocm_gpu = pytest.mark.skipif(
 
 
 def _make_v_first_state(
-    n: int, h: int, *, device: str | torch.device, nonzero: bool
+    n: int,
+    h: int,
+    *,
+    device: str | torch.device,
+    nonzero: bool,
+    dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """Make an asymmetric ``[N,H,V,K]`` state.
 
@@ -50,9 +55,7 @@ def _make_v_first_state(
     Different V- and K-axis ramps make that layout error numerically obvious.
     """
 
-    state = torch.zeros(
-        n, h, HEAD_DIM, HEAD_DIM, device=device, dtype=torch.float32
-    )
+    state = torch.zeros(n, h, HEAD_DIM, HEAD_DIM, device=device, dtype=torch.float32)
     if nonzero:
         state.normal_(mean=0.0, std=0.02)
         v_axis = torch.linspace(-0.04, 0.03, HEAD_DIM, device=device).view(
@@ -63,7 +66,7 @@ def _make_v_first_state(
         )
         state.add_(v_axis).add_(0.37 * k_axis)
         assert not torch.equal(state, state.transpose(-1, -2))
-    return state
+    return state.to(dtype)
 
 
 def _make_k3_inputs(
@@ -72,6 +75,7 @@ def _make_k3_inputs(
     heads: int = 2,
     value_heads: int | None = None,
     resume: bool = False,
+    state_dtype: torch.dtype = torch.float32,
     device: str | torch.device = "cuda",
     seed: int = 42,
 ) -> dict[str, object]:
@@ -100,9 +104,7 @@ def _make_k3_inputs(
             torch.bfloat16
         ),
         # ATOM widens the BF16 beta projection before invoking KDA.
-        "beta": torch.randn(
-            (1, total, value_heads), device=device, dtype=torch.float32
-        )
+        "beta": torch.randn((1, total, value_heads), device=device, dtype=torch.float32)
         .to(torch.bfloat16)
         .float(),
         "A_log": torch.empty(value_heads, device=device, dtype=torch.float32)
@@ -114,7 +116,11 @@ def _make_k3_inputs(
         ),
         "scale": 1.0 / math.sqrt(HEAD_DIM),
         "initial_state": _make_v_first_state(
-            len(seq_lens), value_heads, device=device, nonzero=resume
+            len(seq_lens),
+            value_heads,
+            device=device,
+            nonzero=resume,
+            dtype=state_dtype,
         ),
         "output_final_state": True,
         "use_qk_l2norm_in_kernel": True,
@@ -147,33 +153,11 @@ def _native_kwargs(inputs: dict[str, object]) -> dict[str, object]:
 
 
 def _native_support_kwargs(inputs: dict[str, object]) -> dict[str, object]:
-    return {
-        key: value
-        for key, value in inputs.items()
-        if key
-        in {
-            "q",
-            "k",
-            "v",
-            "g",
-            "beta",
-            "A_log",
-            "dt_bias",
-            "initial_state",
-            "output_final_state",
-            "use_qk_l2norm_in_kernel",
-            "use_gate_in_kernel",
-            "use_beta_sigmoid_in_kernel",
-            "safe_gate",
-            "lower_bound",
-            "state_v_first",
-            "cu_seqlens",
-        }
-    }
+    return _native_kwargs(inputs)
 
 
 def _triton_call(inputs: dict[str, object]):
-    return _PUBLIC_MODULE.chunk_kimi_delta_attn(**inputs, backend="triton")
+    return _PUBLIC_MODULE.chunk_kimi_delta_attn(**inputs)
 
 
 def _relative_rms(actual: torch.Tensor, reference: torch.Tensor) -> float:
@@ -209,13 +193,11 @@ def _max_packed_relative_rms(
 
 def _require_native(inputs: dict[str, object]) -> None:
     support_kwargs = _native_support_kwargs(inputs)
-    reason = _NATIVE_MODULE._native_rejection_reason(  # noqa: SLF001
-        **support_kwargs
-    )
+    reason = _NATIVE_MODULE._native_rejection_reason(**support_kwargs)
     if reason is None:
         assert flash_kda_native_supported(**support_kwargs)
         return
-    arch = _NATIVE_MODULE._device_arch(inputs["q"].device)  # noqa: SLF001
+    arch = _NATIVE_MODULE._device_arch(inputs["q"].device)
     if arch not in _NATIVE_MODULE.FLASH_KDA_NATIVE_ARCHS or "disables" in reason:
         pytest.skip(f"native FlashKDA is unavailable: {reason}")
     pytest.fail(f"native FlashKDA unexpectedly rejected the test contract: {reason}")
@@ -241,9 +223,7 @@ def test_native_matches_direct_triton_k3_contract(seq_lens, resume):
     triton_o, triton_ht = _triton_call(inputs)
     torch.cuda.synchronize()
 
-    assert all(
-        inputs[name].dtype == torch.bfloat16 for name in ("q", "k", "v", "g")
-    )
+    assert all(inputs[name].dtype == torch.bfloat16 for name in ("q", "k", "v", "g"))
     assert inputs["beta"].dtype == torch.float32
     assert inputs["A_log"].dtype == torch.float32
     assert inputs["dt_bias"].dtype == torch.float32
@@ -352,9 +332,7 @@ def test_native_gva_matches_fp32_recurrence(heads, value_heads, layout, resume):
 def test_native_gva_packed_int64_empty_sequence_preserves_state():
     """Cover host int64 metadata conversion and an empty sequence under GVA."""
 
-    inputs = _make_k3_inputs(
-        (0, 7, 17), heads=1, value_heads=2, resume=True, seed=31
-    )
+    inputs = _make_k3_inputs((0, 7, 17), heads=1, value_heads=2, resume=True, seed=31)
     inputs["cu_seqlens"] = inputs["cu_seqlens"].to(torch.int64)
     _require_native(inputs)
     initial_copy = inputs["initial_state"].clone()
@@ -372,15 +350,23 @@ def test_native_gva_packed_int64_empty_sequence_preserves_state():
 
 @requires_rocm_gpu
 def test_native_gva_descriptor_entry_matches_raw_v3(monkeypatch):
-    """Exercise shape-derived Hq/HV in the tensor-descriptor ABI explicitly."""
+    """Exercise hinted GVA geometry in the tensor-descriptor ABI explicitly."""
 
-    inputs = _make_k3_inputs(
-        (19, 29), heads=2, value_heads=4, resume=True, seed=37
-    )
+    inputs = _make_k3_inputs((19, 29), heads=2, value_heads=4, resume=True, seed=37)
     _require_native(inputs)
-    raw_o, raw_ht = flash_kda_native_fwd(**_native_kwargs(inputs))
+    kwargs = {
+        **_native_kwargs(inputs),
+        "max_seqlen_upper_bound": max((19, 29)),
+    }
+    # A source-only checkout reaches the descriptor entry while compiling the
+    # extension. Warm it first, then prove that the comparison side is really
+    # the additive raw-v3 ABI rather than a second descriptor invocation.
+    flash_kda_native_fwd(**kwargs)
+    binding = _NATIVE_MODULE._get_raw_pointer_binding()
+    assert binding is not None and binding[1] == 3
+    raw_o, raw_ht = flash_kda_native_fwd(**kwargs)
     monkeypatch.setattr(_NATIVE_MODULE, "_get_raw_pointer_binding", lambda: None)
-    descriptor_o, descriptor_ht = flash_kda_native_fwd(**_native_kwargs(inputs))
+    descriptor_o, descriptor_ht = flash_kda_native_fwd(**kwargs)
     torch.cuda.synchronize()
 
     assert raw_ht is not None and descriptor_ht is not None
@@ -388,13 +374,60 @@ def test_native_gva_descriptor_entry_matches_raw_v3(monkeypatch):
     assert torch.equal(descriptor_ht, raw_ht)
 
 
+@pytest.mark.parametrize("layout", ["dense", "packed"])
+@pytest.mark.parametrize("entry", ["raw-v3", "descriptor"])
+@requires_rocm_gpu
+def test_native_bf16_resumed_state_matches_reference(monkeypatch, layout, entry):
+    """Cover BF16 state input/output through both native launch ABIs."""
+
+    seq_lens = (17, 33)
+    inputs = _make_k3_inputs(
+        seq_lens,
+        heads=2,
+        value_heads=4,
+        resume=True,
+        state_dtype=torch.bfloat16,
+        seed=39,
+    )
+    if layout == "dense":
+        for name in ("q", "k", "v", "g", "beta"):
+            tensor = inputs[name]
+            inputs[name] = tensor.reshape(2, 25, *tensor.shape[2:]).contiguous()
+        inputs["cu_seqlens"] = None
+    _require_native(inputs)
+
+    if entry == "raw-v3":
+        # Warm a source-only checkout once so this case proves the direct ABI,
+        # rather than accidentally exercising the descriptor cold-start path.
+        flash_kda_native_fwd(**_native_kwargs(inputs))
+        binding = _NATIVE_MODULE._get_raw_pointer_binding()
+        assert binding is not None and binding[1] == 3
+    else:
+        monkeypatch.setattr(_NATIVE_MODULE, "_get_raw_pointer_binding", lambda: None)
+
+    initial_copy = inputs["initial_state"].clone()
+    native_o, native_ht = flash_kda_native_fwd(
+        **_native_kwargs(inputs),
+        max_seqlen_upper_bound=max(seq_lens) if layout == "packed" else None,
+    )
+    gold_o, gold_ht = chunk_kda_ref(**inputs)
+    torch.cuda.synchronize()
+
+    assert native_ht is not None and gold_ht is not None
+    assert native_ht.shape == inputs["initial_state"].shape
+    assert native_ht.dtype == torch.bfloat16
+    assert torch.equal(inputs["initial_state"], initial_copy)
+    assert torch.isfinite(native_o).all()
+    assert torch.isfinite(native_ht).all()
+    assert _relative_rms(native_o, gold_o) < 4e-2
+    assert _relative_rms(native_ht, gold_ht) < 4e-2
+
+
 @requires_rocm_gpu
 def test_native_gva_graph_capture_replays_bitwise():
     """The raw-v3 pointer path must remain capture-safe for serving graphs."""
 
-    inputs = _make_k3_inputs(
-        (31, 47), heads=2, value_heads=4, resume=True, seed=41
-    )
+    inputs = _make_k3_inputs((31, 47), heads=2, value_heads=4, resume=True, seed=41)
     _require_native(inputs)
     eager_o, eager_ht = flash_kda_native_fwd(**_native_kwargs(inputs))
     torch.cuda.synchronize()
@@ -480,31 +513,6 @@ def test_gfx950_context_routes_match_triton_and_preserve_empty_state(
 
 
 @pytest.mark.parametrize(
-    "value_heads",
-    [pytest.param(2, id="equal-heads"), pytest.param(4, id="gva-2x4")],
-)
-@requires_rocm_gpu
-def test_public_default_backend_reaches_real_native_kernel(
-    monkeypatch, value_heads
-):
-    """Verify zero-env production routing, allocation, and native JIT together."""
-
-    monkeypatch.delenv("AITER_KDA_BACKEND", raising=False)
-    monkeypatch.delenv("AITER_TRITON_ONLY", raising=False)
-    inputs = _make_k3_inputs(
-        (33, 71), heads=2, value_heads=value_heads, resume=True, seed=11
-    )
-    _require_native(inputs)
-    direct_o, direct_ht = flash_kda_native_fwd(**_native_kwargs(inputs))
-    public_o, public_ht = _PUBLIC_MODULE.chunk_kimi_delta_attn(**inputs)
-    torch.cuda.synchronize()
-
-    assert direct_ht is not None and public_ht is not None
-    assert torch.equal(public_o, direct_o)
-    assert torch.equal(public_ht, direct_ht)
-
-
-@pytest.mark.parametrize(
     ("heads", "value_heads"),
     [
         pytest.param(12, 12, id="k3-h12"),
@@ -513,19 +521,16 @@ def test_public_default_backend_reaches_real_native_kernel(
     ],
 )
 @requires_rocm_gpu
-def test_public_native_mixed_hint_resume_chain_is_equivalent(
-    monkeypatch, heads, value_heads
-):
+def test_native_mixed_hint_resume_chain_is_equivalent(monkeypatch, heads, value_heads):
     """Valid no/exact/over hints may change routing, never KDA semantics."""
 
     device = torch.device("cuda")
-    if _NATIVE_MODULE._device_arch(device) != "gfx950":  # noqa: SLF001
+    if _NATIVE_MODULE._device_arch(device) != "gfx950":
         pytest.skip("mixed-hint production routing is gfx950-specific")
 
     # Exercise the production policy even when a developer shell carries an
     # unrelated route experiment. monkeypatch restores every value afterwards.
     monkeypatch.delenv("AITER_TRITON_ONLY", raising=False)
-    monkeypatch.delenv("AITER_KDA_BACKEND", raising=False)
     for name in tuple(os.environ):
         if name.startswith("FLASH_KDA_"):
             monkeypatch.delenv(name, raising=False)
@@ -542,16 +547,12 @@ def test_public_native_mixed_hint_resume_chain_is_equivalent(
         seed=20261100 + value_heads,
     )
     _require_native(warmup_inputs)
-    _PUBLIC_MODULE.chunk_kimi_delta_attn(
-        **warmup_inputs,
-        backend="native",
-        max_seqlen_upper_bound=None,
-    )
+    flash_kda_native_fwd(**_native_kwargs(warmup_inputs))
     torch.cuda.synchronize(device)
-    real_binding = _NATIVE_MODULE._get_raw_pointer_binding()  # noqa: SLF001
-    assert real_binding is not None and real_binding[1] == 3, (
-        "mixed-hint coverage requires the native FlashKDA raw-v3 ABI"
-    )
+    real_binding = _NATIVE_MODULE._get_raw_pointer_binding()
+    assert (
+        real_binding is not None and real_binding[1] == 3
+    ), "mixed-hint coverage requires the native FlashKDA raw-v3 ABI"
     real_raw_v3 = real_binding[0]
     raw_v3_tail_args: list[tuple[int, int]] = []
 
@@ -560,9 +561,7 @@ def test_public_native_mixed_hint_resume_chain_is_equivalent(
         raw_v3_tail_args.append((int(args[-2]), int(args[-1])))
         return real_raw_v3(*args)
 
-    monkeypatch.setattr(
-        _NATIVE_MODULE, "_RAW_POINTER_BINDING", (raw_v3_spy, 3)
-    )
+    monkeypatch.setattr(_NATIVE_MODULE, "_RAW_POINTER_BINDING", (raw_v3_spy, 3))
 
     decodes = (1,) * 15
     steps = (
@@ -595,19 +594,17 @@ def test_public_native_mixed_hint_resume_chain_is_equivalent(
         reference_input_copy = reference_state.clone()
 
         raw_v3_tail_args.clear()
-        candidate_o, candidate_final = _PUBLIC_MODULE.chunk_kimi_delta_attn(
-            **candidate_inputs,
-            backend="native",
+        candidate_o, candidate_final = flash_kda_native_fwd(
+            **_native_kwargs(candidate_inputs),
             max_seqlen_upper_bound=bound,
         )
-        reference_o, reference_final = _PUBLIC_MODULE.chunk_kimi_delta_attn(
-            **reference_inputs,
-            backend="native",
+        reference_o, reference_final = flash_kda_native_fwd(
+            **_native_kwargs(reference_inputs),
             max_seqlen_upper_bound=None,
         )
         torch.cuda.synchronize(device)
 
-        # This proves public API -> raw-v3 ABI transport.  The existing raw
+        # This proves native API -> raw-v3 ABI transport. The existing raw
         # graph route validator separately proves that C++ consumes the hint.
         candidate_bound = 0 if bound is None else bound
         assert raw_v3_tail_args == [
@@ -619,16 +616,12 @@ def test_public_native_mixed_hint_resume_chain_is_equivalent(
         assert torch.isfinite(candidate_final).all()
         assert torch.equal(candidate_state, candidate_input_copy)
         assert torch.equal(reference_state, reference_input_copy)
-        output_error = _max_packed_relative_rms(
-            candidate_o, reference_o, seq_lens
-        )
+        output_error = _max_packed_relative_rms(candidate_o, reference_o, seq_lens)
         state_error = _relative_rms(candidate_final, reference_final)
         for sequence in range(len(seq_lens)):
             state_error = max(
                 state_error,
-                _relative_rms(
-                    candidate_final[sequence], reference_final[sequence]
-                ),
+                _relative_rms(candidate_final[sequence], reference_final[sequence]),
             )
         assert output_error <= tolerance, (
             f"{hint_label} step {step_index} output rRMS "
@@ -639,7 +632,7 @@ def test_public_native_mixed_hint_resume_chain_is_equivalent(
             f"{state_error:.6e} exceeds {tolerance:.1e}"
         )
 
-        # Feed the actual returned allocations into the next public API call;
+        # Feed the actual returned allocations into the next native API call;
         # cloning here would weaken the resume-chain coverage.
         candidate_state = candidate_final
         reference_state = reference_final
@@ -665,100 +658,9 @@ def test_native_support_validator_accepts_exact_k3_metadata(monkeypatch, arch):
     assert not flash_kda_native_supported(
         **{**kwargs, "dt_bias": inputs["dt_bias"].bfloat16()}
     )
-    assert not flash_kda_native_supported(**{**kwargs, "chunk_size": 64})
-    assert not flash_kda_native_supported(**{**kwargs, "state_v_first": False})
     assert not flash_kda_native_supported(
         **{**kwargs, "dt_bias": inputs["dt_bias"][:-1]}
     )
 
     monkeypatch.setattr(_NATIVE_MODULE, "_device_arch", lambda _device: "gfx90a")
     assert not flash_kda_native_supported(**kwargs)
-
-
-def test_public_backend_selector_and_unsupported_fallback(monkeypatch):
-    """The selector is testable on CPU and never reaches a compiled kernel."""
-
-    monkeypatch.delenv("AITER_KDA_BACKEND", raising=False)
-    inputs = _make_k3_inputs((3, 5), heads=1, resume=True, device="cpu")
-    calls: list[tuple[str, dict[str, object]]] = []
-    support = {"value": True}
-
-    def fake_supported(**_kwargs):
-        return support["value"]
-
-    def fake_native(**kwargs):
-        calls.append(("native", kwargs))
-        return torch.full_like(kwargs["v"], 1), kwargs["initial_state"].clone()
-
-    def fake_triton(**kwargs):
-        calls.append(("triton", kwargs))
-        return torch.full_like(kwargs["v"], 2), kwargs["initial_state"].clone()
-
-    monkeypatch.setattr(_PUBLIC_MODULE, "flash_kda_native_supported", fake_supported)
-    monkeypatch.setattr(_PUBLIC_MODULE, "flash_kda_native_fwd", fake_native)
-    monkeypatch.setattr(_PUBLIC_MODULE, "chunk_delta_attn_fwd", fake_triton)
-    monkeypatch.setattr(
-        _PUBLIC_MODULE,
-        "_native_rejection_reason",
-        lambda **_kwargs: "synthetic unsupported input",
-    )
-
-    # An unvalidated architecture preserves the Triton default without even
-    # querying native eligibility.
-    monkeypatch.setattr(
-        _PUBLIC_MODULE,
-        "flash_kda_native_supported",
-        lambda **_kwargs: pytest.fail("default Triton path queried native support"),
-    )
-    output, _ = _PUBLIC_MODULE.chunk_kimi_delta_attn(**inputs)
-    assert torch.equal(output, torch.full_like(inputs["v"], 2))
-    assert calls[0][0] == "triton"
-    assert calls[0][1]["allow_flash_kda"] is True
-    calls.clear()
-
-    monkeypatch.setattr(_PUBLIC_MODULE, "flash_kda_native_supported", fake_supported)
-
-    # Both promoted AMD architectures completed their production matrices, so
-    # a zero-environment public call selects the native fast path on each.
-    for arch in ("gfx942", "gfx950"):
-        monkeypatch.setattr(
-            _PUBLIC_MODULE, "_device_arch", lambda _device, arch=arch: arch
-        )
-        output, final_state = _PUBLIC_MODULE.chunk_kimi_delta_attn(**inputs)
-        assert [name for name, _ in calls] == ["native"]
-        assert torch.equal(output, torch.full_like(inputs["v"], 1))
-        assert final_state is not None
-        calls.clear()
-
-    for backend, expected, marker, allow_flash in (
-        ("auto", "native", 1, None),
-        ("native", "native", 1, None),
-        ("triton", "triton", 2, True),
-        ("baseline", "triton", 2, False),
-    ):
-        calls.clear()
-        output, final_state = _PUBLIC_MODULE.chunk_kimi_delta_attn(
-            **inputs, backend=backend
-        )
-        assert [name for name, _ in calls] == [expected]
-        assert torch.equal(output, torch.full_like(inputs["v"], marker))
-        assert final_state is not None
-        if expected == "native":
-            native_call = calls[0][1]
-            assert native_call["dt_bias"].ndim == 1
-            assert native_call["cu_seqlens"].dtype == torch.int32
-            assert native_call["initial_state"].dtype == torch.float32
-        else:
-            assert calls[0][1]["allow_flash_kda"] is allow_flash
-
-    # ``auto`` must fall back, while an explicit native request must fail loud.
-    support["value"] = False
-    calls.clear()
-    _PUBLIC_MODULE.chunk_kimi_delta_attn(**inputs, backend="auto")
-    assert [name for name, _ in calls] == ["triton"]
-    assert calls[0][1]["allow_flash_kda"] is True
-
-    calls.clear()
-    with pytest.raises(ValueError, match="synthetic unsupported input"):
-        _PUBLIC_MODULE.chunk_kimi_delta_attn(**inputs, backend="native")
-    assert not calls

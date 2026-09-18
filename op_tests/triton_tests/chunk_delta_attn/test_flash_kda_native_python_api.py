@@ -12,9 +12,6 @@ import pytest
 import torch
 
 _FLASH_KDA = importlib.import_module("aiter.ops.flash_kda")
-_PUBLIC_KDA = importlib.import_module(
-    "aiter.ops.triton.kimi_delta_attn.chunk_delta_attn"
-)
 
 
 class _Recorder:
@@ -25,25 +22,11 @@ class _Recorder:
         self.calls.append(args)
 
 
-class _CapturingLogger:
-    def __init__(self) -> None:
-        self.messages: list[str] = []
-
-    def get_logger(self):
-        return self
-
-    def isEnabledFor(self, _level: int) -> bool:  # noqa: N802
-        return True
-
-    def info(self, message: str) -> None:
-        self.messages.append(message)
-
-
 class _IntSubclass(int):
     pass
 
 
-def _cpu_public_inputs() -> dict[str, object]:
+def _cpu_native_inputs() -> dict[str, object]:
     shape = (1, 10, 1, 128)
     return {
         "q": torch.zeros(shape, dtype=torch.bfloat16),
@@ -56,21 +39,16 @@ def _cpu_public_inputs() -> dict[str, object]:
 
 
 def _cpu_native_support_inputs() -> dict[str, object]:
-    inputs = _cpu_public_inputs()
+    inputs = _cpu_native_inputs()
     return {
         **inputs,
         "A_log": torch.zeros(1, dtype=torch.float32),
         "dt_bias": torch.zeros(128, dtype=torch.float32),
-        "use_qk_l2norm_in_kernel": True,
-        "use_gate_in_kernel": True,
-        "use_beta_sigmoid_in_kernel": True,
-        "safe_gate": True,
         "lower_bound": -5.0,
-        "state_v_first": True,
     }
 
 
-def _cpu_gva_public_inputs() -> dict[str, object]:
+def _cpu_gva_native_inputs() -> dict[str, object]:
     inputs = _cpu_native_support_inputs()
     q = torch.zeros((1, 10, 2, 128), dtype=torch.bfloat16)
     return {
@@ -85,36 +63,13 @@ def _cpu_gva_public_inputs() -> dict[str, object]:
     }
 
 
-def _cpu_k3_mixed_boundary_inputs(prefill_tokens: int) -> dict[str, object]:
-    """Build the two exact K3 TP8 mixed-prefill routing signatures."""
-
-    seq_lens = (1,) * 15 + (prefill_tokens,)
-    offsets = [0]
-    for length in seq_lens:
-        offsets.append(offsets[-1] + length)
-    total_tokens = offsets[-1]
-    shape = (1, total_tokens, 12, 128)
-    return {
-        "q": torch.empty(shape, dtype=torch.bfloat16),
-        "k": torch.empty(shape, dtype=torch.bfloat16),
-        "v": torch.empty(shape, dtype=torch.bfloat16),
-        "g": torch.empty(shape, dtype=torch.bfloat16),
-        "beta": torch.empty((1, total_tokens, 12), dtype=torch.float32),
-        "A_log": torch.empty(12, dtype=torch.float32),
-        "dt_bias": torch.empty(12 * 128, dtype=torch.float32),
-        "cu_seqlens": torch.tensor(offsets, dtype=torch.int32),
-    }
-
-
 @pytest.fixture(autouse=True)
 def _reset_raw_binding_cache(monkeypatch):
     monkeypatch.setattr(_FLASH_KDA, "_RAW_POINTER_BINDING", None)
     monkeypatch.setattr(_FLASH_KDA._jit_core, "AITER_REBUILD", False)
 
 
-@pytest.mark.parametrize(
-    "value", [True, False, 1.0, "4", object(), _IntSubclass(4)]
-)
+@pytest.mark.parametrize("value", [True, False, 1.0, "4", object(), _IntSubclass(4)])
 def test_max_seqlen_upper_bound_rejects_non_int_and_bool(value):
     with pytest.raises(TypeError, match="must be a Python int or None"):
         _FLASH_KDA._normalize_max_seqlen_upper_bound(
@@ -304,106 +259,35 @@ def test_raw_v3_receives_bound_and_qk_head_count(bound):
 def test_raw_dispatch_rejects_internal_arity_or_version_drift():
     recorder = _Recorder()
     with pytest.raises(RuntimeError, match="must contain 25 values"):
-        _FLASH_KDA._call_raw_pointer_binding(
-            (recorder, 1), tuple(range(24)), None, 7
-        )
+        _FLASH_KDA._call_raw_pointer_binding((recorder, 1), tuple(range(24)), None, 7)
     with pytest.raises(RuntimeError, match="unsupported FlashKDA raw ABI version"):
-        _FLASH_KDA._call_raw_pointer_binding(
-            (recorder, 4), tuple(range(25)), None, 7
-        )
+        _FLASH_KDA._call_raw_pointer_binding((recorder, 4), tuple(range(25)), None, 7)
 
 
-def test_public_wrapper_passes_bound_to_native_route(monkeypatch):
-    calls: list[dict[str, object]] = []
+@pytest.mark.parametrize(
+    ("packed", "bound", "expected_bound"),
+    [(True, 6, 6), (True, None, 0), (False, None, 10)],
+)
+def test_descriptor_receives_bound(monkeypatch, packed, bound, expected_bound):
+    recorder = _Recorder()
+    inputs = _cpu_gva_native_inputs()
+    if not packed:
+        inputs["cu_seqlens"] = None
 
-    def fake_native(**kwargs):
-        calls.append(kwargs)
-        return torch.empty_like(kwargs["v"]), None
+    monkeypatch.setattr(_FLASH_KDA, "_get_raw_pointer_binding", lambda: None)
+    monkeypatch.setattr(_FLASH_KDA, "flash_kda_fwd_hip", recorder)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: None)
 
-    monkeypatch.setattr(
-        _PUBLIC_KDA, "flash_kda_native_supported", lambda **_kwargs: True
-    )
-    monkeypatch.setattr(_PUBLIC_KDA, "flash_kda_native_fwd", fake_native)
-
-    _PUBLIC_KDA.chunk_kimi_delta_attn(
-        **_cpu_public_inputs(),
-        backend="native",
-        max_seqlen_upper_bound=6,
-    )
-
-    assert len(calls) == 1
-    assert calls[0]["max_seqlen_upper_bound"] == 6
-
-
-@pytest.mark.parametrize("prefill_tokens", [1024, 1025])
-def test_public_zero_env_k3_mixed_boundary_preserves_absent_bound(
-    monkeypatch, prefill_tokens
-):
-    """ATOM's public call omits the optional hint; keep raw-v3's zero sentinel."""
-
-    support_calls: list[dict[str, object]] = []
-    native_calls: list[dict[str, object]] = []
-
-    def fake_supported(**kwargs):
-        support_calls.append(kwargs)
-        return True
-
-    def fake_native(**kwargs):
-        native_calls.append(kwargs)
-        return torch.empty_like(kwargs["v"]), None
-
-    monkeypatch.delenv("AITER_KDA_BACKEND", raising=False)
-    monkeypatch.delenv("AITER_TRITON_ONLY", raising=False)
-    monkeypatch.setattr(_PUBLIC_KDA, "_device_arch", lambda _device: "gfx950")
-    monkeypatch.setattr(_PUBLIC_KDA, "flash_kda_native_supported", fake_supported)
-    monkeypatch.setattr(_PUBLIC_KDA, "flash_kda_native_fwd", fake_native)
-    monkeypatch.setattr(
-        _PUBLIC_KDA,
-        "chunk_delta_attn_fwd",
-        lambda **_kwargs: pytest.fail("supported K3 call unexpectedly reached Triton"),
-    )
-
-    inputs = _cpu_k3_mixed_boundary_inputs(prefill_tokens)
-    output, final_state = _PUBLIC_KDA.chunk_kimi_delta_attn(
+    output, final_state = _FLASH_KDA._flash_kda_fwd_prevalidated(
         **inputs,
-        output_final_state=False,
-        use_qk_l2norm_in_kernel=True,
-        use_gate_in_kernel=True,
-        use_beta_sigmoid_in_kernel=True,
-        safe_gate=True,
-        lower_bound=-5.0,
-        state_v_first=True,
+        max_seqlen_upper_bound=bound,
     )
 
-    assert inputs["q"].shape == (1, prefill_tokens + 15, 12, 128)
-    assert inputs["cu_seqlens"].numel() == 17
-    assert len(support_calls) == len(native_calls) == 1
-    assert support_calls[0]["max_seqlen_upper_bound"] is None
-    assert native_calls[0]["max_seqlen_upper_bound"] is None
     assert output.shape == inputs["v"].shape
     assert final_state is None
-
-
-def test_public_wrapper_logs_bound_but_does_not_pass_it_to_triton(monkeypatch):
-    calls: list[dict[str, object]] = []
-    logger = _CapturingLogger()
-
-    def fake_triton(**kwargs):
-        calls.append(kwargs)
-        return torch.empty_like(kwargs["v"]), None
-
-    monkeypatch.setattr(_PUBLIC_KDA, "_LOGGER", logger)
-    monkeypatch.setattr(_PUBLIC_KDA, "chunk_delta_attn_fwd", fake_triton)
-
-    _PUBLIC_KDA.chunk_kimi_delta_attn(
-        **_cpu_public_inputs(),
-        backend="triton",
-        max_seqlen_upper_bound=6,
-    )
-
-    assert len(calls) == 1
-    assert "max_seqlen_upper_bound" not in calls[0]
-    assert any("max_seqlen_upper_bound=6" in message for message in logger.messages)
+    assert len(recorder.calls) == 1
+    assert len(recorder.calls[0]) == 18
+    assert recorder.calls[0][-1] == expected_bound
 
 
 def test_direct_native_api_rejects_int_subclass_before_arch_admission():
@@ -431,6 +315,51 @@ def test_native_supported_rejects_int_subclass(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("scale", [0.0, -1.0, float("inf"), float("nan"), 1e300])
+def test_native_supported_rejects_unrepresentable_scale(monkeypatch, scale):
+    monkeypatch.setattr(_FLASH_KDA, "_device_arch", lambda _device: "gfx950")
+    inputs = _cpu_native_support_inputs()
+
+    assert not _FLASH_KDA.flash_kda_native_supported(**inputs, scale=scale)
+
+
+@pytest.mark.parametrize(
+    "scale",
+    [1e300, pytest.param(10**10000, id="integer-overflow")],
+)
+def test_direct_native_api_rejects_unrepresentable_scale(monkeypatch, scale):
+    monkeypatch.setattr(_FLASH_KDA, "_device_arch", lambda _device: "gfx950")
+    inputs = _cpu_native_support_inputs()
+
+    with pytest.raises(ValueError, match="representable as float32"):
+        _FLASH_KDA.flash_kda_fwd(**inputs, scale=scale)
+
+
+def test_native_supported_returns_false_for_scale_conversion_overflow(monkeypatch):
+    monkeypatch.setattr(_FLASH_KDA, "_device_arch", lambda _device: "gfx950")
+    inputs = _cpu_native_support_inputs()
+
+    assert not _FLASH_KDA.flash_kda_native_supported(**inputs, scale=10**10000)
+
+
+def test_native_supported_rejects_dense_grid_y_overflow(monkeypatch):
+    monkeypatch.setattr(_FLASH_KDA, "_device_arch", lambda _device: "gfx950")
+    shape = (_FLASH_KDA._HIP_GRID_Y_MAX + 1, 1, 1, 128)
+    q = torch.empty(shape, device="meta", dtype=torch.bfloat16)
+    inputs = {
+        "q": q,
+        "k": torch.empty_like(q),
+        "v": torch.empty_like(q),
+        "g": torch.empty_like(q),
+        "beta": torch.empty(shape[:-1], device="meta", dtype=torch.float32),
+        "A_log": torch.empty(1, device="meta", dtype=torch.float32),
+        "dt_bias": torch.empty(128, device="meta", dtype=torch.float32),
+    }
+
+    assert not _FLASH_KDA.flash_kda_native_supported(**inputs)
+    assert "grid.y" in _FLASH_KDA._native_rejection_reason(**inputs)
+
+
 def test_native_supported_accepts_gva_and_rejects_invalid_head_ratio(monkeypatch):
     monkeypatch.setattr(_FLASH_KDA, "_device_arch", lambda _device: "gfx950")
     monkeypatch.setattr(
@@ -438,7 +367,7 @@ def test_native_supported_accepts_gva_and_rejects_invalid_head_ratio(monkeypatch
         "_get_raw_pointer_binding",
         lambda: (_Recorder(), 3),
     )
-    gva = _cpu_gva_public_inputs()
+    gva = _cpu_gva_native_inputs()
 
     assert _FLASH_KDA.flash_kda_native_supported(**gva)
     ratio4 = {
@@ -468,151 +397,9 @@ def test_native_supported_rejects_gva_with_stale_raw_abi(monkeypatch):
         "_get_raw_pointer_binding",
         lambda: (_Recorder(), 2),
     )
-    inputs = _cpu_gva_public_inputs()
+    inputs = _cpu_gva_native_inputs()
 
     assert not _FLASH_KDA.flash_kda_native_supported(**inputs)
     assert "predates the raw-v3 GVA ABI" in _FLASH_KDA._native_rejection_reason(
         **inputs
     )
-
-
-def test_public_auto_routes_supported_gva_to_native(monkeypatch):
-    native_calls: list[dict[str, object]] = []
-
-    def fake_native(**kwargs):
-        native_calls.append(kwargs)
-        return torch.full_like(kwargs["v"], 1), None
-
-    monkeypatch.delenv("AITER_TRITON_ONLY", raising=False)
-    monkeypatch.setattr(_FLASH_KDA, "_device_arch", lambda _device: "gfx950")
-    monkeypatch.setattr(
-        _FLASH_KDA,
-        "_get_raw_pointer_binding",
-        lambda: (_Recorder(), 3),
-    )
-    monkeypatch.setattr(_PUBLIC_KDA, "flash_kda_native_fwd", fake_native)
-    monkeypatch.setattr(
-        _PUBLIC_KDA,
-        "chunk_delta_attn_fwd",
-        lambda **_kwargs: pytest.fail("supported GVA unexpectedly reached Triton"),
-    )
-
-    inputs = _cpu_gva_public_inputs()
-    output, final_state = _PUBLIC_KDA.chunk_kimi_delta_attn(
-        **inputs,
-        backend="auto",
-    )
-
-    assert len(native_calls) == 1
-    assert native_calls[0]["q"].shape[2] == 2
-    assert native_calls[0]["v"].shape[2] == 4
-    assert torch.equal(output, torch.full_like(inputs["v"], 1))
-    assert final_state is None
-
-
-def test_public_auto_falls_back_for_native_ineligible_gva(monkeypatch):
-    triton_calls: list[dict[str, object]] = []
-
-    def fake_triton(**kwargs):
-        triton_calls.append(kwargs)
-        return torch.full_like(kwargs["v"], 2), None
-
-    monkeypatch.delenv("AITER_TRITON_ONLY", raising=False)
-    monkeypatch.setattr(_FLASH_KDA, "_device_arch", lambda _device: "gfx950")
-    monkeypatch.setattr(
-        _FLASH_KDA,
-        "_get_raw_pointer_binding",
-        lambda: (_Recorder(), 3),
-    )
-    monkeypatch.setattr(
-        _PUBLIC_KDA,
-        "flash_kda_native_fwd",
-        lambda **_kwargs: pytest.fail("native-ineligible GVA reached native"),
-    )
-    monkeypatch.setattr(_PUBLIC_KDA, "chunk_delta_attn_fwd", fake_triton)
-
-    inputs = _cpu_gva_public_inputs()
-    output, final_state = _PUBLIC_KDA.chunk_kimi_delta_attn(
-        **inputs,
-        backend="auto",
-        chunk_size=64,
-    )
-
-    assert len(triton_calls) == 1
-    assert triton_calls[0]["q"].shape[2] == 2
-    assert triton_calls[0]["v"].shape[2] == 4
-    assert triton_calls[0]["allow_flash_kda"] is True
-    assert torch.equal(output, torch.full_like(inputs["v"], 2))
-    assert final_state is None
-
-
-def test_public_native_fails_loud_for_native_ineligible_gva(monkeypatch):
-    monkeypatch.delenv("AITER_TRITON_ONLY", raising=False)
-    monkeypatch.setattr(_FLASH_KDA, "_device_arch", lambda _device: "gfx950")
-    monkeypatch.setattr(
-        _FLASH_KDA,
-        "_get_raw_pointer_binding",
-        lambda: (_Recorder(), 3),
-    )
-    monkeypatch.setattr(
-        _PUBLIC_KDA,
-        "flash_kda_native_fwd",
-        lambda **_kwargs: pytest.fail("native-ineligible GVA reached native"),
-    )
-    monkeypatch.setattr(
-        _PUBLIC_KDA,
-        "chunk_delta_attn_fwd",
-        lambda **_kwargs: pytest.fail("explicit native unexpectedly fell back"),
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="an explicit chunk_size belongs to the Triton implementation",
-    ):
-        _PUBLIC_KDA.chunk_kimi_delta_attn(
-            **_cpu_gva_public_inputs(),
-            backend="native",
-            chunk_size=64,
-        )
-
-
-def test_auto_fallback_validates_hint_and_keeps_it_out_of_triton(monkeypatch):
-    support_calls: list[dict[str, object]] = []
-    triton_calls: list[dict[str, object]] = []
-
-    def fake_supported(**kwargs):
-        support_calls.append(kwargs)
-        return False
-
-    def fake_triton(**kwargs):
-        triton_calls.append(kwargs)
-        return torch.empty_like(kwargs["v"]), None
-
-    monkeypatch.setattr(_PUBLIC_KDA, "flash_kda_native_supported", fake_supported)
-    monkeypatch.setattr(_PUBLIC_KDA, "chunk_delta_attn_fwd", fake_triton)
-
-    _PUBLIC_KDA.chunk_kimi_delta_attn(
-        **_cpu_public_inputs(),
-        backend="auto",
-        max_seqlen_upper_bound=6,
-    )
-
-    assert len(support_calls) == 1
-    assert support_calls[0]["max_seqlen_upper_bound"] == 6
-    assert len(triton_calls) == 1
-    assert "max_seqlen_upper_bound" not in triton_calls[0]
-
-
-def test_triton_fallback_does_not_hide_invalid_hint(monkeypatch):
-    monkeypatch.setattr(
-        _PUBLIC_KDA,
-        "chunk_delta_attn_fwd",
-        lambda **_kwargs: pytest.fail("invalid hint reached Triton"),
-    )
-
-    with pytest.raises(TypeError, match="must be a Python int or None"):
-        _PUBLIC_KDA.chunk_kimi_delta_attn(
-            **_cpu_public_inputs(),
-            backend="triton",
-            max_seqlen_upper_bound=_IntSubclass(6),
-        )

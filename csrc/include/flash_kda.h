@@ -94,7 +94,8 @@ void flash_kda_fwd_hip(
     double lower_bound,
     bool has_initial_state,
     bool output_final_state,
-    bool is_varlen);
+    bool is_varlen,
+    int64_t max_seqlen_upper_bound);
 
 // Fast internal ABI for an already-validated Python call.  Tensor dtype/shape
 // admission remains the responsibility of the public Python adapter; this

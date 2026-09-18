@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 import os
 import sys
 from pathlib import Path
@@ -16,12 +15,14 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from aiter.ops.flash_kda import (  # noqa: E402
+from aiter.ops.flash_kda import (
     flash_kda_fwd as native_fwd,
+)
+from aiter.ops.flash_kda import (
     flash_kda_fwd_hip,
     flash_kda_workspace_size,
 )
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.flash_kda import (  # noqa: E402
+from aiter.ops.triton._triton_kernels.chunk_delta_attn.flash_kda import (
     flash_kda_fwd as triton_fwd,
 )
 
@@ -35,17 +36,15 @@ def _inputs(tokens: int, seed: int) -> dict[str, torch.Tensor | float]:
     shape = (1, tokens, H, D)
 
     def projection() -> torch.Tensor:
-        return F.silu(
-            torch.randn(shape, device="cuda", dtype=torch.float32)
-        ).to(torch.bfloat16)
+        return F.silu(torch.randn(shape, device="cuda", dtype=torch.float32)).to(
+            torch.bfloat16
+        )
 
     return {
         "q": projection(),
         "k": projection(),
         "v": projection(),
-        "g": torch.randn(shape, device="cuda", dtype=torch.float32).to(
-            torch.bfloat16
-        ),
+        "g": torch.randn(shape, device="cuda", dtype=torch.float32).to(torch.bfloat16),
         "beta": torch.randn(
             (1, tokens, H), device="cuda", dtype=torch.bfloat16
         ).float(),
@@ -61,9 +60,7 @@ def _state(dtype: torch.dtype, seed: int) -> torch.Tensor:
     torch.manual_seed(seed)
     value = torch.randn((1, H, D, D), device="cuda", dtype=torch.float32) * 0.02
     value += torch.linspace(-0.04, 0.03, D, device="cuda").view(1, 1, D, 1)
-    value += 0.37 * torch.linspace(0.02, -0.01, D, device="cuda").view(
-        1, 1, 1, D
-    )
+    value += 0.37 * torch.linspace(0.02, -0.01, D, device="cuda").view(1, 1, 1, D)
     return value.to(dtype)
 
 
@@ -115,8 +112,13 @@ def _set_route(route: str, tokens: int) -> None:
 
 
 def _native(
-    data: dict[str, torch.Tensor | float], *, tokens: int, packed: bool,
-    initial: torch.Tensor | None, final: bool, route: str,
+    data: dict[str, torch.Tensor | float],
+    *,
+    tokens: int,
+    packed: bool,
+    initial: torch.Tensor | None,
+    final: bool,
+    route: str,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     _set_route(route, tokens)
     return native_fwd(
@@ -129,8 +131,12 @@ def _native(
 
 
 def _triton(
-    data: dict[str, torch.Tensor | float], *, tokens: int, packed: bool,
-    initial: torch.Tensor | None, final: bool,
+    data: dict[str, torch.Tensor | float],
+    *,
+    tokens: int,
+    packed: bool,
+    initial: torch.Tensor | None,
+    final: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     return triton_fwd(
         **data,
@@ -146,8 +152,9 @@ def _rms(actual: torch.Tensor, expected: torch.Tensor) -> float:
     a = actual.float()
     e = expected.float()
     return float(
-        ((a - e).square().mean().sqrt() /
-         e.square().mean().sqrt().clamp_min(1.0e-8)).item()
+        (
+            (a - e).square().mean().sqrt() / e.square().mean().sqrt().clamp_min(1.0e-8)
+        ).item()
     )
 
 
@@ -155,7 +162,8 @@ def _check_result(
     label: str,
     actual: tuple[torch.Tensor, torch.Tensor | None],
     expected: tuple[torch.Tensor, torch.Tensor | None],
-    *, bitwise: bool = False,
+    *,
+    bitwise: bool = False,
 ) -> None:
     out, state = actual
     ref_out, ref_state = expected
@@ -171,9 +179,9 @@ def _check_result(
         if state is not None:
             assert torch.equal(state, ref_state), f"{label}: state not bitwise"
     else:
-        assert max(out_rms, state_rms) < 2.5e-2, (
-            f"{label}: out_rms={out_rms}, state_rms={state_rms}"
-        )
+        assert (
+            max(out_rms, state_rms) < 2.5e-2
+        ), f"{label}: out_rms={out_rms}, state_rms={state_rms}"
     print(
         f"PASS {label:46s} out_rms={out_rms:.7f} "
         f"state_rms={state_rms:.7f} bitwise={int(bitwise)}"
@@ -186,25 +194,40 @@ def check_boundaries(seed: int) -> None:
         initial = _state(torch.float32, seed + tokens + 1)
         for packed in (False, True):
             actual = _native(
-                data, tokens=tokens, packed=packed, initial=initial,
-                final=True, route="automatic",
+                data,
+                tokens=tokens,
+                packed=packed,
+                initial=initial,
+                final=True,
+                route="automatic",
             )
             expected = _triton(
-                data, tokens=tokens, packed=packed, initial=initial, final=True,
+                data,
+                tokens=tokens,
+                packed=packed,
+                initial=initial,
+                final=True,
             )
             _check_result(
                 f"boundary T={tokens} {'packed' if packed else 'dense'}",
-                actual, expected,
+                actual,
+                expected,
             )
             if tokens == 8191:
                 rollback = _native(
-                    data, tokens=tokens, packed=packed, initial=initial,
-                    final=True, route="rollback",
+                    data,
+                    tokens=tokens,
+                    packed=packed,
+                    initial=initial,
+                    final=True,
+                    route="rollback",
                 )
                 _check_result(
                     f"ineligible flag gate T={tokens} "
                     f"{'packed' if packed else 'dense'}",
-                    actual, rollback, bitwise=True,
+                    actual,
+                    rollback,
+                    bitwise=True,
                 )
         del data, initial
         torch.cuda.empty_cache()
@@ -222,21 +245,29 @@ def check_state_matrix(seed: int) -> None:
         for state_name, initial in states.items():
             for final in (False, True):
                 pipeline = _native(
-                    data, tokens=tokens, packed=packed, initial=initial,
-                    final=final, route="automatic",
+                    data,
+                    tokens=tokens,
+                    packed=packed,
+                    initial=initial,
+                    final=final,
+                    route="automatic",
                 )
                 full = _native(
-                    data, tokens=tokens, packed=packed, initial=initial,
-                    final=final, route="full_hybrid",
+                    data,
+                    tokens=tokens,
+                    packed=packed,
+                    initial=initial,
+                    final=final,
+                    route="full_hybrid",
                 )
                 _check_result(
                     f"state {state_name}/final={int(final)} "
                     f"{'packed' if packed else 'dense'}",
-                    pipeline, full, bitwise=True,
+                    pipeline,
+                    full,
+                    bitwise=True,
                 )
-                expected_dtype = (
-                    initial.dtype if initial is not None else torch.float32
-                )
+                expected_dtype = initial.dtype if initial is not None else torch.float32
                 if final:
                     assert pipeline[1] is not None
                     assert pipeline[1].dtype == expected_dtype
@@ -246,27 +277,44 @@ def check_state_matrix(seed: int) -> None:
     # The packed N=1 adapter deliberately enters the dense launch geometry.
     initial = states["fp32"]
     packed_result = _native(
-        data, tokens=tokens, packed=True, initial=initial,
-        final=True, route="automatic",
+        data,
+        tokens=tokens,
+        packed=True,
+        initial=initial,
+        final=True,
+        route="automatic",
     )
     dense_result = _native(
-        data, tokens=tokens, packed=False, initial=initial,
-        final=True, route="automatic",
+        data,
+        tokens=tokens,
+        packed=False,
+        initial=initial,
+        final=True,
+        route="automatic",
     )
-    _check_result("packed-N1 versus true-dense", packed_result, dense_result,
-                  bitwise=True)
+    _check_result(
+        "packed-N1 versus true-dense", packed_result, dense_result, bitwise=True
+    )
 
     rollback = _native(
-        data, tokens=tokens, packed=True, initial=initial,
-        final=True, route="rollback",
+        data,
+        tokens=tokens,
+        packed=True,
+        initial=initial,
+        final=True,
+        route="rollback",
     )
     triton = _triton(
-        data, tokens=tokens, packed=True, initial=initial, final=True,
+        data,
+        tokens=tokens,
+        packed=True,
+        initial=initial,
+        final=True,
     )
     _check_result("explicit flag=0 rollback", rollback, triton)
-    assert torch.equal(rollback[1], packed_result[1]), (
-        "rollback and range P3 must publish the same final state"
-    )
+    assert torch.equal(
+        rollback[1], packed_result[1]
+    ), "rollback and range P3 must publish the same final state"
 
 
 def check_automatic_selection(seed: int) -> None:
@@ -277,63 +325,100 @@ def check_automatic_selection(seed: int) -> None:
         initial = _state(dtype, seed + tokens + 1)
         for packed in (False, True):
             automatic = _native(
-                data, tokens=tokens, packed=packed, initial=initial,
-                final=True, route="automatic",
+                data,
+                tokens=tokens,
+                packed=packed,
+                initial=initial,
+                final=True,
+                route="automatic",
             )
             explicit_hybrid = _native(
-                data, tokens=tokens, packed=packed, initial=initial,
-                final=True, route="explicit_hybrid",
+                data,
+                tokens=tokens,
+                packed=packed,
+                initial=initial,
+                final=True,
+                route="explicit_hybrid",
             )
             _check_result(
                 f"automatic versus explicit hybrid T={tokens} "
                 f"{'packed' if packed else 'dense'}",
-                automatic, explicit_hybrid, bitwise=True,
+                automatic,
+                explicit_hybrid,
+                bitwise=True,
             )
 
             rollback = _native(
-                data, tokens=tokens, packed=packed, initial=initial,
-                final=True, route="rollback",
+                data,
+                tokens=tokens,
+                packed=packed,
+                initial=initial,
+                final=True,
+                route="rollback",
             )
             explicit_old = _native(
-                data, tokens=tokens, packed=packed, initial=initial,
-                final=True, route="explicit_old",
+                data,
+                tokens=tokens,
+                packed=packed,
+                initial=initial,
+                final=True,
+                route="explicit_old",
             )
             _check_result(
                 f"flag=0 versus explicit old pipeline T={tokens} "
                 f"{'packed' if packed else 'dense'}",
-                rollback, explicit_old, bitwise=True,
+                rollback,
+                explicit_old,
+                bitwise=True,
             )
         del data, initial
         torch.cuda.empty_cache()
 
 
 def _lowlevel_run(
-    data: dict[str, torch.Tensor | float], *, tokens: int, packed: bool,
-    has_input: bool, has_output: bool, dtype: torch.dtype,
-    initial: torch.Tensor, route: str,
+    data: dict[str, torch.Tensor | float],
+    *,
+    tokens: int,
+    packed: bool,
+    has_input: bool,
+    has_output: bool,
+    dtype: torch.dtype,
+    initial: torch.Tensor,
+    route: str,
 ) -> tuple[torch.Tensor, torch.Tensor | None, bool]:
     _set_route(route, tokens)
     out = torch.empty_like(data["v"])
     workspace = torch.empty(
         flash_kda_workspace_size(tokens, H, 1),
-        device="cuda", dtype=torch.uint8,
+        device="cuda",
+        dtype=torch.uint8,
     )
-    ignored_in = torch.full(
-        (1, H, D, D), 7.0, device="cuda", dtype=dtype
-    )
+    ignored_in = torch.full((1, H, D, D), 7.0, device="cuda", dtype=dtype)
     state_in = initial if has_input else ignored_in
-    state_out = torch.full(
-        (1, H, D, D), -11.0, device="cuda", dtype=dtype
-    )
+    state_out = torch.full((1, H, D, D), -11.0, device="cuda", dtype=dtype)
     poison = state_out.clone()
     cu = _metadata(tokens, packed)
     if cu is None:
         cu = torch.empty(0, device="cuda", dtype=torch.int32)
     flash_kda_fwd_hip(
-        data["q"], data["k"], data["v"], data["g"], data["beta"],
-        out, workspace, data["A_log"], data["dt_bias"], state_in,
-        state_out, cu, float(data["scale"]), LOWER_BOUND,
-        has_input, has_output, packed,
+        data["q"],
+        data["k"],
+        data["v"],
+        data["g"],
+        data["beta"],
+        out,
+        workspace,
+        data["A_log"],
+        data["dt_bias"],
+        state_in,
+        state_out,
+        cu,
+        float(data["scale"]),
+        LOWER_BOUND,
+        has_input,
+        has_output,
+        packed,
+        tokens,
     )
     torch.cuda.synchronize()
     ignored_unchanged = has_output or torch.equal(state_out, poison)
@@ -357,21 +442,33 @@ def check_lowlevel_state_matrix(seed: int) -> None:
         for index, (name, has_input, has_output, dtype) in enumerate(modes):
             initial = _state(dtype, seed + index + 1)
             actual = _lowlevel_run(
-                data, tokens=tokens, packed=packed, has_input=has_input,
-                has_output=has_output, dtype=dtype, initial=initial,
+                data,
+                tokens=tokens,
+                packed=packed,
+                has_input=has_input,
+                has_output=has_output,
+                dtype=dtype,
+                initial=initial,
                 route="automatic",
             )
             expected = _lowlevel_run(
-                data, tokens=tokens, packed=packed, has_input=has_input,
-                has_output=has_output, dtype=dtype, initial=initial,
+                data,
+                tokens=tokens,
+                packed=packed,
+                has_input=has_input,
+                has_output=has_output,
+                dtype=dtype,
+                initial=initial,
                 route="full_hybrid",
             )
-            assert actual[2] and expected[2], (
-                f"{name}: ignored final-state buffer was modified"
-            )
+            assert (
+                actual[2] and expected[2]
+            ), f"{name}: ignored final-state buffer was modified"
             _check_result(
                 f"lowlevel {name} {'packed' if packed else 'dense'}",
-                actual[:2], expected[:2], bitwise=True,
+                actual[:2],
+                expected[:2],
+                bitwise=True,
             )
 
 
@@ -386,8 +483,11 @@ def check_graph(seed: int) -> None:
     with torch.cuda.stream(stream):
         for _ in range(3):
             warm = native_fwd(
-                **data, initial_state=initial, output_final_state=True,
-                lower_bound=LOWER_BOUND, cu_seqlens=cu,
+                **data,
+                initial_state=initial,
+                output_final_state=True,
+                lower_bound=LOWER_BOUND,
+                cu_seqlens=cu,
             )
     stream.synchronize()
     del warm
@@ -395,18 +495,24 @@ def check_graph(seed: int) -> None:
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         captured = native_fwd(
-            **data, initial_state=initial, output_final_state=True,
-            lower_bound=LOWER_BOUND, cu_seqlens=cu,
+            **data,
+            initial_state=initial,
+            output_final_state=True,
+            lower_bound=LOWER_BOUND,
+            cu_seqlens=cu,
         )
     graph.replay()
     torch.cuda.synchronize()
     first = (captured[0].clone(), captured[1].clone())
     graph.replay()
     torch.cuda.synchronize()
-    _check_result("graph capture/replay deterministic", captured, first,
-                  bitwise=True)
+    _check_result("graph capture/replay deterministic", captured, first, bitwise=True)
     triton = _triton(
-        data, tokens=tokens, packed=True, initial=initial, final=True,
+        data,
+        tokens=tokens,
+        packed=True,
+        initial=initial,
+        final=True,
     )
     _check_result("graph capture/replay versus Triton", captured, triton)
 
@@ -418,12 +524,20 @@ def check_multistream(seed: int) -> None:
     state0 = _state(torch.float32, seed + 2)
     state1 = _state(torch.bfloat16, seed + 3)
     ref0 = _native(
-        data0, tokens=tokens, packed=True, initial=state0,
-        final=True, route="automatic",
+        data0,
+        tokens=tokens,
+        packed=True,
+        initial=state0,
+        final=True,
+        route="automatic",
     )
     ref1 = _native(
-        data1, tokens=tokens, packed=False, initial=state1,
-        final=True, route="automatic",
+        data1,
+        tokens=tokens,
+        packed=False,
+        initial=state1,
+        final=True,
+        route="automatic",
     )
     stream0 = torch.cuda.Stream()
     stream1 = torch.cuda.Stream()
@@ -432,13 +546,19 @@ def check_multistream(seed: int) -> None:
     _set_route("automatic", tokens)
     with torch.cuda.stream(stream0):
         out0 = native_fwd(
-            **data0, initial_state=state0, output_final_state=True,
-            lower_bound=LOWER_BOUND, cu_seqlens=_metadata(tokens, True),
+            **data0,
+            initial_state=state0,
+            output_final_state=True,
+            lower_bound=LOWER_BOUND,
+            cu_seqlens=_metadata(tokens, True),
         )
     with torch.cuda.stream(stream1):
         out1 = native_fwd(
-            **data1, initial_state=state1, output_final_state=True,
-            lower_bound=LOWER_BOUND, cu_seqlens=None,
+            **data1,
+            initial_state=state1,
+            output_final_state=True,
+            lower_bound=LOWER_BOUND,
+            cu_seqlens=None,
         )
     torch.cuda.current_stream().wait_stream(stream0)
     torch.cuda.current_stream().wait_stream(stream1)

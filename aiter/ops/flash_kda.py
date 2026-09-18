@@ -12,15 +12,16 @@ the C++ entry point only launches kernels into buffers allocated here, which
 keeps it compatible with aiter's lightweight ``aiter_tensor_t`` JIT ABI.
 
 The native implementation serves the Kimi-K3 prefill contract and its grouped
-value-attention (GVA) extension: BF16 Q/K/V/raw-gate, FP32 beta logits and gate
-parameters, K=V=128, and V-first recurrent state.  GVA maps each value head to
-``hv // (HV // H)`` in the smaller Q/K head set.
+value-attention (GVA) extension: BF16 Q/K/V/raw-gate, FP32 or BF16 beta logits,
+FP32 gate parameters, K=V=128, and V-first recurrent state. GVA maps each value
+head to ``hv // (HV // H)`` in the smaller Q/K head set.
 """
 
 from __future__ import annotations
 
+import math
 import os
-from functools import lru_cache
+from functools import cache
 from typing import Any
 
 import torch
@@ -29,11 +30,17 @@ from torch import Tensor
 from ..jit import core as _jit_core
 from ..jit.core import compile_ops, get_module
 
-MD_NAME = "module_flash_kda_hip"
+# Bump this internal module name whenever the tensor-descriptor pybind ABI
+# changes. Aiter reuses importable JIT DSOs before consulting Ninja, so a new
+# cache key is required to prevent an older descriptor from being loaded.
+MD_NAME = "module_flash_kda_hip_v2"
 
 FLASH_KDA_NATIVE_ARCHS = frozenset({"gfx942", "gfx950"})
 FLASH_KDA_NATIVE_CHUNK = 16
 FLASH_KDA_NATIVE_DIM = 128
+_FLOAT32_MAX = float(torch.finfo(torch.float32).max)
+_INT32_MAX = (1 << 31) - 1
+_HIP_GRID_Y_MAX = 65535
 
 # Workspace ABI shared with the imported FlashKDA K1/K2 launchers.  Keep these
 # names next to the sizing function so changes to the native hand-off layout
@@ -50,9 +57,7 @@ _CSPLIT_SIN = FLASH_KDA_NATIVE_DIM * FLASH_KDA_NATIVE_DIM * 2
 _CSPLIT_CROSS = FLASH_KDA_NATIVE_CHUNK * FLASH_KDA_NATIVE_CHUNK * 2
 _CSPLIT_CROSS64 = 4 * FLASH_KDA_NATIVE_CHUNK * FLASH_KDA_NATIVE_CHUNK * 2
 _CSPLIT_BETA = 64 * 4
-_CSPLIT_SEGMENT_A = (
-    10 * FLASH_KDA_NATIVE_CHUNK * FLASH_KDA_NATIVE_CHUNK * 2
-)
+_CSPLIT_SEGMENT_A = 10 * FLASH_KDA_NATIVE_CHUNK * FLASH_KDA_NATIVE_CHUNK * 2
 
 
 @compile_ops(MD_NAME, develop=True)
@@ -74,6 +79,7 @@ def flash_kda_fwd_hip(
     has_initial_state: bool,
     output_final_state: bool,
     is_varlen: bool,
+    max_seqlen_upper_bound: int,
 ) -> None: ...
 
 
@@ -120,8 +126,7 @@ def _normalize_max_seqlen_upper_bound(
 
     if value is not None and type(value) is not int:
         raise TypeError(
-            "max_seqlen_upper_bound must be a Python int or None, "
-            f"got {value!r}"
+            "max_seqlen_upper_bound must be a Python int or None, " f"got {value!r}"
         )
     if not is_varlen:
         # Dense geometry already carries the exact per-sequence length.  Do
@@ -139,7 +144,7 @@ def _normalize_max_seqlen_upper_bound(
     return value
 
 
-@lru_cache(maxsize=None)
+@cache
 def _device_arch(device: torch.device) -> str | None:
     """Return the immutable GCN architecture without a per-call HIP query."""
 
@@ -168,16 +173,10 @@ def _native_rejection_reason(
     dt_bias: Tensor | None,
     initial_state: Tensor | None = None,
     output_final_state: bool = False,
-    use_qk_l2norm_in_kernel: bool = True,
-    use_gate_in_kernel: bool = True,
-    use_beta_sigmoid_in_kernel: bool = True,
-    safe_gate: bool = True,
+    scale: float | None = None,
     lower_bound: float | None = -5.0,
-    state_v_first: bool = True,
-    chunk_size: int | None = None,
     cu_seqlens: Tensor | None = None,
     max_seqlen_upper_bound: int | None = None,
-    **_: Any,
 ) -> str | None:
     """Return why a call cannot use native FlashKDA, or ``None`` if it can."""
 
@@ -187,8 +186,6 @@ def _native_rejection_reason(
     if arch not in FLASH_KDA_NATIVE_ARCHS:
         supported = sorted(FLASH_KDA_NATIVE_ARCHS)
         return f"device architecture {arch!r} is not one of {supported}"
-    if chunk_size is not None:
-        return "an explicit chunk_size belongs to the Triton implementation"
     if q.ndim != 4 or k.shape != q.shape:
         return "q and k must have matching [B,T,H,K] shapes"
     if v.ndim != 4 or g.ndim != 4 or beta.ndim != 3:
@@ -208,7 +205,7 @@ def _native_rejection_reason(
         if loaded_binding is not None and loaded_binding[1] < 3:
             return (
                 "the loaded native FlashKDA extension predates the raw-v3 "
-                "GVA ABI; rebuild module_flash_kda_hip"
+                f"GVA ABI; rebuild {MD_NAME}"
             )
     if tuple(g.shape) != (B, T, HV, K) or tuple(beta.shape) != (B, T, HV):
         return "g and beta must match v's batch/token/value-head dimensions"
@@ -231,20 +228,20 @@ def _native_rejection_reason(
         or (dt_bias.ndim == 2 and tuple(dt_bias.shape) != (HV, K))
     ):
         return "dt_bias must be contiguous-compatible float32 [HV*K] or [HV,K]"
-    if not (
-        use_qk_l2norm_in_kernel
-        and use_gate_in_kernel
-        and use_beta_sigmoid_in_kernel
-        and safe_gate
+    try:
+        scale_value = None if scale is None else float(scale)
+    except (OverflowError, TypeError, ValueError):
+        return "scale must be finite, positive, and representable as float32"
+    if scale_value is not None and (
+        not math.isfinite(scale_value) or scale_value <= 0 or scale_value > _FLOAT32_MAX
     ):
-        return (
-            "native FlashKDA requires fused l2norm, raw gate, beta sigmoid "
-            "and safe_gate"
-        )
-    if lower_bound is None or not -5.0 <= float(lower_bound) < 0.0:
+        return "scale must be finite, positive, and representable as float32"
+    try:
+        lower_bound_value = None if lower_bound is None else float(lower_bound)
+    except (OverflowError, TypeError, ValueError):
         return "lower_bound must be in [-5, 0)"
-    if (initial_state is not None or output_final_state) and not state_v_first:
-        return "native FlashKDA recurrent state is V-first"
+    if lower_bound_value is None or not -5.0 <= lower_bound_value < 0.0:
+        return "lower_bound must be in [-5, 0)"
     if initial_state is not None:
         if initial_state.dtype not in (torch.float32, torch.bfloat16):
             return "initial_state must be float32 or bfloat16"
@@ -257,9 +254,23 @@ def _native_rejection_reason(
         if cu_seqlens.dtype not in (torch.int32, torch.int64):
             return "cu_seqlens must be int32 or int64"
     N = int(cu_seqlens.numel() - 1) if cu_seqlens is not None else B
+    total_tokens = B * T
+    if total_tokens > _INT32_MAX or N > _INT32_MAX:
+        return "token or sequence count exceeds the native int32 launch ABI"
+    grid_y = HV if cu_seqlens is not None else N * HV
+    if grid_y > _HIP_GRID_Y_MAX:
+        return "sequence/value-head product exceeds the native grid.y limit"
+    launch_tiles = (
+        (total_tokens + FLASH_KDA_NATIVE_CHUNK - 1) // FLASH_KDA_NATIVE_CHUNK
+        + (0 if N == 1 else N)
+        if cu_seqlens is not None
+        else N * ((T + FLASH_KDA_NATIVE_CHUNK - 1) // FLASH_KDA_NATIVE_CHUNK)
+    )
+    if launch_tiles > _INT32_MAX:
+        return "number of tiles exceeds the native int32 launch ABI"
     _normalize_max_seqlen_upper_bound(
         max_seqlen_upper_bound,
-        total_tokens=B * T,
+        total_tokens=total_tokens,
         num_seqs=N,
         dense_seqlen=T,
         is_varlen=cu_seqlens is not None,
@@ -274,12 +285,43 @@ def _native_rejection_reason(
     return None
 
 
-def flash_kda_native_supported(**kwargs: Any) -> bool:
-    """Whether the native gfx942/gfx950 implementation can serve ``kwargs``."""
+def flash_kda_native_supported(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    g: Tensor,
+    beta: Tensor,
+    A_log: Tensor,
+    dt_bias: Tensor,
+    scale: float | None = None,
+    initial_state: Tensor | None = None,
+    output_final_state: bool = False,
+    lower_bound: float = -5.0,
+    cu_seqlens: Tensor | None = None,
+    max_seqlen_upper_bound: int | None = None,
+) -> bool:
+    """Check native capability without launching or selecting a fallback."""
 
     try:
-        return _native_rejection_reason(**kwargs) is None
-    except (AttributeError, TypeError, ValueError):
+        return (
+            _native_rejection_reason(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                lower_bound=lower_bound,
+                cu_seqlens=cu_seqlens,
+                max_seqlen_upper_bound=max_seqlen_upper_bound,
+            )
+            is None
+        )
+    except (AttributeError, OverflowError, TypeError, ValueError):
         return False
 
 
@@ -297,10 +339,7 @@ def _get_raw_pointer_binding() -> tuple[Any, int] | None:
     """
 
     global _RAW_POINTER_BINDING
-    if (
-        _jit_core.AITER_REBUILD
-        and MD_NAME not in _jit_core.rebuilded_list
-    ):
+    if _jit_core.AITER_REBUILD and MD_NAME not in _jit_core.rebuilded_list:
         # A cached callable belongs to the pre-rebuild extension.  Drop it so
         # the first post-build lookup can discover the newest additive symbol.
         _RAW_POINTER_BINDING = None
@@ -388,10 +427,10 @@ def _flash_kda_fwd_prevalidated(
 ) -> tuple[Tensor, Tensor | None]:
     """Allocation-owning native path after ``_native_rejection_reason``.
 
-    K3's auto/native router has already performed the complete metadata
-    admission check before entering here.  Keeping this private contract lets
-    that hot path use the raw-pointer ABI without repeating the Python tensor
-    walk, while the public ``flash_kda_fwd`` entry below remains defensive.
+    The public entry point has already performed the complete metadata
+    admission check before entering here. Keeping this private contract lets
+    the hot path use the raw-pointer ABI without repeating the Python tensor
+    walk, while ``flash_kda_fwd`` remains defensive.
     """
 
     B, T, H, K = q.shape
@@ -405,8 +444,11 @@ def _flash_kda_fwd_prevalidated(
         is_varlen=cu_seqlens is not None,
     )
     scale = K**-0.5 if scale is None else float(scale)
-    if scale <= 0:
-        raise ValueError(f"scale must be positive, got {scale}.")
+    if not math.isfinite(scale) or scale <= 0 or scale > _FLOAT32_MAX:
+        raise ValueError(
+            "scale must be finite, positive, and representable as float32, "
+            f"got {scale}."
+        )
 
     # The imported kernels use contiguous pointer arithmetic.  K3 serving
     # tensors already satisfy this contract, so these branches are normally
@@ -464,7 +506,7 @@ def _flash_kda_fwd_prevalidated(
     if raw_binding is not None and raw_binding[1] < 3 and H != HV:
         raise RuntimeError(
             "the loaded native FlashKDA extension predates the raw-v3 GVA "
-            "ABI; rebuild module_flash_kda_hip"
+            f"ABI; rebuild {MD_NAME}"
         )
 
     def launch() -> None:
@@ -531,6 +573,7 @@ def _flash_kda_fwd_prevalidated(
             initial_state is not None,
             output_final_state,
             is_varlen,
+            0 if normalized_max_seqlen is None else normalized_max_seqlen,
         )
 
     # The raw C++ ABI checks both the active device and stream ownership.  The
@@ -565,10 +608,11 @@ def flash_kda_fwd(
     ``[N,HV,V,K]``.  Both dense inputs and B=1 packed-varlen inputs are
     supported, including GVA when ``HV`` is an integer multiple of the Q/K
     head count ``H``. Unsupported devices or shapes raise rather than silently
-    selecting another implementation; use ``chunk_kimi_delta_attn`` with
-    ``backend="auto"`` when a fallback is desired.
+    selecting another implementation. Callers that support multiple kernels
+    should use ``flash_kda_native_supported`` and make their own dispatch
+    decision.
 
-    ``max_seqlen_upper_bound`` is a route-only host hint for packed inputs.
+    ``max_seqlen_upper_bound`` is a native launch-topology hint for packed inputs.
     It must be a built-in Python ``int`` (not ``bool`` or an ``int`` subclass),
     lie in ``[ceil(total_tokens / N), total_tokens]``, and should be a static
     bucket bound when this call is captured in a CUDA/HIP graph.  Dense calls
@@ -581,22 +625,14 @@ def flash_kda_fwd(
     mathematical result, but may choose a different topology and therefore
     need not be bitwise identical; it must remain equivalent within the normal
     dtype-appropriate floating-point tolerance.  A looser bound is safe but
-    can be slower. ``None`` retains the conservative no-hint policy.  The
-    tensor-descriptor fallback used during a JIT cold start or while tracing
-    with ``torch.compile`` also uses that safe no-hint policy.  After a cold
-    start, a later eager call can discover raw-v3 and consume the supplied
-    bound.  A descriptor graph captured by ``torch.compile`` remains no-hint
-    on replay; only a later non-compiling call that re-enters this Python
-    wrapper can consume the bound.  Older native modules without the additive
-    raw-v3 symbol retain their legacy equal-head route.
+    can be slower. ``None`` retains the conservative no-hint policy. Both the
+    tensor-descriptor path used during JIT cold start or ``torch.compile`` and
+    the eager raw-v3 path carry the same bound and GVA head geometry.
     """
 
     # Validate the public scalar before architecture admission so malformed
     # API input has stable TypeError/ValueError behavior on every device.
-    if (
-        max_seqlen_upper_bound is not None
-        and type(max_seqlen_upper_bound) is not int
-    ):
+    if max_seqlen_upper_bound is not None and type(max_seqlen_upper_bound) is not int:
         raise TypeError(
             "max_seqlen_upper_bound must be a Python int or None, "
             f"got {max_seqlen_upper_bound!r}"
@@ -623,12 +659,8 @@ def flash_kda_fwd(
         dt_bias=dt_bias,
         initial_state=initial_state,
         output_final_state=output_final_state,
-        use_qk_l2norm_in_kernel=True,
-        use_gate_in_kernel=True,
-        use_beta_sigmoid_in_kernel=True,
-        safe_gate=True,
+        scale=scale,
         lower_bound=lower_bound,
-        state_v_first=True,
         cu_seqlens=cu_seqlens,
         max_seqlen_upper_bound=max_seqlen_upper_bound,
     )

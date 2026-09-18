@@ -19,13 +19,13 @@ readonly WARMUP=20
 readonly REPEAT=120
 readonly BOOTSTRAP_RESAMPLES=10000
 readonly MIN_NATIVE_SPEEDUP=1.03
-readonly FORMAL_PLAN_SHA256=f78e32aa80d754d7f02c91f9f138a68b77720f286c9f667f1f26a598f50ae894
+readonly FORMAL_PLAN_SHA256=8e651f53b430ef4fe8a947de1ee0ed64687a7d8192369351b65ab71a0b4a1fab
 
 usage() {
     cat <<'EOF'
 Usage: scripts/run_flash_kda_pr4683_perf_acceptance.sh [OUTPUT_DIR]
 
-Run the canonical native-HIP versus forced-PR#4683-Triton dense eager matrix
+Run the canonical native-HIP versus direct latest-main Triton dense eager matrix
 on exactly one visible 256-CU gfx950 GPU. Select the GPU with
 ROCR_VISIBLE_DEVICES (or HIP_VISIBLE_DEVICES) before invoking the script.
 
@@ -168,7 +168,7 @@ acceptance_exit() {
         git-provenance.log static-self-test.json static-self-test.log \
         plan.json plan.log environment.log benchmark.log benchmark-status.txt \
         result.json partial-results.jsonl artifact-validation.log \
-        jit/module_flash_kda_hip.so; do
+        jit/module_flash_kda_hip_v2.so; do
         [[ -s $OUTPUT_DIR/$candidate ]] && artifacts+=("$candidate")
     done
     if ((${#artifacts[@]} > 0)); then
@@ -223,6 +223,7 @@ done < <(env)
 unset CK_DIR HIP_KITTENS_DIR OPUS_GEN_CO_DIR PYTHONOPTIMIZE
 
 export AITER_AOT_IMPORT=1
+export AITER_FDA_USE_GLUON=0
 export AITER_JIT_DIR="$OUTPUT_DIR/jit"
 export AITER_META_DIR="$REPO_ROOT"
 export GPU_ARCHS=gfx950
@@ -307,6 +308,7 @@ if hipcc is not None:
     print(version)
 for name in (
     "AITER_AOT_IMPORT",
+    "AITER_FDA_USE_GLUON",
     "AITER_JIT_DIR",
     "AITER_META_DIR",
     "CK_DIR",
@@ -343,7 +345,7 @@ fi
 
 ACCEPTANCE_STAGE=artifact-validation
 for artifact in plan.json result.json partial-results.jsonl \
-    jit/module_flash_kda_hip.so; do
+    jit/module_flash_kda_hip_v2.so; do
     [[ -s $OUTPUT_DIR/$artifact ]] || {
         echo "ERROR: successful benchmark did not produce $artifact" >&2
         exit 1
@@ -416,6 +418,14 @@ require(plan.get("warmup_rounds") == 20, "plan warmup")
 require(plan.get("measured_rounds") == 120, "plan measured rounds")
 require(plan.get("bootstrap_resamples") == 10000, "plan bootstrap resamples")
 require(len(plan.get("cells", ())) == expected_seed_cells, "plan cells")
+comparator = plan.get("comparator", {})
+require(comparator.get("forced_direct_import") is True,
+        "plan direct Triton import")
+require(comparator.get("gluon_disabled") is True,
+        "plan Triton-only route")
+require(comparator.get("forced_route_environment") == {
+            "AITER_FDA_USE_GLUON": "0"},
+        "plan route environment")
 
 configuration = result.get("configuration", {})
 require(configuration.get("seeds") == [42, 43, 44], "configuration seeds")
@@ -429,6 +439,8 @@ require(configuration.get("minimum_native_speedup") == 1.03,
 require(configuration.get("execution") == "eager", "configuration execution")
 require(configuration.get("triton_forced_direct_internal_import") is True,
         "configuration Triton import")
+require(configuration.get("triton_gluon_disabled") is True,
+        "configuration Triton-only route")
 
 environment = result.get("environment", {})
 git = environment.get("git", {})
@@ -440,11 +452,12 @@ require(environment.get("gpu", {}).get("compute_units") == 256,
         "GPU CU count")
 require(environment.get("gpu", {}).get("visible_device_count") == 1,
         "visible GPU count")
-require(environment.get("active_route_control_environment") == {},
+require(environment.get("active_route_control_environment") == {
+            "AITER_FDA_USE_GLUON": "0"},
         "route-control environment")
 modules = environment.get("modules", {})
 native_jit = modules.get("native_jit", {})
-expected_module = (root / "jit/module_flash_kda_hip.so").resolve()
+expected_module = (root / "jit/module_flash_kda_hip_v2.so").resolve()
 require(expected_module.is_file() and expected_module.stat().st_size > 0,
         "native module is missing")
 module_sha256 = sha256(expected_module)
@@ -455,9 +468,18 @@ require(native_jit.get("sha256") == module_sha256, "native JIT SHA256")
 require(native_jit.get("raw_abi_version") == 3, "native raw ABI")
 require(modules.get("native_build_roots", {}).get("both_match_checkout") is True,
         "native build roots")
-require(modules.get("pr4683_triton_python", {}).get(
-            "matches_audited_pr_source") is True,
-        "PR #4683 Triton source identity")
+require(modules.get("latest_main_triton_python", {}).get(
+            "matches_expected_source") is True,
+        "latest-main Triton source identity")
+require(modules.get("latest_main_triton_python", {}).get(
+            "gluon_k1_enabled") is False,
+        "latest-main Triton K1 route")
+require(modules.get("latest_main_triton_python", {}).get(
+            "gluon_k2_enabled") is False,
+        "latest-main Triton K2 route")
+require(modules.get("latest_main_triton_python", {}).get(
+            "triton_only_route_verified") is True,
+        "latest-main Triton-only route")
 
 rows = result.get("results")
 require(isinstance(rows, list) and len(rows) == expected_seed_cells,

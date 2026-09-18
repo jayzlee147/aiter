@@ -709,9 +709,6 @@ def test_public_wrapper_routes_to_flash_kda(monkeypatch):
         "use_qk_l2norm_in_kernel": True,
         "use_beta_sigmoid_in_kernel": True,
         "output_final_state": True,
-        # This test specifically verifies the PR #4683 Triton dispatcher; the
-        # public wrapper's auto mode may select native HIP on gfx942/gfx950.
-        "backend": "triton",
     }
 
     calls = []
@@ -760,7 +757,6 @@ def test_unset_chunk_size_follows_the_dispatch(monkeypatch):
         "use_gate_in_kernel": True,
         "use_qk_l2norm_in_kernel": True,
         "use_beta_sigmoid_in_kernel": True,
-        "backend": "triton",
     }
 
     calls = []

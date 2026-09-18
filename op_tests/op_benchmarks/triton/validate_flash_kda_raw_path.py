@@ -27,59 +27,31 @@ _CONTEXT_LDS_PIPELINE_PASS_ENV = (
     "FLASH_KDA_GFX950_CONTEXT_LDS_PIPELINE_REPLAY",
 )
 _CONTEXT_NW8_ENV = "FLASH_KDA_GFX950_CONTEXT_NW8"
-_CONTEXT_DIRECT_TAIL_FIRST_ENV = (
-    "FLASH_KDA_GFX950_CONTEXT_DIRECT_TAIL_FIRST"
-)
-_CONTEXT_DIRECT_NW1_FLAT_ENV = (
-    "FLASH_KDA_GFX950_CONTEXT_DIRECT_NW1_FLAT_TAIL_FIRST"
-)
-_CONTEXT_DIRECT_PREFIXLESS_ENV = (
-    "FLASH_KDA_GFX950_CONTEXT_DIRECT_PREFIXLESS"
-)
-_CONTEXT_DIRECT_DENSE_N1_H12_ENV = (
-    "FLASH_KDA_GFX950_CONTEXT_DIRECT_DENSE_N1_H12"
-)
-_CONTEXT_DIRECT_GLOBAL_N1_H12_ENV = (
-    "FLASH_KDA_GFX950_CONTEXT_DIRECT_GLOBAL_N1_H12"
-)
-_CONTEXT_DIRECT_GLOBAL_KR_GLL_ENV = (
-    "FLASH_KDA_GFX950_CONTEXT_DIRECT_GLOBAL_KR_GLL"
-)
-_CONTEXT_DIRECT_GLOBAL_KQ_GLL_ENV = (
-    "FLASH_KDA_GFX950_CONTEXT_DIRECT_GLOBAL_KQ_GLL"
-)
-_CONTEXT_DIRECT_KSPLIT_ENV = (
-    "FLASH_KDA_GFX950_CONTEXT_DIRECT_KSPLIT"
-)
+_CONTEXT_DIRECT_TAIL_FIRST_ENV = "FLASH_KDA_GFX950_CONTEXT_DIRECT_TAIL_FIRST"
+_CONTEXT_DIRECT_NW1_FLAT_ENV = "FLASH_KDA_GFX950_CONTEXT_DIRECT_NW1_FLAT_TAIL_FIRST"
+_CONTEXT_DIRECT_PREFIXLESS_ENV = "FLASH_KDA_GFX950_CONTEXT_DIRECT_PREFIXLESS"
+_CONTEXT_DIRECT_DENSE_N1_H12_ENV = "FLASH_KDA_GFX950_CONTEXT_DIRECT_DENSE_N1_H12"
+_CONTEXT_DIRECT_GLOBAL_N1_H12_ENV = "FLASH_KDA_GFX950_CONTEXT_DIRECT_GLOBAL_N1_H12"
+_CONTEXT_DIRECT_GLOBAL_KR_GLL_ENV = "FLASH_KDA_GFX950_CONTEXT_DIRECT_GLOBAL_KR_GLL"
+_CONTEXT_DIRECT_GLOBAL_KQ_GLL_ENV = "FLASH_KDA_GFX950_CONTEXT_DIRECT_GLOBAL_KQ_GLL"
+_CONTEXT_DIRECT_KSPLIT_ENV = "FLASH_KDA_GFX950_CONTEXT_DIRECT_KSPLIT"
 _CONTEXT_DIRECT_KSPLIT_TAIL_MQK_PREFETCH_ENV = (
     "FLASH_KDA_GFX950_CONTEXT_DIRECT_KSPLIT_TAIL_MQK_PREFETCH"
 )
 _CONTEXT_DIRECT_KSPLIT_LONG_N1_H12_ENV = (
     "FLASH_KDA_GFX950_CONTEXT_DIRECT_KSPLIT_LONG_N1_H12"
 )
-_CONTEXT_AFFINE_AB_FUSED_ENV = (
-    "FLASH_KDA_GFX950_CONTEXT_AFFINE_AB_FUSED"
-)
-_CONTEXT_AFFINE_AB_STAGE_EARLY_ENV = (
-    "FLASH_KDA_GFX950_CONTEXT_AFFINE_AB_STAGE_EARLY"
-)
-_CONTEXT_EQUAL_DENSE_N4_G64_ENV = (
-    "FLASH_KDA_GFX950_CONTEXT_EQUAL_DENSE_N4_G64"
-)
+_CONTEXT_AFFINE_AB_FUSED_ENV = "FLASH_KDA_GFX950_CONTEXT_AFFINE_AB_FUSED"
+_CONTEXT_AFFINE_AB_STAGE_EARLY_ENV = "FLASH_KDA_GFX950_CONTEXT_AFFINE_AB_STAGE_EARLY"
+_CONTEXT_EQUAL_DENSE_N4_G64_ENV = "FLASH_KDA_GFX950_CONTEXT_EQUAL_DENSE_N4_G64"
 _CONTEXT_SCAN_KSPLIT_ENV = "FLASH_KDA_GFX950_CONTEXT_SCAN_KSPLIT"
 _CONTEXT_PERSISTENT_ENV = "FLASH_KDA_GFX950_CONTEXT_PERSISTENT"
 _CONTEXT_PERSISTENT_ESTABLISHED_AB_ENV = (
     "FLASH_KDA_GFX950_CONTEXT_PERSISTENT_ESTABLISHED_AB"
 )
-_BT16_DENSE_N1_ALL_FULL_C16_ENV = (
-    "FLASH_KDA_GFX950_BT16_DENSE_N1_ALL_FULL_C16"
-)
-_BT16_DENSE_N1_PADDED_SOLVE_ENV = (
-    "FLASH_KDA_GFX950_BT16_DENSE_N1_PADDED_SOLVE"
-)
-_BT16_DENSE_N1_EARLY_BETA_ENV = (
-    "FLASH_KDA_GFX950_BT16_DENSE_N1_EARLY_BETA"
-)
+_BT16_DENSE_N1_ALL_FULL_C16_ENV = "FLASH_KDA_GFX950_BT16_DENSE_N1_ALL_FULL_C16"
+_BT16_DENSE_N1_PADDED_SOLVE_ENV = "FLASH_KDA_GFX950_BT16_DENSE_N1_PADDED_SOLVE"
+_BT16_DENSE_N1_EARLY_BETA_ENV = "FLASH_KDA_GFX950_BT16_DENSE_N1_EARLY_BETA"
 
 _DESCRIPTOR_ABI_ARGUMENTS = (
     "q",
@@ -99,6 +71,7 @@ _DESCRIPTOR_ABI_ARGUMENTS = (
     "has_initial_state",
     "output_final_state",
     "is_varlen",
+    "max_seqlen_upper_bound",
 )
 _RAW_V1_ABI_ARGUMENTS = (
     "q_ptr",
@@ -127,9 +100,7 @@ _RAW_V1_ABI_ARGUMENTS = (
     "device_id",
     "stream_ptr",
 )
-_RAW_V2_ABI_ARGUMENTS = _RAW_V1_ABI_ARGUMENTS + (
-    "max_seqlen_upper_bound",
-)
+_RAW_V2_ABI_ARGUMENTS = _RAW_V1_ABI_ARGUMENTS + ("max_seqlen_upper_bound",)
 _RAW_V3_ABI_ARGUMENTS = _RAW_V2_ABI_ARGUMENTS + ("H_q",)
 
 # A raw-v2 policy check must exercise the zero-environment production route.
@@ -189,11 +160,7 @@ def validate_input_shape(
 
     if heads <= 0:
         raise ValueError(f"heads must be positive, got {heads}")
-    if (
-        not seq_lens
-        or any(length < 0 for length in seq_lens)
-        or not any(seq_lens)
-    ):
+    if not seq_lens or any(length < 0 for length in seq_lens) or not any(seq_lens):
         raise ValueError(
             f"seq_lens must contain a nonnegative, nonempty workload, got {seq_lens}"
         )
@@ -206,7 +173,7 @@ def validate_input_shape(
 def make_inputs(
     seq_lens: tuple[int, ...],
     heads: int,
-    device: torch.device | str = torch.device("cuda"),
+    device: torch.device | str = "cuda",
     *,
     value_heads: int | None = None,
     packed: bool = True,
@@ -256,14 +223,10 @@ def make_inputs(
         "A_log": torch.empty(value_heads, device=device, dtype=torch.float32)
         .uniform_(1.0, 16.0)
         .log_(),
-        "dt_bias": torch.randn(
-            value_heads * 128, device=device, dtype=torch.float32
-        ),
+        "dt_bias": torch.randn(value_heads * 128, device=device, dtype=torch.float32),
         "initial_state": state,
         "cu_seqlens": (
-            torch.tensor(offsets, device=device, dtype=torch.int32)
-            if packed
-            else None
+            torch.tensor(offsets, device=device, dtype=torch.int32) if packed else None
         ),
         "scale": 128**-0.5,
         "lower_bound": -5.0,
@@ -309,18 +272,14 @@ def check_cpu_parameter_validation() -> None:
         )
     for value_heads in (0, 1, 3):
         try:
-            make_inputs(
-                (1,), 2, "cpu", value_heads=value_heads, packed=True
-            )
+            make_inputs((1,), 2, "cpu", value_heads=value_heads, packed=True)
         except ValueError:
             continue
         raise AssertionError(
             "input construction accepted invalid GVA geometry: "
             f"H_q=2, H_v={value_heads}"
         )
-    ratio4 = make_inputs(
-        (1,), 1, "cpu", value_heads=4, packed=True, seed=20260827
-    )
+    ratio4 = make_inputs((1,), 1, "cpu", value_heads=4, packed=True, seed=20260827)
     if (
         ratio4["q"].shape[2] != 1
         or ratio4["v"].shape[2] != 4
@@ -347,15 +306,23 @@ def check_packed_n1_entry_dense_normalization_static() -> None:
             f"{compact_entry.count(declaration)}"
         )
     entry_contracts = (
-        "const int64_t total_tiles64 = single_sequence_packed ? "
-        "(total_tokens + chunk - 1) / chunk :",
+        (
+            "const int64_t total_tiles64 = single_sequence_packed ? "
+            "(total_tokens + chunk - 1) / chunk :"
+        ),
         "single_sequence_packed ? nullptr : cu_seqlens_ptr",
-        "if(is_varlen && !single_sequence_packed) "
-        'raw_check_pointer(cu_seqlens_ptr, "cu_seqlens_ptr", alignof(int32_t));',
-        "const int64_t launch_tiles = single_sequence_packed ? "
-        "(total_tokens + chunk - 1) / chunk :",
-        "single_sequence_packed ? nullptr : "
-        "reinterpret_cast<const int32_t*>(cu_seqlens_ptr)",
+        (
+            "if(is_varlen && !single_sequence_packed) "
+            'raw_check_pointer(cu_seqlens_ptr, "cu_seqlens_ptr", alignof(int32_t));'
+        ),
+        (
+            "const int64_t launch_tiles = single_sequence_packed ? "
+            "(total_tokens + chunk - 1) / chunk :"
+        ),
+        (
+            "single_sequence_packed ? nullptr : "
+            "reinterpret_cast<const int32_t*>(cu_seqlens_ptr)"
+        ),
     )
     for contract in entry_contracts:
         if contract not in compact_entry:
@@ -368,19 +335,29 @@ def check_packed_n1_entry_dense_normalization_static() -> None:
     # the measured two-node recipe so a future adapter change cannot silently
     # make the full-C16 K1 selector unreachable again.
     route_contracts = (
-        "const bool automatic_short_single_direct = p.N == 1 && "
-        "(T_seq == 256 || T_seq == 512)",
+        (
+            "const bool automatic_short_single_direct = p.N == 1 && "
+            "(T_seq == 256 || T_seq == 512)"
+        ),
         "if (direct) { group_chunks = 0;",
-        "const dim3 grid = a.is_varlen ? dim3(a.total_tiles, a.H) : "
-        "dim3(a.NT, a.N * a.H);",
-        "const bool automatic_short_single_nw1_flat = a.N == 1 && "
-        "(a.T_seq == 256 || a.T_seq == 512)",
-        "const uint64_t direct_flat_blocks_per_sequence = a.H > 0 ? "
-        "uint64_t(a.H) * uint64_t(8) : uint64_t(0);",
+        (
+            "const dim3 grid = a.is_varlen ? dim3(a.total_tiles, a.H) : "
+            "dim3(a.NT, a.N * a.H);"
+        ),
+        (
+            "const bool automatic_short_single_nw1_flat = a.N == 1 && "
+            "(a.T_seq == 256 || a.T_seq == 512)"
+        ),
+        (
+            "const uint64_t direct_flat_blocks_per_sequence = a.H > 0 ? "
+            "uint64_t(a.H) * uint64_t(8) : uint64_t(0);"
+        ),
         "<<<dim3(direct_flat_blocks, 1, 1), 64, 0, a.stream>>>",
-        "if (dense_all_full_c16_enabled && a.N == 1 && "
-        "(a.T_seq & 15) == 0) "
-        "dispatch_flat.template operator()<false, true>();",
+        (
+            "if (dense_all_full_c16_enabled && a.N == 1 && "
+            "(a.T_seq & 15) == 0) "
+            "dispatch_flat.template operator()<false, true>();"
+        ),
     )
     for contract in route_contracts:
         if contract not in compact_policy:
@@ -403,9 +380,7 @@ def check_packed_n1_entry_dense_normalization_static() -> None:
         (1024, 64),
         (2048, 128),
     ):
-        normalized_varlen, total_tiles = normalize(
-            tokens, packed=True, sequences=1
-        )
+        normalized_varlen, total_tiles = normalize(tokens, packed=True, sequences=1)
         if normalized_varlen or total_tiles != expected_tiles:
             raise AssertionError(
                 f"packed N=1 T={tokens} did not normalize to dense "
@@ -425,20 +400,15 @@ def check_bt16_dense_n1_all_full_c16_policy_static() -> None:
 
     policy_path = _REPO_ROOT / "csrc/kernels/flash_kda/gfx950/policy.hpp"
     kernel_path = (
-        _REPO_ROOT
-        / "csrc/kernels/flash_kda/gfx950/k1_kda_bt16_fused_kernel.hpp"
+        _REPO_ROOT / "csrc/kernels/flash_kda/gfx950/k1_kda_bt16_fused_kernel.hpp"
     )
     policy = policy_path.read_text()
     kernel = kernel_path.read_text()
     compact_policy = " ".join(policy.split())
     compact_kernel = " ".join(kernel.split())
 
-    selector_start = policy.find(
-        "static bool bt16_dense_n1_all_full_c16_enabled("
-    )
-    selector_end = policy.find(
-        "static bool bt16_fused_opt_enabled()", selector_start
-    )
+    selector_start = policy.find("static bool bt16_dense_n1_all_full_c16_enabled(")
+    selector_end = policy.find("static bool bt16_fused_opt_enabled()", selector_start)
     if selector_start < 0 or selector_end < 0:
         raise AssertionError("policy is missing the dense-N1 full-C16 selector")
     selector = " ".join(policy[selector_start:selector_end].split())
@@ -446,8 +416,7 @@ def check_bt16_dense_n1_all_full_c16_policy_static() -> None:
         'env_exact( "FLASH_KDA_GFX950_BT16_DENSE_N1_ALL_FULL_C16", "1")',
         "cache_context_operands && a.cache_context_operands",
         "!a.is_varlen && a.N == 1",
-        "(a.T_seq == 256 || a.T_seq == 512 || "
-        "a.T_seq == 1024 || a.T_seq == 2048)",
+        ("(a.T_seq == 256 || a.T_seq == 512 || " "a.T_seq == 1024 || a.T_seq == 2048)"),
         "a.T_seq % WorkspaceSizes::CHUNK == 0",
         "a.NT == a.T_seq / WorkspaceSizes::CHUNK",
         "a.total_tiles == a.NT",
@@ -461,28 +430,38 @@ def check_bt16_dense_n1_all_full_c16_policy_static() -> None:
             )
 
     launch_contracts = (
-        "bool PACKED_DIRECT_PREFIXLESS, "
-        "bool DENSE_N1_ALL_FULL_C16, bool GVA = false>",
-        "PACKED_DIRECT_PREFIXLESS, DENSE_N1_ALL_FULL_C16, "
-        "PADDED_SOLVE, EARLY_DENSE_BETA, GVA>",
-        "if constexpr (DENSE_N1_ALL_FULL_C16) { "
-        "const bool padded_solve = "
-        "bt16_dense_n1_padded_solve_enabled(); "
-        "auto launch_dense = [&]<bool EARLY_DENSE_BETA>() { "
-        "if (padded_solve) launch.template operator()< "
-        "true, true, EARLY_DENSE_BETA>(); else "
-        "launch.template operator()< "
-        "true, false, EARLY_DENSE_BETA>(); }; "
-        "if (bt16_dense_n1_early_beta_enabled()) "
-        "launch_dense.template operator()<true>(); else "
-        "launch_dense.template operator()<false>();",
-        "if constexpr (DENSE_N1_ALL_FULL_C16) launch_bt16_fused< "
-        "VL, false, true, CACHE_CONTEXT_OPERANDS, "
-        "PUBLISH_ACTIVATED_BETA, PACKED_DIRECT_PREFIXLESS, true>",
+        (
+            "bool PACKED_DIRECT_PREFIXLESS, "
+            "bool DENSE_N1_ALL_FULL_C16, bool GVA = false>"
+        ),
+        (
+            "PACKED_DIRECT_PREFIXLESS, DENSE_N1_ALL_FULL_C16, "
+            "PADDED_SOLVE, EARLY_DENSE_BETA, GVA>"
+        ),
+        (
+            "if constexpr (DENSE_N1_ALL_FULL_C16) { "
+            "const bool padded_solve = "
+            "bt16_dense_n1_padded_solve_enabled(); "
+            "auto launch_dense = [&]<bool EARLY_DENSE_BETA>() { "
+            "if (padded_solve) launch.template operator()< "
+            "true, true, EARLY_DENSE_BETA>(); else "
+            "launch.template operator()< "
+            "true, false, EARLY_DENSE_BETA>(); }; "
+            "if (bt16_dense_n1_early_beta_enabled()) "
+            "launch_dense.template operator()<true>(); else "
+            "launch_dense.template operator()<false>();"
+        ),
+        (
+            "if constexpr (DENSE_N1_ALL_FULL_C16) launch_bt16_fused< "
+            "VL, false, true, CACHE_CONTEXT_OPERANDS, "
+            "PUBLISH_ACTIVATED_BETA, PACKED_DIRECT_PREFIXLESS, true>"
+        ),
         "dispatch.template operator()<true, true, false>();",
         "dispatch.template operator()<true, false, false>();",
-        "else if (dense_n1_all_full_c16) { "
-        "dispatch.template operator()<false, false, true>();",
+        (
+            "else if (dense_n1_all_full_c16) { "
+            "dispatch.template operator()<false, false, true>();"
+        ),
         "dispatch.template operator()<false, false, false>();",
     )
     for contract in launch_contracts:
@@ -495,10 +474,8 @@ def check_bt16_dense_n1_all_full_c16_policy_static() -> None:
         "static_assert(!DENSE_N1_ALL_FULL_C16 || !VL",
         "static_assert(!DENSE_N1_ALL_FULL_C16 || !EXACT_PREP",
         "static_assert(!DENSE_N1_ALL_FULL_C16 || USE_X32",
-        "static_assert(!DENSE_N1_ALL_FULL_C16 || "
-        "CACHE_CONTEXT_OPERANDS",
-        "static_assert(!DENSE_N1_ALL_FULL_C16 || "
-        "PUBLISH_ACTIVATED_BETA",
+        ("static_assert(!DENSE_N1_ALL_FULL_C16 || " "CACHE_CONTEXT_OPERANDS"),
+        ("static_assert(!DENSE_N1_ALL_FULL_C16 || " "PUBLISH_ACTIVATED_BETA"),
     )
     for contract in compile_contracts:
         if contract not in compact_policy:
@@ -507,25 +484,26 @@ def check_bt16_dense_n1_all_full_c16_policy_static() -> None:
             )
 
     kernel_contracts = (
-        "bool PACKED_DIRECT_PREFIXLESS = false, "
-        "bool DENSE_N1_ALL_FULL_C16 = false, "
-        "bool PADDED_SOLVE = false, "
-        "bool EARLY_DENSE_BETA = false, "
-        "bool GVA = false>",
+        (
+            "bool PACKED_DIRECT_PREFIXLESS = false, "
+            "bool DENSE_N1_ALL_FULL_C16 = false, "
+            "bool PADDED_SOLVE = false, "
+            "bool EARLY_DENSE_BETA = false, "
+            "bool GVA = false>"
+        ),
         "static_assert(!DENSE_N1_ALL_FULL_C16 || !VL",
-        "static_assert(!DENSE_N1_ALL_FULL_C16 || "
-        "!PACKED_DIRECT_PREFIXLESS",
-        "if constexpr (DENSE_N1_ALL_FULL_C16) { h = bh; "
-        "ht = h * gridDim.x + nt; t0 = nt * C; alen = C;",
+        ("static_assert(!DENSE_N1_ALL_FULL_C16 || " "!PACKED_DIRECT_PREFIXLESS"),
+        (
+            "if constexpr (DENSE_N1_ALL_FULL_C16) { h = bh; "
+            "ht = h * gridDim.x + nt; t0 = nt * C; alen = C;"
+        ),
         "if (DENSE_N1_ALL_FULL_C16 || vec_m < alen)",
         "(DENSE_N1_ALL_FULL_C16 || row_lane < alen)",
         "(DENSE_N1_ALL_FULL_C16 || tid < alen)",
     )
     for contract in kernel_contracts:
         if contract not in compact_kernel:
-            raise AssertionError(
-                "dense-N1 full-C16 kernel lost contract: " + contract
-            )
+            raise AssertionError("dense-N1 full-C16 kernel lost contract: " + contract)
 
     def selected(
         value: str | None,
@@ -603,17 +581,14 @@ def check_bt16_dense_n1_padded_solve_policy_static() -> None:
 
     policy_path = _REPO_ROOT / "csrc/kernels/flash_kda/gfx950/policy.hpp"
     kernel_path = (
-        _REPO_ROOT
-        / "csrc/kernels/flash_kda/gfx950/k1_kda_bt16_fused_kernel.hpp"
+        _REPO_ROOT / "csrc/kernels/flash_kda/gfx950/k1_kda_bt16_fused_kernel.hpp"
     )
     policy = policy_path.read_text()
     kernel = kernel_path.read_text()
     compact_policy = " ".join(policy.split())
     compact_kernel = " ".join(kernel.split())
 
-    parser_start = policy.find(
-        "static bool bt16_dense_n1_padded_solve_enabled()"
-    )
+    parser_start = policy.find("static bool bt16_dense_n1_padded_solve_enabled()")
     parser_end = policy.find("\n    }", parser_start)
     if parser_start < 0 or parser_end < 0:
         raise AssertionError("policy is missing the padded-solve parser")
@@ -623,52 +598,52 @@ def check_bt16_dense_n1_padded_solve_policy_static() -> None:
     )
     for contract in parser_contracts:
         if contract not in parser:
-            raise AssertionError(
-                "padded-solve parser lost contract: " + contract
-            )
+            raise AssertionError("padded-solve parser lost contract: " + contract)
 
     policy_contracts = (
-        "if constexpr (DENSE_N1_ALL_FULL_C16) { "
-        "const bool padded_solve = "
-        "bt16_dense_n1_padded_solve_enabled(); "
-        "auto launch_dense = [&]<bool EARLY_DENSE_BETA>() { "
-        "if (padded_solve) launch.template operator()< "
-        "true, true, EARLY_DENSE_BETA>(); else "
-        "launch.template operator()< "
-        "true, false, EARLY_DENSE_BETA>(); }; "
-        "if (bt16_dense_n1_early_beta_enabled()) "
-        "launch_dense.template operator()<true>(); else "
-        "launch_dense.template operator()<false>(); } else { "
-        "const bool opt = bt16_fused_opt_enabled(); if (opt) "
-        "launch.template operator()<true, false, false>(); else "
-        "launch.template operator()<false, false, false>(); }",
+        (
+            "if constexpr (DENSE_N1_ALL_FULL_C16) { "
+            "const bool padded_solve = "
+            "bt16_dense_n1_padded_solve_enabled(); "
+            "auto launch_dense = [&]<bool EARLY_DENSE_BETA>() { "
+            "if (padded_solve) launch.template operator()< "
+            "true, true, EARLY_DENSE_BETA>(); else "
+            "launch.template operator()< "
+            "true, false, EARLY_DENSE_BETA>(); }; "
+            "if (bt16_dense_n1_early_beta_enabled()) "
+            "launch_dense.template operator()<true>(); else "
+            "launch_dense.template operator()<false>(); } else { "
+            "const bool opt = bt16_fused_opt_enabled(); if (opt) "
+            "launch.template operator()<true, false, false>(); else "
+            "launch.template operator()<false, false, false>(); }"
+        ),
         "static_assert(!PADDED_SOLVE || DENSE_N1_ALL_FULL_C16",
         "static_assert(!PADDED_SOLVE || USE_X32",
         "static_assert(!PADDED_SOLVE || OPT",
         "static_assert(!PADDED_SOLVE || CACHE_CONTEXT_OPERANDS",
         "static_assert(!PADDED_SOLVE || PUBLISH_ACTIVATED_BETA",
-        "PACKED_DIRECT_PREFIXLESS, DENSE_N1_ALL_FULL_C16, PADDED_SOLVE, "
-        "EARLY_DENSE_BETA, GVA>",
+        (
+            "PACKED_DIRECT_PREFIXLESS, DENSE_N1_ALL_FULL_C16, PADDED_SOLVE, "
+            "EARLY_DENSE_BETA, GVA>"
+        ),
     )
     for contract in policy_contracts:
         if contract not in compact_policy:
-            raise AssertionError(
-                "padded-solve dispatch lost contract: " + contract
-            )
+            raise AssertionError("padded-solve dispatch lost contract: " + contract)
 
     kernel_contracts = (
-        "bool DENSE_N1_ALL_FULL_C16 = false, bool PADDED_SOLVE = false, "
-        "bool EARLY_DENSE_BETA = false, bool GVA = false>",
+        (
+            "bool DENSE_N1_ALL_FULL_C16 = false, bool PADDED_SOLVE = false, "
+            "bool EARLY_DENSE_BETA = false, bool GVA = false>"
+        ),
         "static_assert(!PADDED_SOLVE || DENSE_N1_ALL_FULL_C16",
         "static_assert(!PADDED_SOLVE || USE_X32",
         "constexpr int SD = PADDED_SOLVE ? D + 4 : D;",
         "__bf16 kd[C * SD]; __bf16 qd[C * SD]; __bf16 ki[C * SD];",
         "sizeof(SolveStorage<D>) == 14400",
         "sizeof(SolveStorage<D + 4>) == 14784",
-        "sizeof(SharedStorage<false, D + 4>) == "
-        "sizeof(SolveStorage<D + 4>)",
-        "sizeof(SharedStorage<true, D + 4>) == "
-        "sizeof(ExactPrepStorage)",
+        ("sizeof(SharedStorage<false, D + 4>) == " "sizeof(SolveStorage<D + 4>)"),
+        ("sizeof(SharedStorage<true, D + 4>) == " "sizeof(ExactPrepStorage)"),
         "const int64_t ws_vec_off = int64_t(ht) * TILE_ELEMS + vec_idx;",
         "const int solve_vec_idx = vec_m * SD + vec_d0;",
         "solve.kd + solve_vec_idx",
@@ -679,12 +654,11 @@ def check_bt16_dense_n1_padded_solve_policy_static() -> None:
     )
     for contract in kernel_contracts:
         if contract not in compact_kernel:
-            raise AssertionError(
-                "padded-solve kernel lost contract: " + contract
-            )
-    if compact_kernel.count(
-        "contract_last_x32<D, SD, SD>(solve.qd, solve.ki, lane)"
-    ) != 2:
+            raise AssertionError("padded-solve kernel lost contract: " + contract)
+    if (
+        compact_kernel.count("contract_last_x32<D, SD, SD>(solve.qd, solve.ki, lane)")
+        != 2
+    ):
         raise AssertionError(
             "padded-solve kernel must have exactly two Qd@Ki X32 call sites"
         )
@@ -709,9 +683,7 @@ def check_bt16_dense_n1_padded_solve_policy_static() -> None:
 
     for spelling in (None, "", "0", "01", "true", "1 ", " 1"):
         if selected(spelling):
-            raise AssertionError(
-                f"padded-solve parser accepted fallback {spelling!r}"
-            )
+            raise AssertionError(f"padded-solve parser accepted fallback {spelling!r}")
     if not selected("1"):
         raise AssertionError("padded-solve selector rejected canonical '1'")
     for mismatch in (
@@ -722,9 +694,7 @@ def check_bt16_dense_n1_padded_solve_policy_static() -> None:
         {"publish_beta": False},
     ):
         if selected("1", **mismatch):
-            raise AssertionError(
-                f"padded-solve selector accepted fallback {mismatch}"
-            )
+            raise AssertionError(f"padded-solve selector accepted fallback {mismatch}")
 
     print(
         "PASS static strict dense-N1 padded-solve exact opt-in, "
@@ -738,71 +708,74 @@ def check_bt16_dense_n1_early_beta_policy_static() -> None:
 
     policy_path = _REPO_ROOT / "csrc/kernels/flash_kda/gfx950/policy.hpp"
     kernel_path = (
-        _REPO_ROOT
-        / "csrc/kernels/flash_kda/gfx950/k1_kda_bt16_fused_kernel.hpp"
+        _REPO_ROOT / "csrc/kernels/flash_kda/gfx950/k1_kda_bt16_fused_kernel.hpp"
     )
     policy = policy_path.read_text()
     kernel = kernel_path.read_text()
     compact_policy = " ".join(policy.split())
     compact_kernel = " ".join(kernel.split())
 
-    parser_start = policy.find(
-        "static bool bt16_dense_n1_early_beta_enabled()"
-    )
+    parser_start = policy.find("static bool bt16_dense_n1_early_beta_enabled()")
     parser_end = policy.find("\n    }", parser_start)
     if parser_start < 0 or parser_end < 0:
         raise AssertionError("policy is missing the early-beta parser")
     parser = " ".join(policy[parser_start:parser_end].split())
-    parser_contract = (
-        'env_exact( "FLASH_KDA_GFX950_BT16_DENSE_N1_EARLY_BETA", "1")'
-    )
+    parser_contract = 'env_exact( "FLASH_KDA_GFX950_BT16_DENSE_N1_EARLY_BETA", "1")'
     if parser_contract not in parser:
         raise AssertionError(
-            "early-beta parser lost exact opt-in contract: "
-            + parser_contract
+            "early-beta parser lost exact opt-in contract: " + parser_contract
         )
 
     policy_contracts = (
-        "auto launch = [&]<bool OPT, bool PADDED_SOLVE, "
-        "bool EARLY_DENSE_BETA>()",
-        "static_assert(!EARLY_DENSE_BETA || "
-        "(DENSE_N1_ALL_FULL_C16 && !EXACT_PREP && "
-        "USE_X32 && OPT && CACHE_CONTEXT_OPERANDS && "
-        "PUBLISH_ACTIVATED_BETA)",
-        "PACKED_DIRECT_PREFIXLESS, DENSE_N1_ALL_FULL_C16, "
-        "PADDED_SOLVE, EARLY_DENSE_BETA, GVA>",
-        "if (bt16_dense_n1_early_beta_enabled()) "
-        "launch_dense.template operator()<true>(); else "
-        "launch_dense.template operator()<false>();",
-        "if (opt) launch.template operator()<true, false, false>(); "
-        "else launch.template operator()<false, false, false>();",
+        ("auto launch = [&]<bool OPT, bool PADDED_SOLVE, " "bool EARLY_DENSE_BETA>()"),
+        (
+            "static_assert(!EARLY_DENSE_BETA || "
+            "(DENSE_N1_ALL_FULL_C16 && !EXACT_PREP && "
+            "USE_X32 && OPT && CACHE_CONTEXT_OPERANDS && "
+            "PUBLISH_ACTIVATED_BETA)"
+        ),
+        (
+            "PACKED_DIRECT_PREFIXLESS, DENSE_N1_ALL_FULL_C16, "
+            "PADDED_SOLVE, EARLY_DENSE_BETA, GVA>"
+        ),
+        (
+            "if (bt16_dense_n1_early_beta_enabled()) "
+            "launch_dense.template operator()<true>(); else "
+            "launch_dense.template operator()<false>();"
+        ),
+        (
+            "if (opt) launch.template operator()<true, false, false>(); "
+            "else launch.template operator()<false, false, false>();"
+        ),
     )
     for contract in policy_contracts:
         if contract not in compact_policy:
-            raise AssertionError(
-                "early-beta dispatch lost contract: " + contract
-            )
+            raise AssertionError("early-beta dispatch lost contract: " + contract)
 
     kernel_contracts = (
-        "bool PADDED_SOLVE = false, bool EARLY_DENSE_BETA = false, "
-        "bool GVA = false>",
-        "static_assert(!EARLY_DENSE_BETA || "
-        "(!EXACT_PREP && DENSE_N1_ALL_FULL_C16)",
-        "float balanced_beta = 0.0f; "
-        "if constexpr (EXACT_PREP || EARLY_DENSE_BETA)",
+        (
+            "bool PADDED_SOLVE = false, bool EARLY_DENSE_BETA = false, "
+            "bool GVA = false>"
+        ),
+        (
+            "static_assert(!EARLY_DENSE_BETA || "
+            "(!EXACT_PREP && DENSE_N1_ALL_FULL_C16)"
+        ),
+        (
+            "float balanced_beta = 0.0f; "
+            "if constexpr (EXACT_PREP || EARLY_DENSE_BETA)"
+        ),
         "if (tid >= 3 * 64 && tid < 3 * 64 + C)",
-        "solve.beta[row_lane] = balanced_beta; "
-        "if constexpr (PUBLISH_ACTIVATED_BETA) "
-        "beta_cache[int64_t(ht) * C + row_lane] = balanced_beta;",
+        (
+            "solve.beta[row_lane] = balanced_beta; "
+            "if constexpr (PUBLISH_ACTIVATED_BETA) "
+            "beta_cache[int64_t(ht) * C + row_lane] = balanced_beta;"
+        ),
     )
     for contract in kernel_contracts:
         if contract not in compact_kernel:
-            raise AssertionError(
-                "early-beta kernel lost contract: " + contract
-            )
-    if compact_kernel.count(
-        "if (tid >= 3 * 64 && tid < 3 * 64 + C)"
-    ) != 2:
+            raise AssertionError("early-beta kernel lost contract: " + contract)
+    if compact_kernel.count("if (tid >= 3 * 64 && tid < 3 * 64 + C)") != 2:
         raise AssertionError(
             "early-beta kernel must have one wave-3 compute site and one "
             "wave-3 publication site"
@@ -830,9 +803,7 @@ def check_bt16_dense_n1_early_beta_policy_static() -> None:
 
     for spelling in (None, "", "0", "01", "true", "1 ", " 1"):
         if selected(spelling):
-            raise AssertionError(
-                f"early-beta parser accepted fallback {spelling!r}"
-            )
+            raise AssertionError(f"early-beta parser accepted fallback {spelling!r}")
     if not selected("1"):
         raise AssertionError("early-beta selector rejected canonical '1'")
     for mismatch in (
@@ -844,9 +815,7 @@ def check_bt16_dense_n1_early_beta_policy_static() -> None:
         {"publish_beta": False},
     ):
         if selected("1", **mismatch):
-            raise AssertionError(
-                f"early-beta selector accepted fallback {mismatch}"
-            )
+            raise AssertionError(f"early-beta selector accepted fallback {mismatch}")
 
     print(
         "PASS static strict dense-N1 early-beta exact opt-in, "
@@ -861,16 +830,11 @@ def check_context_forward_policy_static() -> None:
     policy_path = _REPO_ROOT / "csrc/kernels/flash_kda/gfx950/policy.hpp"
     source = policy_path.read_text()
     default_on_return = (
-        "return value == nullptr || "
-        "!(value[0] == '0' && value[1] == '\\0');"
+        "return value == nullptr || " "!(value[0] == '0' && value[1] == '\\0');"
     )
     parsers = {
-        "context_u_forward_enabled": (
-            "FLASH_KDA_GFX950_CONTEXT_U_FORWARD"
-        ),
-        "context_v_forward_enabled": (
-            "FLASH_KDA_GFX950_CONTEXT_V_FORWARD"
-        ),
+        "context_u_forward_enabled": ("FLASH_KDA_GFX950_CONTEXT_U_FORWARD"),
+        "context_v_forward_enabled": ("FLASH_KDA_GFX950_CONTEXT_V_FORWARD"),
     }
     for function, environment in parsers.items():
         start = source.find(f"static bool {function}()")
@@ -879,22 +843,16 @@ def check_context_forward_policy_static() -> None:
             raise AssertionError(f"policy is missing {function}")
         body = " ".join(source[start:end].split())
         if f'std::getenv("{environment}")' not in body:
-            raise AssertionError(
-                f"{function} does not read the expected environment"
-            )
+            raise AssertionError(f"{function} does not read the expected environment")
         if default_on_return not in body:
-            raise AssertionError(
-                f"{function} is not default-on/exact-'0'-off"
-            )
+            raise AssertionError(f"{function} is not default-on/exact-'0'-off")
 
     def default_on(value: str | None) -> bool:
         return value != "0"
 
     for enabled in (None, "", "1", "01", "true", "1 ", " 0", "00"):
         if not default_on(enabled):
-            raise AssertionError(
-                f"static default-on model rejected {enabled!r}"
-            )
+            raise AssertionError(f"static default-on model rejected {enabled!r}")
     if default_on("0"):
         raise AssertionError("static exact-'0' rollback model stayed enabled")
     print("PASS static context U/V default-on, exact-'0'-off parsing")
@@ -903,27 +861,18 @@ def check_context_forward_policy_static() -> None:
 def check_context_lds_pipeline_pass_policy_static() -> None:
     """Audit strict parsing and per-mode template wiring without a GPU."""
 
-    policy_path = (
-        _REPO_ROOT / "csrc/kernels/flash_kda/gfx950/policy.hpp"
-    )
+    policy_path = _REPO_ROOT / "csrc/kernels/flash_kda/gfx950/policy.hpp"
     source = policy_path.read_text()
     compact = " ".join(source.split())
 
     pass_parsers = {
-        "context_lds_pipeline_b_enabled": (
-            "FLASH_KDA_GFX950_CONTEXT_LDS_PIPELINE_B"
-        ),
-        "context_lds_pipeline_a_enabled": (
-            "FLASH_KDA_GFX950_CONTEXT_LDS_PIPELINE_A"
-        ),
+        "context_lds_pipeline_b_enabled": ("FLASH_KDA_GFX950_CONTEXT_LDS_PIPELINE_B"),
+        "context_lds_pipeline_a_enabled": ("FLASH_KDA_GFX950_CONTEXT_LDS_PIPELINE_A"),
         "context_lds_pipeline_replay_enabled": (
             "FLASH_KDA_GFX950_CONTEXT_LDS_PIPELINE_REPLAY"
         ),
     }
-    exact_return = (
-        "return value != nullptr && value[0] == '1' && "
-        "value[1] == '\\0';"
-    )
+    exact_return = "return value != nullptr && value[0] == '1' && " "value[1] == '\\0';"
     for function, environment in pass_parsers.items():
         start = source.find(f"static bool {function}()")
         if start < 0:
@@ -933,19 +882,23 @@ def check_context_lds_pipeline_pass_policy_static() -> None:
             raise AssertionError(f"cannot delimit policy parser {function}")
         body = " ".join(source[start:end].split())
         if f'std::getenv("{environment}")' not in body:
-            raise AssertionError(
-                f"{function} does not read the expected environment"
-            )
+            raise AssertionError(f"{function} does not read the expected environment")
         if exact_return not in body:
             raise AssertionError(f"{function} is not an exact-'1' parser")
 
     effective_wiring = (
-        "const bool pipeline_lds_b = forward_u && forward_v && "
-        "(pipeline_lds_global || context_lds_pipeline_b_enabled());",
-        "const bool pipeline_lds_a = forward_u && forward_v && "
-        "(pipeline_lds_global || context_lds_pipeline_a_enabled());",
-        "const bool pipeline_lds_replay = forward_u && forward_v && "
-        "(pipeline_lds_global || context_lds_pipeline_replay_enabled());",
+        (
+            "const bool pipeline_lds_b = forward_u && forward_v && "
+            "(pipeline_lds_global || context_lds_pipeline_b_enabled());"
+        ),
+        (
+            "const bool pipeline_lds_a = forward_u && forward_v && "
+            "(pipeline_lds_global || context_lds_pipeline_a_enabled());"
+        ),
+        (
+            "const bool pipeline_lds_replay = forward_u && forward_v && "
+            "(pipeline_lds_global || context_lds_pipeline_replay_enabled());"
+        ),
     )
     for statement in effective_wiring:
         if statement not in compact:
@@ -957,20 +910,27 @@ def check_context_lds_pipeline_pass_policy_static() -> None:
     # consume only its own final LDS_PIPELINE bit.  This reuses the existing
     # true/false specializations instead of introducing a pass-mask template.
     mode_wiring = (
-        "KdaContextMode::kAffineB, false, false, VL, false, CONTEXT_NW, 0, "
-        "CACHED_OPERANDS, U_FORWARD, V_FORWARD, LDS_PIPELINE_B>",
-        "KdaContextMode::kAffineA, false, false, VL, false, CONTEXT_NW, 0, "
-        "CACHED_OPERANDS, U_FORWARD, V_FORWARD, LDS_PIPELINE_A>",
-        "KdaContextMode::kReplay, HO, FP, VL, false, CONTEXT_NW, 0, "
-        "CACHED_OPERANDS, U_FORWARD, V_FORWARD, LDS_PIPELINE_REPLAY>",
-        "CONTEXT_NW, DIRECT_MAX_CHUNKS, CACHED_OPERANDS, U_FORWARD, V_FORWARD, "
-        "LDS_PIPELINE_REPLAY>",
+        (
+            "KdaContextMode::kAffineB, false, false, VL, false, CONTEXT_NW, 0, "
+            "CACHED_OPERANDS, U_FORWARD, V_FORWARD, LDS_PIPELINE_B>"
+        ),
+        (
+            "KdaContextMode::kAffineA, false, false, VL, false, CONTEXT_NW, 0, "
+            "CACHED_OPERANDS, U_FORWARD, V_FORWARD, LDS_PIPELINE_A>"
+        ),
+        (
+            "KdaContextMode::kReplay, HO, FP, VL, false, CONTEXT_NW, 0, "
+            "CACHED_OPERANDS, U_FORWARD, V_FORWARD, LDS_PIPELINE_REPLAY>"
+        ),
+        (
+            "CONTEXT_NW, DIRECT_MAX_CHUNKS, CACHED_OPERANDS, U_FORWARD, V_FORWARD, "
+            "LDS_PIPELINE_REPLAY>"
+        ),
     )
     for specialization in mode_wiring:
         if specialization not in compact:
             raise AssertionError(
-                "policy per-mode LDS template wiring changed: "
-                f"{specialization}"
+                "policy per-mode LDS template wiring changed: " f"{specialization}"
             )
     launch_start = compact.find("static void launch_context_parallel")
     direct_start = compact.find("if (direct) {", launch_start)
@@ -993,21 +953,19 @@ def check_context_lds_pipeline_pass_policy_static() -> None:
         for v_forward in (False, True):
             for global_pipeline in (False, True):
                 for mask in range(8):
-                    requested = tuple(
-                        bool(mask & bit) for bit in (4, 2, 1)
-                    )
+                    requested = tuple(bool(mask & bit) for bit in (4, 2, 1))
                     effective = tuple(
-                        u_forward
-                        and v_forward
-                        and (global_pipeline or selected)
+                        u_forward and v_forward and (global_pipeline or selected)
                         for selected in requested
                     )
                     expected = (
                         (True, True, True)
                         if u_forward and v_forward and global_pipeline
-                        else requested
-                        if u_forward and v_forward
-                        else (False, False, False)
+                        else (
+                            requested
+                            if u_forward and v_forward
+                            else (False, False, False)
+                        )
                     )
                     if effective != expected:
                         raise AssertionError(
@@ -1026,8 +984,7 @@ def check_context_nw8_policy_static() -> None:
 
     policy_path = _REPO_ROOT / "csrc/kernels/flash_kda/gfx950/policy.hpp"
     kernel_path = (
-        _REPO_ROOT
-        / "csrc/kernels/flash_kda/gfx950/"
+        _REPO_ROOT / "csrc/kernels/flash_kda/gfx950/"
         "k2_kda_context_parallel_kernel.hpp"
     )
     policy = policy_path.read_text()
@@ -1042,10 +999,7 @@ def check_context_nw8_policy_static() -> None:
     parser = " ".join(policy[parser_start:parser_end].split())
     if 'std::getenv("FLASH_KDA_GFX950_CONTEXT_NW8")' not in parser:
         raise AssertionError("context NW8 parser reads the wrong environment")
-    exact_return = (
-        "return value != nullptr && value[0] == '1' && "
-        "value[1] == '\\0';"
-    )
+    exact_return = "return value != nullptr && value[0] == '1' && " "value[1] == '\\0';"
     if exact_return not in parser:
         raise AssertionError("context NW8 parser is not exact-'1'")
 
@@ -1085,9 +1039,7 @@ def check_context_nw8_policy_static() -> None:
     )
     for contract in kernel_contracts:
         if contract not in compact_kernel:
-            raise AssertionError(
-                f"context NW8 kernel is missing contract: {contract}"
-            )
+            raise AssertionError(f"context NW8 kernel is missing contract: {contract}")
     legacy_grid_decode = (
         "const int global_context = int(blockIdx.x) / H;",
         "const int h = int(blockIdx.x) - global_context * H;",
@@ -1102,10 +1054,7 @@ def check_context_nw8_policy_static() -> None:
     )
     if not (
         all(contract in compact_kernel for contract in legacy_grid_decode)
-        or all(
-            contract in compact_kernel
-            for contract in flat_nw1_isolated_decode
-        )
+        or all(contract in compact_kernel for contract in flat_nw1_isolated_decode)
     ):
         raise AssertionError(
             "context NW8 kernel lost its established 2D grid decode or "
@@ -1120,9 +1069,7 @@ def check_context_nw8_policy_static() -> None:
             "context NW1/2/4 stage/commit paths are not isolated three times"
         )
     if kernel.count("if (tid < ROW_VECS)") != 3:
-        raise AssertionError(
-            "context NW8 does not guard all three common publications"
-        )
+        raise AssertionError("context NW8 does not guard all three common publications")
 
     def exact_one(value: str | None) -> bool:
         return value == "1"
@@ -1146,13 +1093,8 @@ def _check_context_direct_prefixless_policy_static(
 ) -> None:
     """Audit the hinted and no-hint mixed-boundary direct recipe."""
 
-    common_path = (
-        _REPO_ROOT / "csrc/kernels/flash_kda/hip_launch_common.cu"
-    )
-    k1_path = (
-        _REPO_ROOT
-        / "csrc/kernels/flash_kda/gfx950/k1_kda_bt16_fused_kernel.hpp"
-    )
+    common_path = _REPO_ROOT / "csrc/kernels/flash_kda/hip_launch_common.cu"
+    k1_path = _REPO_ROOT / "csrc/kernels/flash_kda/gfx950/k1_kda_bt16_fused_kernel.hpp"
     common = common_path.read_text()
     k1_kernel = k1_path.read_text()
     compact_common = " ".join(common.split())
@@ -1178,9 +1120,11 @@ def _check_context_direct_prefixless_policy_static(
         policy, "static bool is_k3_mixed_boundary_nohint_aggregate("
     )
     aggregate_contracts = (
-        "const bool supported_heads = "
-        "(p.H_q == p.H && p.H == 12) || "
-        "(p.H_q == 2 && (p.H == 4 || p.H == 8));",
+        (
+            "const bool supported_heads = "
+            "(p.H_q == p.H && p.H == 12) || "
+            "(p.H_q == 2 && (p.H == 4 || p.H == 8));"
+        ),
         "p.max_seqlen_upper_bound == 0",
         "supported_heads",
         "p.cu_seqlens != nullptr",
@@ -1211,8 +1155,7 @@ def _check_context_direct_prefixless_policy_static(
         for contract in aggregate_contracts:
             if contract not in aggregate_guard:
                 raise AssertionError(
-                    f"K3 no-hint N{sequences}/16K aggregate changed: "
-                    + contract
+                    f"K3 no-hint N{sequences}/16K aggregate changed: " + contract
                 )
 
     prefixless_guard = cpp_block(
@@ -1220,25 +1163,31 @@ def _check_context_direct_prefixless_policy_static(
     )
     guard_contracts = (
         f'std::getenv( "{_CONTEXT_DIRECT_PREFIXLESS_ENV}")',
-        "const bool explicit_prefixless = value != nullptr && "
-        "value[0] == '1' && value[1] == '\\0';",
-        "const bool hinted_mixed_boundary = "
-        "p.cu_seqlens != nullptr && p.N == 16",
-        "(p.max_seqlen_upper_bound == 1024 || "
-        "p.max_seqlen_upper_bound == 1025)",
+        (
+            "const bool explicit_prefixless = value != nullptr && "
+            "value[0] == '1' && value[1] == '\\0';"
+        ),
+        ("const bool hinted_mixed_boundary = " "p.cu_seqlens != nullptr && p.N == 16"),
+        ("(p.max_seqlen_upper_bound == 1024 || " "p.max_seqlen_upper_bound == 1025)"),
         "p.T_total == p.max_seqlen_upper_bound + 15",
         "p.total_tiles == 81;",
-        "const bool automatic_mixed_boundary_prefixless = "
-        "value == nullptr && (hinted_mixed_boundary || "
-        "is_k3_mixed_boundary_nohint_aggregate(p))",
+        (
+            "const bool automatic_mixed_boundary_prefixless = "
+            "value == nullptr && (hinted_mixed_boundary || "
+            "is_k3_mixed_boundary_nohint_aggregate(p))"
+        ),
         'std::getenv( "FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS") == nullptr',
         f'std::getenv( "{_CONTEXT_DIRECT_NW1_FLAT_ENV}") == nullptr',
         'std::getenv( "FLASH_KDA_GFX950_CONTEXT_DIRECT_NW") == nullptr',
-        "if (!explicit_prefixless && "
-        "!automatic_mixed_boundary_prefixless) return false;",
-        "const bool supported_head_layout = p.H_q == p.H || "
-        "(automatic_mixed_boundary_prefixless && p.H_q == 2 && "
-        "(p.H == 4 || p.H == 8));",
+        (
+            "if (!explicit_prefixless && "
+            "!automatic_mixed_boundary_prefixless) return false;"
+        ),
+        (
+            "const bool supported_head_layout = p.H_q == p.H || "
+            "(automatic_mixed_boundary_prefixless && p.H_q == 2 && "
+            "(p.H == 4 || p.H == 8));"
+        ),
         "return supported_head_layout && p.cu_seqlens != nullptr",
         "default_k2_route == K2DefaultRoute::context_parallel",
         "route.group_chunks == 0 && route.direct_max_chunks == 0",
@@ -1248,13 +1197,9 @@ def _check_context_direct_prefixless_policy_static(
     )
     for contract in guard_contracts:
         if contract not in prefixless_guard:
-            raise AssertionError(
-                "mixed-boundary prefixless guard changed: " + contract
-            )
+            raise AssertionError("mixed-boundary prefixless guard changed: " + contract)
     for route in ("DIRECT", "AFFINE", "HYBRID"):
-        contract = (
-            f'std::getenv("FLASH_KDA_GFX950_CONTEXT_{route}") == nullptr'
-        )
+        contract = f'std::getenv("FLASH_KDA_GFX950_CONTEXT_{route}") == nullptr'
         if contract not in prefixless_guard:
             raise AssertionError(
                 "automatic prefixless host guard no longer rolls back every "
@@ -1265,29 +1210,44 @@ def _check_context_direct_prefixless_policy_static(
         policy, "static ContextRouteConfig resolve_context_route("
     )
     resolve_contracts = (
-        "const bool automatic_mixed_boundary_direct = "
-        "is_k3_mixed_boundary_nohint_aggregate(p) && group_env == nullptr && "
-        "!force_direct && !force_affine && !force_hybrid;",
-        "const bool automatic_k3_n4_16k_g64 = "
-        "is_k3_n4_16k_nohint_aggregate(p) && group_env == nullptr && "
-        "!force_direct && !force_affine && !force_hybrid;",
-        "const bool automatic_k3_n8_16k_hybrid_g32 = "
-        "is_k3_n8_16k_nohint_aggregate(p) && group_env == nullptr && "
-        "!force_direct && !force_affine && !force_hybrid;",
-        "hinted_direct || automatic_mixed_boundary_direct || "
-        "automatic_short_single_direct",
-        "const bool hybrid = is_varlen && !hinted_direct && "
-        "!automatic_mixed_boundary_direct && "
-        "(automatic_k3_n8_16k_hybrid_g32 ||",
-        "automatic_short_single_direct || hinted_direct || "
-        "automatic_mixed_boundary_direct",
-        "automatic_gva_equal_n4_g32 || automatic_gva_n4_16k_nohint || "
-        "automatic_k3_dense_n4_h12_g64 || automatic_k3_n4_16k_g64 || "
-        "automatic_k3_n8_16k_hybrid_g32;",
-        "else if (automatic_k3_n8_16k_hybrid_g32) { "
-        "group_chunks = 32;",
-        "automatic_k3_n8_16k_hybrid_g32 ? "
-        "kK3N8NoHintDirectMaxChunks : kHybridDirectMaxChunks",
+        (
+            "const bool automatic_mixed_boundary_direct = "
+            "is_k3_mixed_boundary_nohint_aggregate(p) && group_env == nullptr && "
+            "!force_direct && !force_affine && !force_hybrid;"
+        ),
+        (
+            "const bool automatic_k3_n4_16k_g64 = "
+            "is_k3_n4_16k_nohint_aggregate(p) && group_env == nullptr && "
+            "!force_direct && !force_affine && !force_hybrid;"
+        ),
+        (
+            "const bool automatic_k3_n8_16k_hybrid_g32 = "
+            "is_k3_n8_16k_nohint_aggregate(p) && group_env == nullptr && "
+            "!force_direct && !force_affine && !force_hybrid;"
+        ),
+        (
+            "hinted_direct || automatic_mixed_boundary_direct || "
+            "automatic_short_single_direct"
+        ),
+        (
+            "const bool hybrid = is_varlen && !hinted_direct && "
+            "!automatic_mixed_boundary_direct && "
+            "(automatic_k3_n8_16k_hybrid_g32 ||"
+        ),
+        (
+            "automatic_short_single_direct || hinted_direct || "
+            "automatic_mixed_boundary_direct"
+        ),
+        (
+            "automatic_gva_equal_n4_g32 || automatic_gva_n4_16k_nohint || "
+            "automatic_k3_dense_n4_h12_g64 || automatic_k3_n4_16k_g64 || "
+            "automatic_k3_n8_16k_hybrid_g32;"
+        ),
+        ("else if (automatic_k3_n8_16k_hybrid_g32) { " "group_chunks = 32;"),
+        (
+            "automatic_k3_n8_16k_hybrid_g32 ? "
+            "kK3N8NoHintDirectMaxChunks : kHybridDirectMaxChunks"
+        ),
     )
     for contract in resolve_contracts:
         if contract not in resolve_context:
@@ -1296,20 +1256,18 @@ def _check_context_direct_prefixless_policy_static(
             )
 
     compact_policy = " ".join(policy.split())
-    direct_threshold_contract = (
-        "static constexpr int kK3N8NoHintDirectMaxChunks = 128;"
-    )
+    direct_threshold_contract = "static constexpr int kK3N8NoHintDirectMaxChunks = 128;"
     if direct_threshold_contract not in compact_policy:
         raise AssertionError(
-            "K3 N8 hybrid direct threshold changed: "
-            + direct_threshold_contract
+            "K3 N8 hybrid direct threshold changed: " + direct_threshold_contract
         )
     launch_contracts = (
-        "if (direct_max_chunks == kK3N8NoHintDirectMaxChunks) "
-        "launch_direct.template operator()< "
-        "kK3N8NoHintDirectMaxChunks>();",
-        "else launch_direct.template operator()< "
-        "kHybridDirectMaxChunks>();",
+        (
+            "if (direct_max_chunks == kK3N8NoHintDirectMaxChunks) "
+            "launch_direct.template operator()< "
+            "kK3N8NoHintDirectMaxChunks>();"
+        ),
+        ("else launch_direct.template operator()< " "kHybridDirectMaxChunks>();"),
     )
     for contract in launch_contracts:
         if contract not in compact_policy:
@@ -1331,32 +1289,27 @@ def _check_context_direct_prefixless_policy_static(
         )
     flat_guard = context_launch[flat_guard_start : flat_guard_end + 1]
     flat_guard_contracts = (
-        "const bool automatic_mixed_boundary_nw1_flat = "
-        "a.packed_direct_prefixless && a.is_varlen && a.N == 16",
-        "a.total_tiles == 81 && "
-        "(a.T_seq == 64 || a.T_seq == 65)",
+        (
+            "const bool automatic_mixed_boundary_nw1_flat = "
+            "a.packed_direct_prefixless && a.is_varlen && a.N == 16"
+        ),
+        ("a.total_tiles == 81 && " "(a.T_seq == 64 || a.T_seq == 65)"),
         f'std::getenv( "{_CONTEXT_DIRECT_PREFIXLESS_ENV}") == nullptr',
         'std::getenv( "FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS") == nullptr',
         "direct_nw_value == nullptr && nw1_flat_value == nullptr",
     )
     for contract in flat_guard_contracts:
         if contract not in flat_guard:
-            raise AssertionError(
-                "mixed-boundary NW1-flat guard changed: " + contract
-            )
+            raise AssertionError("mixed-boundary NW1-flat guard changed: " + contract)
     for route in ("DIRECT", "AFFINE", "HYBRID"):
-        contract = (
-            f'std::getenv("FLASH_KDA_GFX950_CONTEXT_{route}") == nullptr'
-        )
+        contract = f'std::getenv("FLASH_KDA_GFX950_CONTEXT_{route}") == nullptr'
         if contract not in flat_guard:
             raise AssertionError(
                 "automatic NW1-flat launch guard no longer rolls back every "
                 f"explicit {route} value"
             )
 
-    gva_nw1_start = context_launch.find(
-        "const bool automatic_gva_mixed_boundary_nw1 ="
-    )
+    gva_nw1_start = context_launch.find("const bool automatic_gva_mixed_boundary_nw1 =")
     gva_nw1_end = context_launch.find(";", gva_nw1_start)
     if gva_nw1_start < 0 or gva_nw1_end < 0:
         raise AssertionError(
@@ -1373,13 +1326,9 @@ def _check_context_direct_prefixless_policy_static(
         "direct_nw_value == nullptr && nw1_flat_value == nullptr",
     ):
         if contract not in gva_nw1_guard:
-            raise AssertionError(
-                "GVA mixed-boundary NW1 guard changed: " + contract
-            )
+            raise AssertionError("GVA mixed-boundary NW1 guard changed: " + contract)
     for route in ("DIRECT", "AFFINE", "HYBRID"):
-        contract = (
-            f'std::getenv("FLASH_KDA_GFX950_CONTEXT_{route}") == nullptr'
-        )
+        contract = f'std::getenv("FLASH_KDA_GFX950_CONTEXT_{route}") == nullptr'
         if contract not in gva_nw1_guard:
             raise AssertionError(
                 "automatic GVA NW1 guard no longer rolls back explicit "
@@ -1387,15 +1336,21 @@ def _check_context_direct_prefixless_policy_static(
             )
 
     flat_dispatch_contracts = (
-        "const char* nw1_flat_value = std::getenv( "
-        f'"{_CONTEXT_DIRECT_NW1_FLAT_ENV}");',
-        "requested_nw1_flat_tail_first || "
-        "automatic_short_single_nw1_flat || "
-        "automatic_mixed_boundary_nw1_flat",
+        (
+            "const char* nw1_flat_value = std::getenv( "
+            f'"{_CONTEXT_DIRECT_NW1_FLAT_ENV}");'
+        ),
+        (
+            "requested_nw1_flat_tail_first || "
+            "automatic_short_single_nw1_flat || "
+            "automatic_mixed_boundary_nw1_flat"
+        ),
         "use_nw1_flat_tail_first && !use_deep_n4_nw4",
         "automatic_gva_mixed_boundary_nw1 ? 1",
-        "if (a.packed_direct_prefixless) "
-        "dispatch_flat.template operator()<true, false>();",
+        (
+            "if (a.packed_direct_prefixless) "
+            "dispatch_flat.template operator()<true, false>();"
+        ),
         "VL && !PACKED_DIRECT_PREFIXLESS ? a.tile_prefix : nullptr",
     )
     for contract in flat_dispatch_contracts:
@@ -1407,41 +1362,55 @@ def _check_context_direct_prefixless_policy_static(
     k1_launch = cpp_block(policy, "static void launch_bt16_k1(")
     k1_contracts = (
         "if (a.H_q != a.H)",
-        "if (a.packed_direct_prefixless) "
-        "launch_gva.template operator()<true, true>();",
-        "if (a.packed_direct_prefixless) "
-        "dispatch.template operator()<true, true, false>();",
+        (
+            "if (a.packed_direct_prefixless) "
+            "launch_gva.template operator()<true, true>();"
+        ),
+        (
+            "if (a.packed_direct_prefixless) "
+            "dispatch.template operator()<true, true, false>();"
+        ),
         "dispatch.template operator()<true, false, false>();",
     )
     for contract in k1_contracts:
         if contract not in k1_launch:
             raise AssertionError(
-                "fused K1 lost matched prefixless specialization dispatch: "
-                + contract
+                "fused K1 lost matched prefixless specialization dispatch: " + contract
             )
 
     common_contracts = (
-        "use_context_parallel && is_varlen && "
-        "!use_context_equal_dense_n4_g64 && "
-        "policy.context_direct_prefixless",
-        "policy.context_group_chunks == 0 && "
-        "policy.context_direct_max_chunks == 0",
-        "if (is_varlen && !use_context_direct_prefixless && "
-        "!normalize_packed_equal_dense_n4_g64)",
-        "use_context_direct_prefixless ? nullptr : "
-        "(k1_is_varlen ? tile_prefix : nullptr)",
-        "use_context_direct_prefixless ? nullptr : "
-        "(context_is_varlen ? tile_prefix : nullptr)",
-        "use_context_direct_prefixless, "
-        "use_context_equal_dense_n4_g64, context_operands_cached, is_gva, "
-        "policy.context_automatic_gva_packed_nw4, "
-        "policy.context_automatic_gva_equal_n4_g16};",
+        (
+            "use_context_parallel && is_varlen && "
+            "!use_context_equal_dense_n4_g64 && "
+            "policy.context_direct_prefixless"
+        ),
+        (
+            "policy.context_group_chunks == 0 && "
+            "policy.context_direct_max_chunks == 0"
+        ),
+        (
+            "if (is_varlen && !use_context_direct_prefixless && "
+            "!normalize_packed_equal_dense_n4_g64)"
+        ),
+        (
+            "use_context_direct_prefixless ? nullptr : "
+            "(k1_is_varlen ? tile_prefix : nullptr)"
+        ),
+        (
+            "use_context_direct_prefixless ? nullptr : "
+            "(context_is_varlen ? tile_prefix : nullptr)"
+        ),
+        (
+            "use_context_direct_prefixless, "
+            "use_context_equal_dense_n4_g64, context_operands_cached, is_gva, "
+            "policy.context_automatic_gva_packed_nw4, "
+            "policy.context_automatic_gva_equal_n4_g16};"
+        ),
     )
     for contract in common_contracts:
         if contract not in compact_common:
             raise AssertionError(
-                "common launcher lost matched prefixless graph wiring: "
-                + contract
+                "common launcher lost matched prefixless graph wiring: " + contract
             )
 
     k1_mapping_contracts = (
@@ -1451,12 +1420,12 @@ def _check_context_direct_prefixless_policy_static(
     )
     for contract in k1_mapping_contracts:
         if contract not in compact_k1:
-            raise AssertionError(
-                "prefixless fused K1 mapping changed: " + contract
-            )
+            raise AssertionError("prefixless fused K1 mapping changed: " + contract)
     context_mapping_contracts = (
-        "static_assert(!PACKED_DIRECT_PREFIXLESS || "
-        "(VL && DIRECT && DIRECT_MAX_CHUNKS == 0)",
+        (
+            "static_assert(!PACKED_DIRECT_PREFIXLESS || "
+            "(VL && DIRECT && DIRECT_MAX_CHUNKS == 0)"
+        ),
         "if constexpr (PACKED_DIRECT_PREFIXLESS)",
         "packed_c16_sequence_mapping(cu_seqlens, seq)",
         "else if (alen == C)",
@@ -1539,11 +1508,7 @@ def _check_context_direct_prefixless_policy_static(
     for bound in (1024, 1025):
         for prefill_first in (False, True):
             decodes = (1,) * 15
-            seq_lens = (
-                (bound,) + decodes
-                if prefill_first
-                else decodes + (bound,)
-            )
+            seq_lens = (bound,) + decodes if prefill_first else decodes + (bound,)
             for supplied_bound in (bound, None):
                 if selected(seq_lens, supplied_bound, 81) != (True, True):
                     raise AssertionError(
@@ -1594,22 +1559,17 @@ def _check_context_direct_prefixless_policy_static(
         raise AssertionError("ordinary packed shape enabled prefixless by default")
     for value in ("", "0", "01", "true", "1 ", " 1"):
         if selected(ordinary, 65, 80, prefixless_value=value)[0]:
-            raise AssertionError(
-                f"ordinary prefixless parser accepted {value!r}"
-            )
+            raise AssertionError(f"ordinary prefixless parser accepted {value!r}")
     if selected(ordinary, 65, 80, prefixless_value="1") != (True, False):
         raise AssertionError("ordinary pure-direct shape rejected exact opt-in")
-    if selected(
-        ordinary, 65, 80, prefixless_value="1", pure_direct=False
-    )[0]:
+    if selected(ordinary, 65, 80, prefixless_value="1", pure_direct=False)[0]:
         raise AssertionError("prefixless escaped its pure-direct route guard")
     for value_heads in (4, 8):
-        if selected(
-            target, None, 81, q_heads=2, value_heads=value_heads
-        ) != (True, True):
-            raise AssertionError(
-                f"no-hint GVA Hq2/Hv{value_heads} mixed route changed"
-            )
+        if selected(target, None, 81, q_heads=2, value_heads=value_heads) != (
+            True,
+            True,
+        ):
+            raise AssertionError(f"no-hint GVA Hq2/Hv{value_heads} mixed route changed")
         if selected(
             target,
             None,
@@ -1634,8 +1594,7 @@ def check_context_direct_tail_first_policy_static() -> None:
 
     policy_path = _REPO_ROOT / "csrc/kernels/flash_kda/gfx950/policy.hpp"
     kernel_path = (
-        _REPO_ROOT
-        / "csrc/kernels/flash_kda/gfx950/"
+        _REPO_ROOT / "csrc/kernels/flash_kda/gfx950/"
         "k2_kda_context_parallel_kernel.hpp"
     )
     policy = policy_path.read_text()
@@ -1643,30 +1602,20 @@ def check_context_direct_tail_first_policy_static() -> None:
     compact_policy = " ".join(policy.split())
     compact_kernel = " ".join(kernel.split())
 
-    parser_start = policy.find(
-        "static bool context_direct_tail_first_enabled()"
-    )
+    parser_start = policy.find("static bool context_direct_tail_first_enabled()")
     parser_end = policy.find("\n    }", parser_start)
     if parser_start < 0 or parser_end < 0:
         raise AssertionError("policy is missing the direct tail-first parser")
     parser = " ".join(policy[parser_start:parser_end].split())
-    if (
-        'std::getenv( "FLASH_KDA_GFX950_CONTEXT_DIRECT_TAIL_FIRST")'
-        not in parser
-    ):
+    if 'std::getenv( "FLASH_KDA_GFX950_CONTEXT_DIRECT_TAIL_FIRST")' not in parser:
         raise AssertionError("direct tail-first parser reads the wrong env")
-    exact_return = (
-        "return value != nullptr && value[0] == '1' && "
-        "value[1] == '\\0';"
-    )
+    exact_return = "return value != nullptr && value[0] == '1' && " "value[1] == '\\0';"
     if exact_return not in parser:
         raise AssertionError("direct tail-first parser is not exact-'1'")
 
     policy_contracts = (
-        "const bool direct_tail_first = "
-        "context_direct_tail_first_enabled();",
-        "NW == 4 && CACHED_OPERANDS && U_FORWARD && V_FORWARD && "
-        "!LDS_PIPELINE",
+        ("const bool direct_tail_first = " "context_direct_tail_first_enabled();"),
+        ("NW == 4 && CACHED_OPERANDS && U_FORWARD && V_FORWARD && " "!LDS_PIPELINE"),
         "<<<dim3(a.N * a.H, 8 / NW), NW * 64, 0, a.stream>>>",
     )
     for contract in policy_contracts:
@@ -1686,10 +1635,7 @@ def check_context_direct_tail_first_policy_static() -> None:
     )
     if not (
         all(contract in compact_policy for contract in legacy_launches)
-        or all(
-            contract in compact_policy
-            for contract in prefixless_aware_launches
-        )
+        or all(contract in compact_policy for contract in prefixless_aware_launches)
     ):
         raise AssertionError(
             "direct tail-first dispatch lost either its legacy launch pair "
@@ -1717,13 +1663,10 @@ def check_context_direct_tail_first_policy_static() -> None:
     for fallback in (None, "", "0", "01", "true", "1 ", " 1"):
         if exact_one(fallback):
             raise AssertionError(
-                "static direct tail-first parser accepted fallback "
-                f"{fallback!r}"
+                "static direct tail-first parser accepted fallback " f"{fallback!r}"
             )
     if not exact_one("1"):
-        raise AssertionError(
-            "static direct tail-first parser rejected canonical '1'"
-        )
+        raise AssertionError("static direct tail-first parser rejected canonical '1'")
     _check_context_direct_prefixless_policy_static(policy, kernel)
     print(
         "PASS static direct tail-first exact parser, guarded NW4/P0/cache/U/V "
@@ -1732,25 +1675,17 @@ def check_context_direct_tail_first_policy_static() -> None:
     )
 
 
-def _check_context_equal_dense_n4_g64_policy_static(
-    policy: str, kernel: str
-) -> None:
+def _check_context_equal_dense_n4_g64_policy_static(policy: str, kernel: str) -> None:
     """Audit packed normalization and exact true-dense N4/G64 admission."""
 
-    common = (
-        _REPO_ROOT / "csrc/kernels/flash_kda/hip_launch_common.cu"
-    ).read_text()
-    common_abi = (
-        _REPO_ROOT / "csrc/kernels/flash_kda/hip_common.hpp"
-    ).read_text()
+    common = (_REPO_ROOT / "csrc/kernels/flash_kda/hip_launch_common.cu").read_text()
+    common_abi = (_REPO_ROOT / "csrc/kernels/flash_kda/hip_common.hpp").read_text()
     scan_kernel = (
-        _REPO_ROOT
-        / "csrc/kernels/flash_kda/gfx950/"
+        _REPO_ROOT / "csrc/kernels/flash_kda/gfx950/"
         "k2_kda_context_affine_scan_ksplit_kernel.hpp"
     ).read_text()
     replay_kernel = (
-        _REPO_ROOT
-        / "csrc/kernels/flash_kda/gfx950/"
+        _REPO_ROOT / "csrc/kernels/flash_kda/gfx950/"
         "k2_kda_context_parallel_kernel.hpp"
     ).read_text()
     compact_policy = " ".join(policy.split())
@@ -1791,22 +1726,22 @@ def _check_context_equal_dense_n4_g64_policy_static(
             "true-dense K3 N4/G64 shape must not depend on a packed hint"
         )
 
-    capability = cpp_block(
-        policy, "static bool context_equal_dense_n4_g64_enabled("
-    )
+    capability = cpp_block(policy, "static bool context_equal_dense_n4_g64_enabled(")
     capability_contracts = (
         f'std::getenv( "{_CONTEXT_EQUAL_DENSE_N4_G64_ENV}")',
-        "const bool explicit_packed = equal_dense != nullptr && "
-        'std::strcmp(equal_dense, "1") == 0',
-        "const bool automatic_dense = equal_dense == nullptr && "
-        "is_k3_dense_n4_4k_nohint(p)",
+        (
+            "const bool explicit_packed = equal_dense != nullptr && "
+            'std::strcmp(equal_dense, "1") == 0'
+        ),
+        (
+            "const bool automatic_dense = equal_dense == nullptr && "
+            "is_k3_dense_n4_4k_nohint(p)"
+        ),
         "if (!explicit_packed && !automatic_dense)",
-        "const bool packed_geometry = explicit_packed && "
-        "p.cu_seqlens != nullptr",
+        ("const bool packed_geometry = explicit_packed && " "p.cu_seqlens != nullptr"),
         "p.max_seqlen_upper_bound == kSequenceTokens",
         "p.total_tiles == kPackedTiles",
-        "const bool dense_geometry = automatic_dense && "
-        "p.cu_seqlens == nullptr",
+        ("const bool dense_geometry = automatic_dense && " "p.cu_seqlens == nullptr"),
         "p.total_tiles == kDenseTiles",
         "p.H_q != p.H || p.N != kSequences || p.H <= 0",
         "p.T_total != kSequences * kSequenceTokens",
@@ -1833,16 +1768,18 @@ def _check_context_equal_dense_n4_g64_policy_static(
             )
 
     automatic_route_contracts = (
-        "const bool automatic_k3_dense_n4_h12_g64 = "
-        "is_k3_dense_n4_4k_nohint(p)",
-        "group_env == nullptr && direct_value == nullptr && "
-        "affine_value == nullptr && hybrid_value == nullptr",
+        ("const bool automatic_k3_dense_n4_h12_g64 = " "is_k3_dense_n4_4k_nohint(p)"),
+        (
+            "group_env == nullptr && direct_value == nullptr && "
+            "affine_value == nullptr && hybrid_value == nullptr"
+        ),
         f'std::getenv( "{_CONTEXT_EQUAL_DENSE_N4_G64_ENV}") == nullptr',
-        "automatic_k3_dense_n4_h12_g64 || "
-        "automatic_k3_n4_16k_g64",
-        "automatic_dense_n1_h96_g64 || "
-        "automatic_k3_dense_n4_h12_g64 || "
-        "automatic_k3_n4_16k_g64",
+        ("automatic_k3_dense_n4_h12_g64 || " "automatic_k3_n4_16k_g64"),
+        (
+            "automatic_dense_n1_h96_g64 || "
+            "automatic_k3_dense_n4_h12_g64 || "
+            "automatic_k3_n4_16k_g64"
+        ),
     )
     for contract in automatic_route_contracts:
         if contract not in compact_policy:
@@ -1851,11 +1788,12 @@ def _check_context_equal_dense_n4_g64_policy_static(
             )
 
     policy_wiring = (
-        "const bool use_context_equal_dense_n4_g64 = "
-        "context_equal_dense_n4_g64_enabled( p, context_route, "
-        "default_k2_route);",
-        "policy.context_equal_dense_n4_g64 = "
-        "use_context_equal_dense_n4_g64;",
+        (
+            "const bool use_context_equal_dense_n4_g64 = "
+            "context_equal_dense_n4_g64_enabled( p, context_route, "
+            "default_k2_route);"
+        ),
+        ("policy.context_equal_dense_n4_g64 = " "use_context_equal_dense_n4_g64;"),
     )
     for contract in policy_wiring:
         if contract not in compact_policy:
@@ -1875,42 +1813,58 @@ def _check_context_equal_dense_n4_g64_policy_static(
 
     common_contracts = (
         "const int equal_dense_nt = is_varlen ?",
-        "const bool packed_equal_dense_n4_g64 = "
-        "is_varlen && N == 4 && H > 0",
+        ("const bool packed_equal_dense_n4_g64 = " "is_varlen && N == 4 && H > 0"),
         "equal_dense_nt == 256",
         "int64_t(total_tiles) == equal_dense_total_tiles + N",
-        "const bool true_dense_n4_h12_g64 = "
-        "!is_varlen && H_q == 12 && H == 12 && N == 4",
+        (
+            "const bool true_dense_n4_h12_g64 = "
+            "!is_varlen && H_q == 12 && H == 12 && N == 4"
+        ),
         "T_seq == 4096 && p.T_total == 4 * 4096 && NT == 256",
         "int64_t(total_tiles) == equal_dense_total_tiles",
-        "const bool use_context_equal_dense_n4_g64 = "
-        "!is_gva && policy.context_equal_dense_n4_g64 && "
-        "use_context_parallel && (packed_equal_dense_n4_g64 || "
-        "true_dense_n4_h12_g64)",
+        (
+            "const bool use_context_equal_dense_n4_g64 = "
+            "!is_gva && policy.context_equal_dense_n4_g64 && "
+            "use_context_parallel && (packed_equal_dense_n4_g64 || "
+            "true_dense_n4_h12_g64)"
+        ),
         "p.max_seqlen_upper_bound == 4096",
-        "int64_t(p.max_seqlen_upper_bound) * int64_t(N) == "
-        "int64_t(p.T_total)",
+        ("int64_t(p.max_seqlen_upper_bound) * int64_t(N) == " "int64_t(p.T_total)"),
         "policy.context_group_chunks == 64",
         "equal_dense_total_tiles == int64_t(4 * 256)",
         "!policy.context_direct_prefixless",
         "policy.launch_context_prefix == nullptr",
         "policy.context_persistent_blocks == 0",
-        "const bool normalize_packed_equal_dense_n4_g64 = "
-        "use_context_equal_dense_n4_g64 && packed_equal_dense_n4_g64;",
-        "if (is_varlen && !use_context_direct_prefixless && "
-        "!normalize_packed_equal_dense_n4_g64)",
-        "const bool k1_is_varlen = is_varlen && "
-        "!normalize_packed_equal_dense_n4_g64;",
-        "const int k1_total_tiles = normalize_packed_equal_dense_n4_g64 ? "
-        "int(equal_dense_total_tiles) : total_tiles;",
-        "const int k1_nt = normalize_packed_equal_dense_n4_g64 ? "
-        "equal_dense_nt : NT;",
-        "const bool context_is_varlen = is_varlen && "
-        "!normalize_packed_equal_dense_n4_g64;",
-        "use_context_direct_prefixless, use_context_equal_dense_n4_g64, "
-        "context_operands_cached, is_gva, "
-        "policy.context_automatic_gva_packed_nw4, "
-        "policy.context_automatic_gva_equal_n4_g16};",
+        (
+            "const bool normalize_packed_equal_dense_n4_g64 = "
+            "use_context_equal_dense_n4_g64 && packed_equal_dense_n4_g64;"
+        ),
+        (
+            "if (is_varlen && !use_context_direct_prefixless && "
+            "!normalize_packed_equal_dense_n4_g64)"
+        ),
+        (
+            "const bool k1_is_varlen = is_varlen && "
+            "!normalize_packed_equal_dense_n4_g64;"
+        ),
+        (
+            "const int k1_total_tiles = normalize_packed_equal_dense_n4_g64 ? "
+            "int(equal_dense_total_tiles) : total_tiles;"
+        ),
+        (
+            "const int k1_nt = normalize_packed_equal_dense_n4_g64 ? "
+            "equal_dense_nt : NT;"
+        ),
+        (
+            "const bool context_is_varlen = is_varlen && "
+            "!normalize_packed_equal_dense_n4_g64;"
+        ),
+        (
+            "use_context_direct_prefixless, use_context_equal_dense_n4_g64, "
+            "context_operands_cached, is_gva, "
+            "policy.context_automatic_gva_packed_nw4, "
+            "policy.context_automatic_gva_equal_n4_g16};"
+        ),
     )
     for contract in common_contracts:
         if contract not in compact_common:
@@ -1919,15 +1873,16 @@ def _check_context_equal_dense_n4_g64_policy_static(
             )
 
     launch_contracts = (
-        "const bool equal_dense_n4_g64 = !a.is_gva && "
-        "a.equal_dense_n4_g64 && "
-        "!a.is_varlen && a.N == 4 && a.T_seq == 4096 && a.NT == 256 && "
-        "a.total_tiles == 1024",
+        (
+            "const bool equal_dense_n4_g64 = !a.is_gva && "
+            "a.equal_dense_n4_g64 && "
+            "!a.is_varlen && a.N == 4 && a.T_seq == 4096 && a.NT == 256 && "
+            "a.total_tiles == 1024"
+        ),
         "packed_automatic_n4_16k_g64 || equal_dense_n4_g64",
         "(!a.is_varlen && a.N == 1) || equal_dense_n4_g64",
         "context_upper = a.N * groups_per_sequence;",
-        "GROUP_CHUNKS, KdaContextMode::kReplay, HO, FP, VL, false, "
-        "CONTEXT_NW, 0",
+        ("GROUP_CHUNKS, KdaContextMode::kReplay, HO, FP, VL, false, " "CONTEXT_NW, 0"),
         "k2_kda_context_affine_ab_fused_equal_n4_g64_nw4_kernel",
         "k2_kda_context_affine_ab_fused_equal_n4_g64_stage_early_nw4_kernel",
     )
@@ -1961,19 +1916,15 @@ def _check_context_equal_dense_n4_g64_policy_static(
                 "equal-dense N4/G64 kernel mapping changed: " + contract
             )
 
-    dense_scan = cpp_block(
-        scan_kernel, "k2_kda_context_affine_scan_ksplit_wg4_kernel("
-    )
+    dense_scan = cpp_block(scan_kernel, "k2_kda_context_affine_scan_ksplit_wg4_kernel(")
     scan_contracts = (
         "const int seq = bh / H;",
-        "const int groups_per_sequence = "
-        "(NT + GROUP_CHUNKS - 1) / GROUP_CHUNKS;",
+        ("const int groups_per_sequence = " "(NT + GROUP_CHUNKS - 1) / GROUP_CHUNKS;"),
         "context_base = seq * groups_per_sequence;",
         "context_count = groups_per_sequence;",
         "const int64_t state_slab = (int64_t(seq) * H + h) * D * D;",
         "const int global_context = context_base + local_group;",
-        "const int64_t context_slab = "
-        "(int64_t(global_context) * H + h) * D * D;",
+        ("const int64_t context_slab = " "(int64_t(global_context) * H + h) * D * D;"),
     )
     for contract in scan_contracts:
         if contract not in dense_scan:
@@ -1981,9 +1932,7 @@ def _check_context_equal_dense_n4_g64_policy_static(
                 "equal-dense N4/G64 K-split mapping changed: " + contract
             )
 
-    dense_replay = cpp_block(
-        replay_kernel, "k2_kda_context_parallel_nw4_kernel("
-    )
+    dense_replay = cpp_block(replay_kernel, "k2_kda_context_parallel_nw4_kernel(")
     replay_contracts = (
         "if (global_context >= N * groups_per_sequence) return;",
         "const int launch_seq = global_context / groups_per_sequence;",
@@ -1994,8 +1943,10 @@ def _check_context_equal_dense_n4_g64_policy_static(
         "ht_sequence_base = (seq * H + h) * NT;",
         "t_sequence_base = seq * T_seq;",
         "const int first_chunk = DIRECT ? 0 : local_group * GROUP_CHUNKS;",
-        "const bool is_last_group = DENSE_N1_H12 || "
-        "first_chunk + group_chunks == seq_chunks;",
+        (
+            "const bool is_last_group = DENSE_N1_H12 || "
+            "first_chunk + group_chunks == seq_chunks;"
+        ),
         ": (int64_t(seq) * H + h) * D * D;",
     )
     for contract in replay_contracts:
@@ -2018,10 +1969,7 @@ def _check_context_equal_dense_n4_g64_policy_static(
         direct_max_chunks: int = 0,
     ) -> bool:
         explicit_packed = (
-            value == "1"
-            and packed
-            and bound == 4096
-            and total_tiles == 1028
+            value == "1" and packed and bound == 4096 and total_tiles == 1028
         )
         automatic_dense = (
             value is None
@@ -2040,15 +1988,11 @@ def _check_context_equal_dense_n4_g64_policy_static(
 
     for spelling in (None, "", "0", "01", "true", "1 ", " 1"):
         if selected(spelling, packed=True):
-            raise AssertionError(
-                f"equal-dense parser accepted fallback {spelling!r}"
-            )
+            raise AssertionError(f"equal-dense parser accepted fallback {spelling!r}")
     if not selected("1", packed=True):
         raise AssertionError("equal-dense parser rejected canonical '1'")
     for bound in (0, 4096):
-        if not selected(
-            None, packed=False, bound=bound, total_tiles=1024
-        ):
+        if not selected(None, packed=False, bound=bound, total_tiles=1024):
             raise AssertionError(
                 "true-dense K3 route depended on optional max-seqlen hint"
             )
@@ -2061,9 +2005,7 @@ def _check_context_equal_dense_n4_g64_policy_static(
         {"direct_max_chunks": 64},
     ):
         if selected("1", packed=True, **mismatch):
-            raise AssertionError(
-                f"equal-dense whole-graph guard accepted {mismatch}"
-            )
+            raise AssertionError(f"equal-dense whole-graph guard accepted {mismatch}")
     for mismatch in (
         {"q_heads": 2, "value_heads": 4},
         {"q_heads": 11, "value_heads": 12},
@@ -2082,9 +2024,7 @@ def _check_context_equal_dense_n4_g64_policy_static(
         dense_args = {"packed": False, "bound": 0, "total_tiles": 1024}
         dense_args.update(mismatch)
         if selected(None, **dense_args):
-            raise AssertionError(
-                f"true-dense K3 whole-graph guard accepted {mismatch}"
-            )
+            raise AssertionError(f"true-dense K3 whole-graph guard accepted {mismatch}")
     for spelling in ("", "0", "1", "01", "true", "1 ", " 1"):
         if selected(spelling, packed=False, bound=0, total_tiles=1024):
             raise AssertionError(
@@ -2132,11 +2072,15 @@ def _check_dense_n1_h96_policy_static(policy: str) -> None:
 
     group_contracts = (
         "requested_group == 128 || automatic_dense_n1_h96_g128",
-        "requested_group == 64 || automatic_equal_n4_g64 || "
-        "automatic_dense_n1_h96_g64 || "
-        "automatic_k3_dense_n4_h12_g64",
-        "automatic_equal_n4_g64 || automatic_k3_dense_n4_h12_g64 || "
-        "automatic_k3_n4_16k_g64 || automatic_dense_n1_h96_g64",
+        (
+            "requested_group == 64 || automatic_equal_n4_g64 || "
+            "automatic_dense_n1_h96_g64 || "
+            "automatic_k3_dense_n4_h12_g64"
+        ),
+        (
+            "automatic_equal_n4_g64 || automatic_k3_dense_n4_h12_g64 || "
+            "automatic_k3_n4_16k_g64 || automatic_dense_n1_h96_g64"
+        ),
         "else if (automatic_dense_n1_h96_g128) { group_chunks = 128; }",
     )
     for contract in group_contracts:
@@ -2145,9 +2089,7 @@ def _check_dense_n1_h96_policy_static(policy: str) -> None:
                 "dense-N1 H96 route/group selection changed: " + contract
             )
 
-    fused_guard = statement(
-        "const bool automatic_dense_n1_h96_fused ="
-    )
+    fused_guard = statement("const bool automatic_dense_n1_h96_fused =")
     fused_contracts = (
         "!a.is_gva",
         "!a.is_varlen",
@@ -2163,9 +2105,7 @@ def _check_dense_n1_h96_policy_static(policy: str) -> None:
     )
     for contract in fused_contracts:
         if contract not in fused_guard:
-            raise AssertionError(
-                "dense-N1 H96 fused A/B guard changed: " + contract
-            )
+            raise AssertionError("dense-N1 H96 fused A/B guard changed: " + contract)
     if "automatic_dense_n1_h96_fused ||" not in statement(
         "const bool fuse_affine_ab ="
     ):
@@ -2236,8 +2176,7 @@ def check_context_affine_ab_fused_policy_static() -> None:
     policy = policy_path.read_text()
     compact = " ".join(policy.split())
     kernel_path = (
-        _REPO_ROOT
-        / "csrc/kernels/flash_kda/gfx950/"
+        _REPO_ROOT / "csrc/kernels/flash_kda/gfx950/"
         "k2_kda_context_affine_ab_fused_kernel.hpp"
     )
     kernel = kernel_path.read_text()
@@ -2252,14 +2191,10 @@ def check_context_affine_ab_fused_policy_static() -> None:
     if parser_start < 0 or parser_end < 0:
         raise AssertionError("policy is missing the affine B/A fused parser")
     parser = " ".join(policy[parser_start:parser_end].split())
-    if (
-        'std::getenv("FLASH_KDA_GFX950_CONTEXT_AFFINE_AB_FUSED")'
-        not in parser
-    ):
+    if 'std::getenv("FLASH_KDA_GFX950_CONTEXT_AFFINE_AB_FUSED")' not in parser:
         raise AssertionError("affine B/A fused parser reads the wrong env")
     explicit_return = (
-        "if (value != nullptr) return value[0] == '1' && "
-        "value[1] == '\\0';"
+        "if (value != nullptr) return value[0] == '1' && " "value[1] == '\\0';"
     )
     default_return = "return group_chunks == 8 || group_chunks == 16;"
     if explicit_return not in parser or default_return not in parser:
@@ -2273,40 +2208,32 @@ def check_context_affine_ab_fused_policy_static() -> None:
     stage_parser_end = policy.find("\n    }", stage_parser_start)
     if stage_parser_start < 0 or stage_parser_end < 0:
         raise AssertionError("policy is missing the affine B/A stage-early parser")
-    stage_parser = " ".join(
-        policy[stage_parser_start:stage_parser_end].split()
-    )
+    stage_parser = " ".join(policy[stage_parser_start:stage_parser_end].split())
     if (
         'std::getenv( "FLASH_KDA_GFX950_CONTEXT_AFFINE_AB_STAGE_EARLY")'
         not in stage_parser
         or "return value != nullptr && value[0] == '1' && "
         "value[1] == '\\0';" not in stage_parser
     ):
-        raise AssertionError(
-            "affine B/A stage-early parser is not exact-'1'"
-        )
+        raise AssertionError("affine B/A stage-early parser is not exact-'1'")
 
     context_launch_start = compact.find(
         "static void launch_context_parallel(const ContextParallelLaunch& a)"
     )
     if context_launch_start < 0:
-        raise AssertionError(
-            "policy is missing the established context launcher"
-        )
+        raise AssertionError("policy is missing the established context launcher")
     automatic_guard_start = compact.find(
         "const bool packed_automatic_n4_16k_g64 =", context_launch_start
     )
     automatic_guard_end = compact.find(";", automatic_guard_start)
     if automatic_guard_start < 0 or automatic_guard_end < 0:
-        raise AssertionError(
-            "policy is missing the automatic packed N4/G64 guard"
-        )
-    automatic_n4_g64_guard = compact[
-        automatic_guard_start : automatic_guard_end + 1
-    ]
+        raise AssertionError("policy is missing the automatic packed N4/G64 guard")
+    automatic_n4_g64_guard = compact[automatic_guard_start : automatic_guard_end + 1]
     automatic_guard_contracts = (
-        "packed_automatic_n4_16k_g64 = "
-        "!a.is_gva && a.is_varlen && a.N == 4 && a.T_seq == 4096",
+        (
+            "packed_automatic_n4_16k_g64 = "
+            "!a.is_gva && a.is_varlen && a.N == 4 && a.T_seq == 4096"
+        ),
         "group_chunks == 64 && direct_max_chunks == 0",
         '!env_exact("FLASH_KDA_GFX950_CONTEXT_DIRECT", "1")',
         '!env_exact("FLASH_KDA_GFX950_CONTEXT_AFFINE", "1")',
@@ -2316,8 +2243,7 @@ def check_context_affine_ab_fused_policy_static() -> None:
     for contract in automatic_guard_contracts:
         if contract not in automatic_n4_g64_guard:
             raise AssertionError(
-                "affine B/A fusion lost its exact packed N4/G64 guard: "
-                f"{contract}"
+                "affine B/A fusion lost its exact packed N4/G64 guard: " f"{contract}"
             )
     effective_guard = (
         "const bool fuse_affine_ab = "
@@ -2332,8 +2258,7 @@ def check_context_affine_ab_fused_policy_static() -> None:
     )
     effective_guard = effective_guard.replace(
         "(a.is_varlen || (!a.is_varlen && a.N == 1))",
-        "(a.is_varlen || (!a.is_varlen && a.N == 1) || "
-        "equal_dense_n4_g64)",
+        "(a.is_varlen || (!a.is_varlen && a.N == 1) || " "equal_dense_n4_g64)",
     )
     if effective_guard not in compact:
         raise AssertionError(
@@ -2349,18 +2274,23 @@ def check_context_affine_ab_fused_policy_static() -> None:
             "affine B/A stage-early selector lost its fused/G64/dense-G16 guard"
         )
     scan_nw_contracts = (
-        "const char* scan_nw_env = std::getenv( "
-        '"FLASH_KDA_GFX950_CONTEXT_SCAN_NW");',
-        "const bool automatic_gva_scan_nw4 = "
-        "automatic_gva_packed_nw4 && scan_nw_env == nullptr",
-        "const int scan_nw = scan_nw_env ? std::atoi(scan_nw_env) : "
-        "automatic_gva_scan_nw4 ? 4 : 2;",
+        (
+            "const char* scan_nw_env = std::getenv( "
+            '"FLASH_KDA_GFX950_CONTEXT_SCAN_NW");'
+        ),
+        (
+            "const bool automatic_gva_scan_nw4 = "
+            "automatic_gva_packed_nw4 && scan_nw_env == nullptr"
+        ),
+        (
+            "const int scan_nw = scan_nw_env ? std::atoi(scan_nw_env) : "
+            "automatic_gva_scan_nw4 ? 4 : 2;"
+        ),
     )
     for contract in scan_nw_contracts:
         if contract not in compact:
             raise AssertionError(
-                "affine scan lost its NW2/GVA-NW4 selection contract: "
-                + contract
+                "affine scan lost its NW2/GVA-NW4 selection contract: " + contract
             )
     for experiment in (
         "SCAN_KSPLIT",
@@ -2368,9 +2298,7 @@ def check_context_affine_ab_fused_policy_static() -> None:
         "SCAN_B_PHASED",
     ):
         contract = (
-            'std::getenv( "FLASH_KDA_GFX950_CONTEXT_'
-            + experiment
-            + '") == nullptr'
+            'std::getenv( "FLASH_KDA_GFX950_CONTEXT_' + experiment + '") == nullptr'
         )
         if contract not in compact:
             raise AssertionError(
@@ -2378,16 +2306,16 @@ def check_context_affine_ab_fused_policy_static() -> None:
                 + experiment
             )
     compile_guards = (
-        "CONTEXT_NW == 4 && CACHED_OPERANDS && U_FORWARD && "
-        "V_FORWARD && !LDS_PIPELINE_B && !LDS_PIPELINE_A",
+        (
+            "CONTEXT_NW == 4 && CACHED_OPERANDS && U_FORWARD && "
+            "V_FORWARD && !LDS_PIPELINE_B && !LDS_PIPELINE_A"
+        ),
         "if (fuse_affine_ab)",
         "if constexpr (VL)",
     )
     for guard in compile_guards:
         if guard not in compact:
-            raise AssertionError(
-                f"affine B/A fused compile guard is missing: {guard}"
-            )
+            raise AssertionError(f"affine B/A fused compile guard is missing: {guard}")
 
     packed_symbol = "k2_kda_context_affine_ab_fused_nw4_kernel<"
     dense_symbol = "k2_kda_context_affine_ab_fused_dense_nw4_kernel<"
@@ -2396,16 +2324,9 @@ def check_context_affine_ab_fused_policy_static() -> None:
             "policy must contain one established packed launch, one nested "
             "persistent reuse, and one dense-N1 fused launch"
         )
-    packed_stage_symbol = (
-        "k2_kda_context_affine_ab_fused_stage_early_g64_nw4_kernel"
-    )
-    dense_stage_symbol = (
-        "k2_kda_context_affine_ab_fused_dense_stage_early_nw4_kernel<"
-    )
-    if (
-        policy.count(packed_stage_symbol) != 1
-        or policy.count(dense_stage_symbol) != 1
-    ):
+    packed_stage_symbol = "k2_kda_context_affine_ab_fused_stage_early_g64_nw4_kernel"
+    dense_stage_symbol = "k2_kda_context_affine_ab_fused_dense_stage_early_nw4_kernel<"
+    if policy.count(packed_stage_symbol) != 1 or policy.count(dense_stage_symbol) != 1:
         raise AssertionError(
             "policy must contain one packed-G64 and one dense stage-early launch"
         )
@@ -2418,9 +2339,7 @@ def check_context_affine_ab_fused_policy_static() -> None:
             "stage-early dispatch must guard packed, dense-N1 and exact-N4 "
             "candidate/rollback symbols"
         )
-    persistent_start = policy.find(
-        "static void launch_context_parallel_persistent("
-    )
+    persistent_start = policy.find("static void launch_context_parallel_persistent(")
     established_start = policy.find(
         "static void launch_context_parallel(", persistent_start
     )
@@ -2453,22 +2372,15 @@ def check_context_affine_ab_fused_policy_static() -> None:
         ("dense-N1", dense_launch_abi),
     ):
         if launch_abi not in compact:
-            raise AssertionError(
-                f"affine B/A fused {layout} launch ABI wiring changed"
-            )
+            raise AssertionError(f"affine B/A fused {layout} launch ABI wiring changed")
 
-    stage_early_start = kernel.find(
-        "// Strict-opt-in next-stage-early experiment."
-    )
-    dense_start = kernel.find(
-        "k2_kda_context_affine_ab_fused_dense_nw4_kernel("
-    )
+    stage_early_start = kernel.find("// Strict-opt-in next-stage-early experiment.")
+    dense_start = kernel.find("k2_kda_context_affine_ab_fused_dense_nw4_kernel(")
     if dense_start < 0 or stage_early_start <= dense_start:
         raise AssertionError("dense-N1 fused kernel is missing")
     dense_body = kernel[dense_start:stage_early_start]
     if any(
-        token in dense_body
-        for token in ("cu_seqlens", "tile_prefix", "context_prefix")
+        token in dense_body for token in ("cu_seqlens", "tile_prefix", "context_prefix")
     ):
         raise AssertionError("dense-N1 fused kernel depends on packed metadata")
     dense_compact = " ".join(dense_body.split())
@@ -2477,9 +2389,7 @@ def check_context_affine_ab_fused_policy_static() -> None:
         "GROUP_CHUNKS == 32 || GROUP_CHUNKS == 64 || GROUP_CHUNKS == 128"
     )
     if dense_groups not in dense_compact:
-        raise AssertionError(
-            "dense-N1 fused kernel lost its G8/G16/G32/G64/G128 guard"
-        )
+        raise AssertionError("dense-N1 fused kernel lost its G8/G16/G32/G64/G128 guard")
 
     def source_function(name: str) -> str:
         start = kernel.find(name)
@@ -2549,8 +2459,16 @@ def check_context_affine_ab_fused_policy_static() -> None:
         "affine_a[idx] = f32_to_bf16(areg[ktile][i]);", write_b
     )
     if not (
-        0 <= next_stage < b_advance < dependency_fence < a_advance
-        < first_barrier < next_commit < second_barrier < write_b < write_a
+        0
+        <= next_stage
+        < b_advance
+        < dependency_fence
+        < a_advance
+        < first_barrier
+        < next_commit
+        < second_barrier
+        < write_b
+        < write_a
     ):
         raise AssertionError(
             "stage-early kernel changed arithmetic/barrier/commit/writeback order"
@@ -2564,9 +2482,7 @@ def check_context_affine_ab_fused_policy_static() -> None:
     )
     for contract in fallback_contracts:
         if contract not in compact:
-            raise AssertionError(
-                f"affine B/A established fallback changed: {contract}"
-            )
+            raise AssertionError(f"affine B/A established fallback changed: {contract}")
 
     launch_start = context_launch_start
     direct_start = compact.find("if (direct) {", launch_start)
@@ -2615,9 +2531,7 @@ def check_context_affine_ab_fused_policy_static() -> None:
     }
     for spelling in (None, "", "0", "01", "true", "1 ", " 1"):
         if enabled(spelling, **base):
-            raise AssertionError(
-                f"static fused parser accepted fallback {spelling!r}"
-            )
+            raise AssertionError(f"static fused parser accepted fallback {spelling!r}")
     if not enabled("1", **base):
         raise AssertionError("static fused parser rejected valid packed layout")
     for group_chunks in (8, 16):
@@ -2635,9 +2549,7 @@ def check_context_affine_ab_fused_policy_static() -> None:
         "automatic_equal_n4_g64": True,
     }
     if not enabled(None, **automatic_n4_g64):
-        raise AssertionError(
-            "static fused guard rejected automatic packed N4/G64"
-        )
+        raise AssertionError("static fused guard rejected automatic packed N4/G64")
     if enabled("0", **automatic_n4_g64):
         raise AssertionError(
             "static fused guard ignored exact-0 packed N4/G64 rollback"
@@ -2692,11 +2604,7 @@ def check_context_affine_ab_fused_policy_static() -> None:
     def resolved_scan_nw(
         value: str | None, *, automatic_gva_scan_nw4: bool = False
     ) -> int:
-        return (
-            int(value)
-            if value is not None
-            else 4 if automatic_gva_scan_nw4 else 2
-        )
+        return int(value) if value is not None else 4 if automatic_gva_scan_nw4 else 2
 
     if resolved_scan_nw(None) != 2:
         raise AssertionError("static affine scan NW2 default changed")
@@ -2704,9 +2612,7 @@ def check_context_affine_ab_fused_policy_static() -> None:
         raise AssertionError("static automatic GVA affine scan NW4 changed")
     for explicit_nw in (1, 2, 4):
         if (
-            resolved_scan_nw(
-                str(explicit_nw), automatic_gva_scan_nw4=True
-            )
+            resolved_scan_nw(str(explicit_nw), automatic_gva_scan_nw4=True)
             != explicit_nw
         ):
             raise AssertionError(
@@ -2728,9 +2634,7 @@ def check_context_affine_ab_fused_policy_static() -> None:
     for override in fallbacks:
         configuration = {**base, **override}
         if enabled("1", **configuration):
-            raise AssertionError(
-                f"static affine B/A fused guard accepted {override}"
-            )
+            raise AssertionError(f"static affine B/A fused guard accepted {override}")
         stage_configuration = {**base, "group_chunks": 64, **override}
         if stage_early_enabled(
             "1",
@@ -2773,17 +2677,14 @@ def check_context_scan_ksplit_policy_static() -> None:
 
     policy_path = _REPO_ROOT / "csrc/kernels/flash_kda/gfx950/policy.hpp"
     kernel_path = (
-        _REPO_ROOT
-        / "csrc/kernels/flash_kda/gfx950/"
+        _REPO_ROOT / "csrc/kernels/flash_kda/gfx950/"
         "k2_kda_context_affine_scan_ksplit_kernel.hpp"
     )
     policy = policy_path.read_text()
     kernel = kernel_path.read_text()
     compact_policy = " ".join(policy.split())
     original_symbol = "k2_kda_context_affine_scan_ksplit_wg4_kernel("
-    prefetch_symbol = (
-        "k2_kda_context_affine_scan_ksplit_prefetch_b_g64_wg4_kernel("
-    )
+    prefetch_symbol = "k2_kda_context_affine_scan_ksplit_prefetch_b_g64_wg4_kernel("
     original_start = kernel.find(original_symbol)
     prefetch_start = kernel.find(prefetch_symbol)
     if original_start < 0 or prefetch_start <= original_start:
@@ -2803,10 +2704,7 @@ def check_context_scan_ksplit_policy_static() -> None:
     parser = " ".join(policy[parser_start:parser_end].split())
     if f'std::getenv("{_CONTEXT_SCAN_KSPLIT_ENV}")' not in parser:
         raise AssertionError("K-split parser reads the wrong environment")
-    exact_return = (
-        "return value != nullptr && value[0] == '1' && "
-        "value[1] == '\\0';"
-    )
+    exact_return = "return value != nullptr && value[0] == '1' && " "value[1] == '\\0';"
     if exact_return not in parser:
         raise AssertionError("K-split parser is not exact-'1'")
 
@@ -2863,12 +2761,16 @@ def check_context_scan_ksplit_policy_static() -> None:
             "policy must contain exactly one G64 K-split prefetch-b launch"
         )
     prefetch_policy_contracts = (
-        "const bool scan_ksplit_prefetch_b = scan_ksplit && "
-        "context_scan_ksplit_prefetch_b_enabled();",
+        (
+            "const bool scan_ksplit_prefetch_b = scan_ksplit && "
+            "context_scan_ksplit_prefetch_b_enabled();"
+        ),
         "if constexpr (GROUP_CHUNKS == 64)",
         "if (scan_ksplit_prefetch_b)",
-        "k2_kda_context_affine_scan_ksplit_prefetch_b_g64_wg4_kernel< "
-        "HI, HO, FP, VL>",
+        (
+            "k2_kda_context_affine_scan_ksplit_prefetch_b_g64_wg4_kernel< "
+            "HI, HO, FP, VL>"
+        ),
     )
     for contract in prefetch_policy_contracts:
         if contract not in compact_policy:
@@ -2884,9 +2786,7 @@ def check_context_scan_ksplit_policy_static() -> None:
     )
     for contract in launch_contracts:
         if contract not in compact_policy:
-            raise AssertionError(
-                f"K-split launch ABI is missing contract: {contract}"
-            )
+            raise AssertionError(f"K-split launch ABI is missing contract: {contract}")
 
     kernel_contracts = (
         "const int vhalf = wave & 1;",
@@ -2901,9 +2801,7 @@ def check_context_scan_ksplit_policy_static() -> None:
     )
     for contract in kernel_contracts:
         if contract not in compact_kernel:
-            raise AssertionError(
-                f"K-split kernel mapping changed: missing {contract}"
-            )
+            raise AssertionError(f"K-split kernel mapping changed: missing {contract}")
     if original_kernel.count("__syncthreads();") != 2:
         raise AssertionError(
             "original K-split must retain exactly two barriers per group"
@@ -2940,11 +2838,7 @@ def check_context_scan_ksplit_policy_static() -> None:
         b_phased: bool,
         automatic_equal_n4_g64: bool,
     ) -> bool:
-        automatic = (
-            automatic_equal_n4_g64
-            and scan_nw_value is None
-            and value is None
-        )
+        automatic = automatic_equal_n4_g64 and scan_nw_value is None and value is None
         scan_nw = int(scan_nw_value) if scan_nw_value is not None else 2
         return (
             (value == "1" or automatic)
@@ -3006,9 +2900,7 @@ def check_context_scan_ksplit_policy_static() -> None:
     )
     for override in fallbacks:
         if enabled("1", **{**base, **override}):
-            raise AssertionError(
-                f"static K-split guard accepted fallback {override}"
-            )
+            raise AssertionError(f"static K-split guard accepted fallback {override}")
     print(
         "PASS static affine-scan K-split exact parser, WG4 K/V mapping, "
         "single-axis isolation, and dense-N1/packed-affine fallback guard"
@@ -3025,15 +2917,9 @@ def check_context_persistent_policy_static() -> None:
     raw_abi_path = _REPO_ROOT / "csrc/kernels/flash_kda/flash_kda_aiter.cu"
     workspace_cpp_path = _REPO_ROOT / "csrc/kernels/flash_kda/hip_workspace.cpp"
     kernel_root = _REPO_ROOT / "csrc/kernels/flash_kda/gfx950"
-    fused_path = (
-        kernel_root / "k2_kda_context_affine_ab_fused_persistent_kernel.hpp"
-    )
-    compact_path = (
-        kernel_root / "k2_kda_context_hybrid_compact_scan_kernel.hpp"
-    )
-    replay_path = (
-        kernel_root / "k2_kda_context_hybrid_persistent_replay_kernel.hpp"
-    )
+    fused_path = kernel_root / "k2_kda_context_affine_ab_fused_persistent_kernel.hpp"
+    compact_path = kernel_root / "k2_kda_context_hybrid_compact_scan_kernel.hpp"
+    replay_path = kernel_root / "k2_kda_context_hybrid_persistent_replay_kernel.hpp"
     policy = policy_path.read_text()
     common = common_path.read_text()
     launch = launch_path.read_text()
@@ -3043,7 +2929,7 @@ def check_context_persistent_policy_static() -> None:
     fused = fused_path.read_text()
     compact_kernel = compact_path.read_text()
     replay = replay_path.read_text()
-    compact_policy = " ".join(policy.split())
+    " ".join(policy.split())
     compact_common = " ".join(common.split())
     compact_launch = " ".join(launch.split())
     compact_workspace = " ".join(workspace.split())
@@ -3087,8 +2973,7 @@ def check_context_persistent_policy_static() -> None:
     )
     if (
         "const char* value = std::getenv(name);" not in exact_helper
-        or "value != nullptr && std::strcmp(value, expected) == 0"
-        not in exact_helper
+        or "value != nullptr && std::strcmp(value, expected) == 0" not in exact_helper
     ):
         raise AssertionError("persistent env_exact helper is not exact-string")
     optional_helper = " ".join(
@@ -3115,9 +3000,7 @@ def check_context_persistent_policy_static() -> None:
         f'env_exact( "{_CONTEXT_PERSISTENT_ESTABLISHED_AB_ENV}", "1")'
         not in established_ab_helper
     ):
-        raise AssertionError(
-            "persistent established-AB parser is not exact-string"
-        )
+        raise AssertionError("persistent established-AB parser is not exact-string")
 
     guard = " ".join(
         cpp_block(policy, "static bool context_persistent_enabled(").split()
@@ -3173,15 +3056,17 @@ def check_context_persistent_policy_static() -> None:
                 f"persistent complete host guard is missing {contract}"
             )
 
-    make = " ".join(
-        cpp_block(policy, "static HipLaunchPolicy make(").split()
-    )
+    make = " ".join(cpp_block(policy, "static HipLaunchPolicy make(").split())
     make_contracts = (
-        "const bool use_context_persistent = context_persistent_enabled( "
-        "p, device, context_route, default_k2_route);",
-        "if (use_context_persistent) { "
-        "policy.launch_context_prefix = &launch_context_persistent_prefix; "
-        "policy.context_persistent_blocks = device.cu_count; }",
+        (
+            "const bool use_context_persistent = context_persistent_enabled( "
+            "p, device, context_route, default_k2_route);"
+        ),
+        (
+            "if (use_context_persistent) { "
+            "policy.launch_context_prefix = &launch_context_persistent_prefix; "
+            "policy.context_persistent_blocks = device.cu_count; }"
+        ),
     )
     for contract in make_contracts:
         if contract not in make:
@@ -3192,8 +3077,10 @@ def check_context_persistent_policy_static() -> None:
     common_contracts = (
         "const int* sequence_worklist; const int* sequence_count;",
         "int context_persistent_blocks;",
-        "PersistentPrefixLauncher launch_context_prefix = nullptr; "
-        "int context_persistent_blocks = 0;",
+        (
+            "PersistentPrefixLauncher launch_context_prefix = nullptr; "
+            "int context_persistent_blocks = 0;"
+        ),
     )
     for contract in common_contracts:
         if contract not in compact_common:
@@ -3213,14 +3100,15 @@ def check_context_persistent_policy_static() -> None:
         or "WorkspaceSizes::prefix_bytes(N)" not in compact_workspace_cpp
     ):
         raise AssertionError(
-            "descriptor/raw workspace sizing disagrees with the expanded "
-            "prefix ABI"
+            "descriptor/raw workspace sizing disagrees with the expanded " "prefix ABI"
         )
 
     launch_contracts = (
-        "const bool use_context_persistent = use_context_parallel && "
-        "!is_gva && is_varlen && policy.launch_context_prefix != nullptr && "
-        "policy.context_persistent_blocks > 0;",
+        (
+            "const bool use_context_persistent = use_context_parallel && "
+            "!is_gva && is_varlen && policy.launch_context_prefix != nullptr && "
+            "policy.context_persistent_blocks > 0;"
+        ),
         "else if (use_context_persistent)",
         "policy.launch_context_prefix(args);",
         "segment_prefix, sequence_worklist, sequence_count,",
@@ -3233,9 +3121,7 @@ def check_context_persistent_policy_static() -> None:
             )
 
     prefix_launcher = " ".join(
-        cpp_block(
-            policy, "static void launch_context_persistent_prefix("
-        ).split()
+        cpp_block(policy, "static void launch_context_persistent_prefix(").split()
     )
     if (
         "k1_build_tile_prefix_hybrid_g64_compact_kernel "
@@ -3246,19 +3132,21 @@ def check_context_persistent_policy_static() -> None:
         raise AssertionError("persistent prefix callback ABI changed")
 
     persistent_launch = " ".join(
-        cpp_block(
-            policy, "static void launch_context_parallel_persistent("
-        ).split()
+        cpp_block(policy, "static void launch_context_parallel_persistent(").split()
     )
     stage_contracts = (
         "const dim3 persistent_grid(a.context_persistent_blocks);",
-        "const bool use_established_ab = "
-        "context_persistent_established_ab_enabled();",
+        (
+            "const bool use_established_ab = "
+            "context_persistent_established_ab_enabled();"
+        ),
         "dispatch_state_mode<true>(",
         "kHybridCompactDirectMaxChunks, true, true, true, false>",
         "k2_kda_context_affine_ab_fused_persistent_g64_nw4_kernel",
-        "k2_kda_context_affine_scan_hybrid_g64_compact_grid_stride_nw2_kernel< "
-        "HI, HO, FP>",
+        (
+            "k2_kda_context_affine_scan_hybrid_g64_compact_grid_stride_nw2_kernel< "
+            "HI, HO, FP>"
+        ),
         "k2_kda_context_replay_hybrid_g64_grid_stride_nw4_kernel<HO, FP>",
     )
     for contract in stage_contracts:
@@ -3269,22 +3157,24 @@ def check_context_persistent_policy_static() -> None:
     established_ab_contracts = (
         "if (use_established_ab) {",
         "a.total_tiles / (kHybridCompactDirectMaxChunks + 1)",
-        "int64_t(max_affine_sequences) * "
-        "(kHybridCompactGroupChunks - 1)",
+        ("int64_t(max_affine_sequences) * " "(kHybridCompactGroupChunks - 1)"),
         "const int context_upper = std::max(1, int(upper));",
         "const dim3 established_ab_grid(context_upper * a.H, 2);",
-        "k2_kda_context_affine_ab_fused_nw4_kernel< "
-        "kHybridCompactGroupChunks> "
-        "<<<established_ab_grid, 256, 0, a.stream>>>",
-        "} else { "
-        "k2_kda_context_affine_ab_fused_persistent_g64_nw4_kernel "
-        "<<<persistent_grid, 256, 0, a.stream>>>",
+        (
+            "k2_kda_context_affine_ab_fused_nw4_kernel< "
+            "kHybridCompactGroupChunks> "
+            "<<<established_ab_grid, 256, 0, a.stream>>>"
+        ),
+        (
+            "} else { "
+            "k2_kda_context_affine_ab_fused_persistent_g64_nw4_kernel "
+            "<<<persistent_grid, 256, 0, a.stream>>>"
+        ),
     )
     for contract in established_ab_contracts:
         if contract not in persistent_launch:
             raise AssertionError(
-                "persistent established-AB nested graph is missing: "
-                f"{contract}"
+                "persistent established-AB nested graph is missing: " f"{contract}"
             )
     if persistent_launch.count("<<<established_ab_grid") != 1:
         raise AssertionError(
@@ -3321,11 +3211,14 @@ def check_context_persistent_policy_static() -> None:
             raise AssertionError(
                 f"persistent K2 gate is missing matched contract: {contract}"
             )
-    if any(symbol in dispatch[fallback_start:] for symbol in (
-        "affine_ab_fused_persistent_g64_nw4",
-        "affine_scan_hybrid_g64_compact_grid_stride_nw2",
-        "replay_hybrid_g64_grid_stride_nw4",
-    )):
+    if any(
+        symbol in dispatch[fallback_start:]
+        for symbol in (
+            "affine_ab_fused_persistent_g64_nw4",
+            "affine_scan_hybrid_g64_compact_grid_stride_nw2",
+            "replay_hybrid_g64_grid_stride_nw4",
+        )
+    ):
         raise AssertionError("persistent symbols leaked into fallback dispatch")
 
     kernel_contracts = (
@@ -3336,8 +3229,7 @@ def check_context_persistent_policy_static() -> None:
         ),
         (
             compact_kernel,
-            "k2_kda_context_affine_scan_hybrid_g64_compact_grid_stride_"
-            "nw2_kernel",
+            ("k2_kda_context_affine_scan_hybrid_g64_compact_grid_stride_" "nw2_kernel"),
             "sequence_count[0]",
         ),
         (
@@ -3368,9 +3260,7 @@ def check_context_persistent_policy_static() -> None:
     )
     for contract in prefix_contracts:
         if contract not in compact_kernel:
-            raise AssertionError(
-                f"persistent compact prefix lost contract: {contract}"
-            )
+            raise AssertionError(f"persistent compact prefix lost contract: {contract}")
 
     def exact_or_unset(value: str | None, expected: str) -> bool:
         return value is None or value == expected
@@ -3462,9 +3352,7 @@ def check_context_persistent_policy_static() -> None:
         raise AssertionError("static persistent model rejected canonical recipe")
     for spelling in (None, "", "0", "01", "true", "1 ", " 1"):
         if enabled(spelling):
-            raise AssertionError(
-                f"static persistent parser accepted {spelling!r}"
-            )
+            raise AssertionError(f"static persistent parser accepted {spelling!r}")
     host_fallbacks = (
         {"packed": False},
         {"sequences": 0},
@@ -3478,9 +3366,7 @@ def check_context_persistent_policy_static() -> None:
     )
     for override in host_fallbacks:
         if enabled("1", **override):
-            raise AssertionError(
-                f"static persistent host guard accepted {override}"
-            )
+            raise AssertionError(f"static persistent host guard accepted {override}")
     recipe_fallbacks = {
         "direct": "1",
         "affine": "1",
@@ -3507,8 +3393,7 @@ def check_context_persistent_policy_static() -> None:
         for spelling in (value, "true"):
             if enabled("1", recipe={axis: spelling}):
                 raise AssertionError(
-                    "static persistent full guard accepted "
-                    f"{axis}={spelling!r}"
+                    "static persistent full guard accepted " f"{axis}={spelling!r}"
                 )
 
     # Old environments are graph-identical: without the new exact nested
@@ -3533,13 +3418,10 @@ def check_context_persistent_policy_static() -> None:
     for override in host_fallbacks:
         if selected_ab("1", "1", **override) != "established-fallback":
             raise AssertionError(
-                "nested established-AB flag escaped a parent host guard: "
-                f"{override}"
+                "nested established-AB flag escaped a parent host guard: " f"{override}"
             )
     for axis, value in recipe_fallbacks.items():
-        if selected_ab(
-            "1", "1", recipe={axis: value}
-        ) != "established-fallback":
+        if selected_ab("1", "1", recipe={axis: value}) != "established-fallback":
             raise AssertionError(
                 "nested established-AB flag escaped a parent recipe guard: "
                 f"{axis}={value!r}"
@@ -3550,9 +3432,7 @@ def check_context_persistent_policy_static() -> None:
         return max(1, (total_tiles + max_affine_sequences * 63) // 64)
 
     if hybrid_context_upper(1026, 8) != 23:
-        raise AssertionError(
-            "nested established-AB host upper changed for ragged-16k"
-        )
+        raise AssertionError("nested established-AB host upper changed for ragged-16k")
     print(
         "PASS static persistent exact parser, complete packed-hybrid G64 "
         "guard, matched prefix/K2 graph, deterministic grids, nested "
@@ -3563,22 +3443,15 @@ def check_context_persistent_policy_static() -> None:
 def check_gva_whole_route_policy_static() -> None:
     """Pin the complete gfx950 grouped-value producer/consumer handshake."""
 
-    common_abi = (
-        _REPO_ROOT / "csrc/kernels/flash_kda/hip_common.hpp"
-    ).read_text()
+    common_abi = (_REPO_ROOT / "csrc/kernels/flash_kda/hip_common.hpp").read_text()
     common_launch = (
         _REPO_ROOT / "csrc/kernels/flash_kda/hip_launch_common.cu"
     ).read_text()
-    policy = (
-        _REPO_ROOT / "csrc/kernels/flash_kda/gfx950/policy.hpp"
-    ).read_text()
+    policy = (_REPO_ROOT / "csrc/kernels/flash_kda/gfx950/policy.hpp").read_text()
     fused_k1 = (
-        _REPO_ROOT
-        / "csrc/kernels/flash_kda/gfx950/k1_kda_bt16_fused_kernel.hpp"
+        _REPO_ROOT / "csrc/kernels/flash_kda/gfx950/k1_kda_bt16_fused_kernel.hpp"
     ).read_text()
-    entry = (
-        _REPO_ROOT / "csrc/kernels/flash_kda/flash_kda_aiter.cu"
-    ).read_text()
+    entry = (_REPO_ROOT / "csrc/kernels/flash_kda/flash_kda_aiter.cu").read_text()
     public_header = (_REPO_ROOT / "csrc/include/flash_kda.h").read_text()
     pybind = (_REPO_ROOT / "csrc/pybind/flash_kda_pybind.cu").read_text()
     python_adapter = (_REPO_ROOT / "aiter/ops/flash_kda.py").read_text()
@@ -3596,31 +3469,35 @@ def check_gva_whole_route_policy_static() -> None:
         (compact_entry, "void flash_kda_fwd_hip_raw_v3("),
         (
             compact_entry,
-            "raw_check(H >= H_q && H % H_q == 0, "
-            '"H_v must be an integer multiple of H_q");',
+            (
+                "raw_check(H >= H_q && H % H_q == 0, "
+                '"H_v must be an integer multiple of H_q");'
+            ),
         ),
         (
             compact_entry,
-            "static_cast<int>(H_q), static_cast<int>(H), "
-            "static_cast<int>(N)",
+            ("static_cast<int>(H_q), static_cast<int>(H), " "static_cast<int>(N)"),
         ),
         (
             compact_pybind,
-            'm.def("flash_kda_fwd_hip_raw_v3", '
-            "&aiter::flash_kda_fwd_hip_raw_v3",
+            ('m.def("flash_kda_fwd_hip_raw_v3", ' "&aiter::flash_kda_fwd_hip_raw_v3"),
         ),
         (compact_pybind, 'py::arg("max_seqlen_upper_bound"), py::arg("H_q")'),
         (
             compact_adapter,
-            '(3, "flash_kda_fwd_hip_raw_v3"), '
-            '(2, "flash_kda_fwd_hip_raw_v2"), '
-            '(1, "flash_kda_fwd_hip_raw")',
+            (
+                '(3, "flash_kda_fwd_hip_raw_v3"), '
+                '(2, "flash_kda_fwd_hip_raw_v2"), '
+                '(1, "flash_kda_fwd_hip_raw")'
+            ),
         ),
         (
             compact_adapter,
-            "if raw_version == 3: raw_op( *raw_v1_args, "
-            "0 if max_seqlen_upper_bound is None else "
-            "max_seqlen_upper_bound, num_qk_heads, )",
+            (
+                "if raw_version == 3: raw_op( *raw_v1_args, "
+                "0 if max_seqlen_upper_bound is None else "
+                "max_seqlen_upper_bound, num_qk_heads, )"
+            ),
         ),
     )
     for source, contract in raw_v3_contracts:
@@ -3646,90 +3523,124 @@ def check_gva_whole_route_policy_static() -> None:
             raise AssertionError("GVA common ABI lost contract: " + contract)
 
     policy_wiring = (
-        "bool automatic_gva_packed_nw4; "
-        "bool automatic_gva_equal_n4_g16;",
-        "policy.context_automatic_gva_packed_nw4 = "
-        "context_route.automatic_gva_packed_nw4;",
-        "policy.context_automatic_gva_equal_n4_g16 = "
-        "context_route.automatic_gva_equal_n4_g16;",
-        "policy.bt16_k1_supports_gva = "
-        "bt16_fused_mode() != Bt16FusedMode::disabled;",
-        "policy.plain_csplit_supports_gva = "
-        "policy.bt16_k1_supports_gva && "
-        "policy.launch_bt16_k1 != nullptr && "
-        "policy.use_bt16_k1_for_plain && "
-        "policy.launch_plain_k1 != nullptr;",
+        ("bool automatic_gva_packed_nw4; " "bool automatic_gva_equal_n4_g16;"),
+        (
+            "policy.context_automatic_gva_packed_nw4 = "
+            "context_route.automatic_gva_packed_nw4;"
+        ),
+        (
+            "policy.context_automatic_gva_equal_n4_g16 = "
+            "context_route.automatic_gva_equal_n4_g16;"
+        ),
+        (
+            "policy.bt16_k1_supports_gva = "
+            "bt16_fused_mode() != Bt16FusedMode::disabled;"
+        ),
+        (
+            "policy.plain_csplit_supports_gva = "
+            "policy.bt16_k1_supports_gva && "
+            "policy.launch_bt16_k1 != nullptr && "
+            "policy.use_bt16_k1_for_plain && "
+            "policy.launch_plain_k1 != nullptr;"
+        ),
     )
     for contract in policy_wiring:
         if contract not in compact_policy:
             raise AssertionError("GVA policy wiring changed: " + contract)
 
     common_contracts = (
-        "const int H_q = p.H_q; const int H = p.H; "
-        "const bool is_gva = H_q != H;",
-        "const char* k2env = is_gva ? nullptr : getenv(\"FLASH_KDA_K2\");",
-        "const bool use_gva_plain_csplit = is_gva && "
-        "policy.plain_csplit_supports_gva && "
-        "policy.bt16_k1_supports_gva && "
-        "policy.launch_bt16_k1 != nullptr && "
-        "policy.use_bt16_k1_for_plain && "
-        "policy.launch_plain_k1 != nullptr && "
-        "!cs_skip_k1_prep && !cs_skip_k1_solve;",
-        "policy.default_k2_route == K2DefaultRoute::csplit64 && "
-        "(!is_gva || use_gva_plain_csplit);",
-        "policy.default_k2_route == K2DefaultRoute::context_parallel && "
-        "policy.launch_context_parallel != nullptr && "
-        "(!is_gva || (policy.launch_bt16_k1 != nullptr && "
-        "policy.bt16_k1_supports_gva));",
-        "const bool request_context_operand_cache = "
-        "use_context_parallel && "
-        "policy.launch_bt16_k1 != nullptr && "
-        "policy.bt16_k1_context_operand_cache;",
-        "const bool use_csplit_bt16_k1 = use_default_csplit64 && "
-        "policy.launch_bt16_k1 != nullptr && "
-        "policy.use_bt16_k1_for_plain && "
-        "(!is_gva || use_gva_plain_csplit) && "
-        "!cs_skip_k1_prep && !cs_skip_k1_solve;",
-        "const bool use_default_vsplit_rs = is_gva || "
-        "(!k2env && policy.default_k2_route == K2DefaultRoute::vsplit_rs);",
-        "context_operands_cached, is_gva, "
-        "policy.context_automatic_gva_packed_nw4, "
-        "policy.context_automatic_gva_equal_n4_g16};",
+        ("const int H_q = p.H_q; const int H = p.H; " "const bool is_gva = H_q != H;"),
+        'const char* k2env = is_gva ? nullptr : getenv("FLASH_KDA_K2");',
+        (
+            "const bool use_gva_plain_csplit = is_gva && "
+            "policy.plain_csplit_supports_gva && "
+            "policy.bt16_k1_supports_gva && "
+            "policy.launch_bt16_k1 != nullptr && "
+            "policy.use_bt16_k1_for_plain && "
+            "policy.launch_plain_k1 != nullptr && "
+            "!cs_skip_k1_prep && !cs_skip_k1_solve;"
+        ),
+        (
+            "policy.default_k2_route == K2DefaultRoute::csplit64 && "
+            "(!is_gva || use_gva_plain_csplit);"
+        ),
+        (
+            "policy.default_k2_route == K2DefaultRoute::context_parallel && "
+            "policy.launch_context_parallel != nullptr && "
+            "(!is_gva || (policy.launch_bt16_k1 != nullptr && "
+            "policy.bt16_k1_supports_gva));"
+        ),
+        (
+            "const bool request_context_operand_cache = "
+            "use_context_parallel && "
+            "policy.launch_bt16_k1 != nullptr && "
+            "policy.bt16_k1_context_operand_cache;"
+        ),
+        (
+            "const bool use_csplit_bt16_k1 = use_default_csplit64 && "
+            "policy.launch_bt16_k1 != nullptr && "
+            "policy.use_bt16_k1_for_plain && "
+            "(!is_gva || use_gva_plain_csplit) && "
+            "!cs_skip_k1_prep && !cs_skip_k1_solve;"
+        ),
+        (
+            "const bool use_default_vsplit_rs = is_gva || "
+            "(!k2env && policy.default_k2_route == K2DefaultRoute::vsplit_rs);"
+        ),
+        (
+            "context_operands_cached, is_gva, "
+            "policy.context_automatic_gva_packed_nw4, "
+            "policy.context_automatic_gva_equal_n4_g16};"
+        ),
     )
     for contract in common_contracts:
         if contract not in compact_common:
-            raise AssertionError(
-                "GVA common-launch handshake changed: " + contract
-            )
+            raise AssertionError("GVA common-launch handshake changed: " + contract)
 
     # The fused producer maps every value head back to its shared Q/K head,
     # while all persistent workspaces and K2 launches remain value-head major.
     k1_contracts = (
         "bool DENSE_N1_ALL_FULL_C16, bool GVA = false>",
-        "VL && CACHE_CONTEXT_OPERANDS && PUBLISH_ACTIVATED_BETA && "
-        "PACKED_DIRECT_PREFIXLESS",
-        "const bool gva_prefixless_context_cache = p.H_q == 2 && "
-        "(p.H == 4 || p.H == 8) && p.cu_seqlens != nullptr && "
-        "p.N == 16 && (p.T_total == 1039 || p.T_total == 1040) && "
-        "p.total_tiles == 81 && use_context_direct_prefixless && "
-        "bt16_fused_mode() == Bt16FusedMode::vector_x32;",
+        (
+            "VL && CACHE_CONTEXT_OPERANDS && PUBLISH_ACTIVATED_BETA && "
+            "PACKED_DIRECT_PREFIXLESS"
+        ),
+        (
+            "const bool gva_prefixless_context_cache = p.H_q == 2 && "
+            "(p.H == 4 || p.H == 8) && p.cu_seqlens != nullptr && "
+            "p.N == 16 && (p.T_total == 1039 || p.T_total == 1040) && "
+            "p.total_tiles == 81 && use_context_direct_prefixless && "
+            "bt16_fused_mode() == Bt16FusedMode::vector_x32;"
+        ),
         "p.H_q == p.H || gva_prefixless_context_cache",
-        "if (a.cache_context_operands && a.is_varlen && "
-        "a.packed_direct_prefixless)",
+        (
+            "if (a.cache_context_operands && a.is_varlen && "
+            "a.packed_direct_prefixless)"
+        ),
         "true, false, true, true, true, true, false, true>( a, grid);",
         "if (a.H_q != a.H) {",
         "auto launch_gva = [&]<bool VL, bool PACKED_DIRECT_PREFIXLESS>()",
-        "VL, true, false, false, false, PACKED_DIRECT_PREFIXLESS, "
-        "false, true>(a, grid);",
-        "VL, true, true, false, false, PACKED_DIRECT_PREFIXLESS, "
-        "false, true>(a, grid);",
-        "VL, false, true, false, false, PACKED_DIRECT_PREFIXLESS, "
-        "false, true>(a, grid);",
-        "if (a.packed_direct_prefixless) "
-        "launch_gva.template operator()<true, true>();",
+        (
+            "VL, true, false, false, false, PACKED_DIRECT_PREFIXLESS, "
+            "false, true>(a, grid);"
+        ),
+        (
+            "VL, true, true, false, false, PACKED_DIRECT_PREFIXLESS, "
+            "false, true>(a, grid);"
+        ),
+        (
+            "VL, false, true, false, false, PACKED_DIRECT_PREFIXLESS, "
+            "false, true>(a, grid);"
+        ),
+        (
+            "if (a.packed_direct_prefixless) "
+            "launch_gva.template operator()<true, true>();"
+        ),
         "a.scale, a.gate_scale, a.T_seq, a.H, a.H_q",
-        "if constexpr (GVA) { const int hq = h / (H / H_q); "
-        "qk_off = (int64_t(t0 + vec_m) * H_q + hq) * D + vec_d0; }",
+        (
+            "if constexpr (GVA) { const int hq = h / (H / H_q); "
+            "qk_off = (int64_t(t0 + vec_m) * H_q + hq) * D + vec_d0; }"
+        ),
     )
     for contract in k1_contracts:
         if contract not in compact_policy and contract not in compact_k1:
@@ -3737,47 +3648,72 @@ def check_gva_whole_route_policy_static() -> None:
 
     route_contracts = (
         "const bool is_gva = p.H_q != p.H;",
-        "const bool automatic_gva_n4_16k_nohint = "
-        "p.max_seqlen_upper_bound == 0 && is_varlen && is_gva && "
-        "p.H_q == 2 && (p.H == 4 || p.H == 8) && p.N == 4 && "
-        "p.T_total == 16384 && p.total_tiles == 1028",
-        "const bool automatic_equal_n4_g64 = "
-        "!is_gva && hinted_equal_lengths && p.N == 4",
-        "const bool automatic_gva_equal_n4_g16 = "
-        "is_gva && p.H_q == 2 && p.H == 4 && "
-        "hinted_equal_lengths && p.N == 4",
-        "const bool automatic_gva_equal_n4_g32 = "
-        "is_gva && p.H_q == 2 && p.H == 8 && "
-        "hinted_equal_lengths && p.N == 4",
-        "hinted_bound == 4096 && p.T_total == 4 * 4096 && "
-        "group_env == nullptr && "
-        "!force_direct && !force_affine && !force_hybrid;",
-        "automatic_gva_equal_n4_g32 || automatic_gva_n4_16k_nohint || "
-        "automatic_k3_dense_n4_h12_g64 || automatic_k3_n4_16k_g64",
-        "const bool hinted_n8_g64 = !is_gva && has_length_hint && "
-        "p.N == 8 && hinted_bound >= 4096;",
-        "requested_g16 || automatic_dense_g16 || "
-        "automatic_gva_equal_n4_g16",
-        "const bool automatic_gva_packed_nw4 = "
-        "is_gva && is_varlen && !direct && !hybrid && "
-        "p.N >= 4 && p.N <= 8 && group_env == nullptr && "
-        "!force_direct && !force_affine && !force_hybrid;",
-        "return {force_context, group_chunks, "
-        "hybrid ? (automatic_k3_n8_16k_hybrid_g32 ? "
-        "kK3N8NoHintDirectMaxChunks : kHybridDirectMaxChunks) : 0, "
-        "automatic_gva_packed_nw4, automatic_gva_equal_n4_g16};",
-        "const bool automatic_gva_packed_nw4 = "
-        "a.automatic_gva_packed_nw4 && a.is_gva && a.is_varlen && "
-        "!direct && !hybrid;",
-        "const bool automatic_gva_equal_n4_g16 = "
-        "a.automatic_gva_equal_n4_g16 && "
-        "automatic_gva_packed_nw4 && group_chunks == 16;",
+        (
+            "const bool automatic_gva_n4_16k_nohint = "
+            "p.max_seqlen_upper_bound == 0 && is_varlen && is_gva && "
+            "p.H_q == 2 && (p.H == 4 || p.H == 8) && p.N == 4 && "
+            "p.T_total == 16384 && p.total_tiles == 1028"
+        ),
+        (
+            "const bool automatic_equal_n4_g64 = "
+            "!is_gva && hinted_equal_lengths && p.N == 4"
+        ),
+        (
+            "const bool automatic_gva_equal_n4_g16 = "
+            "is_gva && p.H_q == 2 && p.H == 4 && "
+            "hinted_equal_lengths && p.N == 4"
+        ),
+        (
+            "const bool automatic_gva_equal_n4_g32 = "
+            "is_gva && p.H_q == 2 && p.H == 8 && "
+            "hinted_equal_lengths && p.N == 4"
+        ),
+        (
+            "hinted_bound == 4096 && p.T_total == 4 * 4096 && "
+            "group_env == nullptr && "
+            "!force_direct && !force_affine && !force_hybrid;"
+        ),
+        (
+            "automatic_gva_equal_n4_g32 || automatic_gva_n4_16k_nohint || "
+            "automatic_k3_dense_n4_h12_g64 || automatic_k3_n4_16k_g64"
+        ),
+        (
+            "const bool hinted_n8_g64 = !is_gva && has_length_hint && "
+            "p.N == 8 && hinted_bound >= 4096;"
+        ),
+        ("requested_g16 || automatic_dense_g16 || " "automatic_gva_equal_n4_g16"),
+        (
+            "const bool automatic_gva_packed_nw4 = "
+            "is_gva && is_varlen && !direct && !hybrid && "
+            "p.N >= 4 && p.N <= 8 && group_env == nullptr && "
+            "!force_direct && !force_affine && !force_hybrid;"
+        ),
+        (
+            "return {force_context, group_chunks, "
+            "hybrid ? (automatic_k3_n8_16k_hybrid_g32 ? "
+            "kK3N8NoHintDirectMaxChunks : kHybridDirectMaxChunks) : 0, "
+            "automatic_gva_packed_nw4, automatic_gva_equal_n4_g16};"
+        ),
+        (
+            "const bool automatic_gva_packed_nw4 = "
+            "a.automatic_gva_packed_nw4 && a.is_gva && a.is_varlen && "
+            "!direct && !hybrid;"
+        ),
+        (
+            "const bool automatic_gva_equal_n4_g16 = "
+            "a.automatic_gva_equal_n4_g16 && "
+            "automatic_gva_packed_nw4 && group_chunks == 16;"
+        ),
         "const bool cache_context_operands = a.context_operands_cached;",
-        "const bool automatic_gva_disable_b_stream = "
-        "automatic_gva_equal_n4_g16 && automatic_gva_scan_nw4 && "
-        "scan_b_stream_env == nullptr;",
-        "const bool scan_b_stream = !automatic_gva_disable_b_stream && "
-        "context_scan_b_stream_enabled(group_chunks);",
+        (
+            "const bool automatic_gva_disable_b_stream = "
+            "automatic_gva_equal_n4_g16 && automatic_gva_scan_nw4 && "
+            "scan_b_stream_env == nullptr;"
+        ),
+        (
+            "const bool scan_b_stream = !automatic_gva_disable_b_stream && "
+            "context_scan_b_stream_enabled(group_chunks);"
+        ),
     )
     for contract in route_contracts:
         if contract not in compact_policy:
@@ -3790,9 +3726,7 @@ def check_gva_whole_route_policy_static() -> None:
             raise AssertionError(f"policy is missing GVA statement {needle!r}")
         return compact_policy[start : end + 1]
 
-    nohint_guard = policy_statement(
-        "const bool automatic_gva_n4_16k_nohint ="
-    )
+    nohint_guard = policy_statement("const bool automatic_gva_n4_16k_nohint =")
     for contract in (
         "p.max_seqlen_upper_bound == 0",
         "is_varlen",
@@ -3806,9 +3740,7 @@ def check_gva_whole_route_policy_static() -> None:
         "!force_direct && !force_affine && !force_hybrid",
     ):
         if contract not in nohint_guard:
-            raise AssertionError(
-                "GVA N4/16K no-hint guard changed: " + contract
-            )
+            raise AssertionError("GVA N4/16K no-hint guard changed: " + contract)
 
     for name, value_heads in (
         ("automatic_gva_equal_n4_g16", 4),
@@ -3828,8 +3760,7 @@ def check_gva_whole_route_policy_static() -> None:
         ):
             if contract not in hinted_guard:
                 raise AssertionError(
-                    f"hinted ratio-{value_heads // 2} GVA guard changed: "
-                    + contract
+                    f"hinted ratio-{value_heads // 2} GVA guard changed: " + contract
                 )
 
     # Metadata-eliding/cache-heavy candidates are deliberately equal-head only.
@@ -3845,19 +3776,19 @@ def check_gva_whole_route_policy_static() -> None:
     for contract in equal_head_only_contracts:
         if contract not in compact_policy:
             raise AssertionError(
-                "equal-head-only specialization lost its GVA exclusion: "
-                + contract
+                "equal-head-only specialization lost its GVA exclusion: " + contract
             )
     common_equal_head_only = (
         "!is_gva && policy.context_equal_dense_n4_g64",
-        "use_context_parallel && !is_gva && is_varlen && "
-        "policy.launch_context_prefix != nullptr",
+        (
+            "use_context_parallel && !is_gva && is_varlen && "
+            "policy.launch_context_prefix != nullptr"
+        ),
     )
     for contract in common_equal_head_only:
         if contract not in compact_common:
             raise AssertionError(
-                "common equal-head-only graph lost its GVA exclusion: "
-                + contract
+                "common equal-head-only graph lost its GVA exclusion: " + contract
             )
 
     def resolve_gva_case(
@@ -3971,9 +3902,7 @@ def check_gva_whole_route_policy_static() -> None:
             and scan_b_phased is None
         )
         resolved_scan_nw = (
-            int(scan_nw)
-            if scan_nw is not None
-            else 4 if automatic_scan_nw4 else 2
+            int(scan_nw) if scan_nw is not None else 4 if automatic_scan_nw4 else 2
         )
         automatic_disable_b_stream = (
             automatic_n4_g16
@@ -3987,9 +3916,7 @@ def check_gva_whole_route_policy_static() -> None:
             if scan_b_stream is not None
             else group_chunks in (8, 16)
         )
-        resolved_b_stream = (
-            not automatic_disable_b_stream and parsed_b_stream
-        )
+        resolved_b_stream = not automatic_disable_b_stream and parsed_b_stream
         return (
             group_chunks,
             automatic_packed_nw4,
@@ -4007,27 +3934,27 @@ def check_gva_whole_route_policy_static() -> None:
     cases = (
         (
             "single-8k",
-            dict(sequences=1, tokens_per_sequence=8192, packed=False),
+            {"sequences": 1, "tokens_per_sequence": 8192, "packed": False},
             (32, False, 2, False, False, False),
         ),
         (
             "resume-4x4k",
-            dict(
-                sequences=4,
-                tokens_per_sequence=4096,
-                packed=True,
-                bound=4096,
-            ),
+            {
+                "sequences": 4,
+                "tokens_per_sequence": 4096,
+                "packed": True,
+                "bound": 4096,
+            },
             (16, True, 4, False, True, True),
         ),
         (
             "long-ragged-n8",
-            dict(
-                sequences=8,
-                tokens_per_sequence=4096,
-                packed=True,
-                bound=8192,
-            ),
+            {
+                "sequences": 8,
+                "tokens_per_sequence": 4096,
+                "packed": True,
+                "bound": 8192,
+            },
             (32, True, 4, False, False, False),
         ),
     )
@@ -4038,19 +3965,17 @@ def check_gva_whole_route_policy_static() -> None:
                 f"static GVA {label} route changed: {actual} != {expected}"
             )
 
-    nohint_n4 = dict(
-        sequences=4,
-        tokens_per_sequence=4096,
-        packed=True,
-        bound=0,
-        total_tokens=16384,
-        total_tiles=1028,
-    )
+    nohint_n4 = {
+        "sequences": 4,
+        "tokens_per_sequence": 4096,
+        "packed": True,
+        "bound": 0,
+        "total_tokens": 16384,
+        "total_tiles": 1028,
+    }
     for value_heads in (4, 8):
         expected = (32, True, 4, False, False, True)
-        actual = resolve_gva_case(
-            **nohint_n4, q_heads=2, value_heads=value_heads
-        )
+        actual = resolve_gva_case(**nohint_n4, q_heads=2, value_heads=value_heads)
         if actual != expected:
             raise AssertionError(
                 f"static no-hint GVA Hq2/Hv{value_heads} N4/16K route "
@@ -4063,9 +3988,7 @@ def check_gva_whole_route_policy_static() -> None:
         value_heads=8,
     )
     if ratio4_hinted != (32, True, 4, False, False, True):
-        raise AssertionError(
-            "static hinted ratio-4 GVA N4/16K did not select G32/NW4"
-        )
+        raise AssertionError("static hinted ratio-4 GVA N4/16K did not select G32/NW4")
 
     nohint_rollbacks = (
         ({"q_heads": 1, "value_heads": 4}, (32, True, 4, False, False, False)),
@@ -4084,12 +4007,12 @@ def check_gva_whole_route_policy_static() -> None:
                 f"override={override}, actual={actual}, expected={expected}"
             )
 
-    base_n4 = dict(
-        sequences=4,
-        tokens_per_sequence=4096,
-        packed=True,
-        bound=4096,
-    )
+    base_n4 = {
+        "sequences": 4,
+        "tokens_per_sequence": 4096,
+        "packed": True,
+        "bound": 4096,
+    }
     explicit_routes = {
         "direct": (0, False, 2, False, False, True),
         "affine": (32, False, 2, False, False, True),
@@ -4292,14 +4215,11 @@ def decode_context_pipeline_roles(
         else:
             role = "affine_replay"
         if role in roles:
-            raise AssertionError(
-                f"captured duplicate context role {role}: {name}"
-            )
+            raise AssertionError(f"captured duplicate context role {role}: {name}")
         roles[role] = {
             "name": name,
             "normalized_name": (
-                name[: match.start("lds_pipeline")]
-                + name[match.end("lds_pipeline") :]
+                name[: match.start("lds_pipeline")] + name[match.end("lds_pipeline") :]
             ),
             "cached": int(match.group("cached")),
             "u_forward": int(match.group("u_forward")),
@@ -4351,7 +4271,6 @@ def rejection_reason(x: dict[str, Any]):
         initial_state=x["initial_state"] if x["has_initial_state"] else None,
         output_final_state=x["output_final_state"],
         lower_bound=x["lower_bound"],
-        state_v_first=True,
         cu_seqlens=x["cu_seqlens"],
     )
 
@@ -4369,18 +4288,14 @@ def allocate(x: dict[str, Any]):
         dtype=x["state_dtype"],
     )
     workspace = torch.empty(
-        flash_kda.flash_kda_workspace_size(
-            batch * tokens, value_heads, x["N"]
-        ),
+        flash_kda.flash_kda_workspace_size(batch * tokens, value_heads, x["N"]),
         device=x["q"].device,
         dtype=torch.uint8,
     )
     return out, final, workspace
 
 
-def _raw_common_args(
-    x: dict[str, Any], out, final, workspace
-) -> tuple[Any, ...]:
+def _raw_common_args(x: dict[str, Any], out, final, workspace) -> tuple[Any, ...]:
     """Construct the stable 25-argument prefix shared by raw-v1/v2/v3."""
 
     B, T, _, _ = x["q"].shape
@@ -4432,8 +4347,7 @@ def raw_args(x: dict[str, Any], out, final, workspace) -> tuple[Any, ...]:
     value_heads = x["v"].shape[2]
     if q_heads != value_heads:
         raise ValueError(
-            "raw-v1/v2 cannot represent GVA: "
-            f"H_q={q_heads}, H_v={value_heads}"
+            "raw-v1/v2 cannot represent GVA: " f"H_q={q_heads}, H_v={value_heads}"
         )
     return _raw_common_args(x, out, final, workspace)
 
@@ -4552,12 +4466,8 @@ def check_module_abi_surface(module) -> None:
     for symbol, expected_arguments in expected:
         operation = getattr(module, symbol, None)
         if not callable(operation):
-            raise RuntimeError(
-                f"module_flash_kda_hip is missing callable {symbol}"
-            )
-        documented_arguments = _documented_pybind_arguments(
-            operation, symbol
-        )
+            raise TypeError(f"{flash_kda.MD_NAME} is missing callable {symbol}")
+        documented_arguments = _documented_pybind_arguments(operation, symbol)
         if documented_arguments != expected_arguments:
             raise AssertionError(
                 f"{symbol} ABI changed: expected "
@@ -4570,13 +4480,16 @@ def check_module_abi_surface(module) -> None:
         raise RuntimeError(
             "public FlashKDA adapter did not prefer the available raw-v3 ABI"
         )
-    print(
-        "PASS module ABI surface: descriptor=17, raw-v1=25, "
-        "raw-v2=26, raw-v3=27"
-    )
+    print("PASS module ABI surface: descriptor=18, raw-v1=25, " "raw-v2=26, raw-v3=27")
 
 
-def descriptor_call(x, out, final, workspace):
+def descriptor_call(
+    x,
+    out,
+    final,
+    workspace,
+    max_seqlen_upper_bound: int = 0,
+):
     """Call the decorated tensor-descriptor ABI without public raw dispatch."""
 
     reason = rejection_reason(x)
@@ -4605,6 +4518,7 @@ def descriptor_call(x, out, final, workspace):
         x["has_initial_state"],
         x["output_final_state"],
         x["is_varlen"],
+        max_seqlen_upper_bound,
     )
 
 
@@ -4680,12 +4594,9 @@ def seed_empty_state_bit_patterns(
         nonfinite_patterns if include_nonfinite else ()
     )
     signed_patterns = tuple(
-        value if value < sign_bit else value - modulus
-        for value in unsigned_patterns
+        value if value < sign_bit else value - modulus for value in unsigned_patterns
     )
-    pattern = torch.tensor(
-        signed_patterns, device=device, dtype=integer_dtype
-    )
+    pattern = torch.tensor(signed_patterns, device=device, dtype=integer_dtype)
     for sequence, length in enumerate(seq_lens):
         if length != 0:
             continue
@@ -4746,10 +4657,15 @@ def check_raw_v3_gva_vs_descriptor(module, device: torch.device) -> None:
         initial_copy = x["initial_state"].clone()
         descriptor_out, descriptor_final, descriptor_workspace = allocate(x)
         raw_out, raw_final, raw_workspace = allocate(x)
-        descriptor_call(x, descriptor_out, descriptor_final, descriptor_workspace)
-        # Bound zero preserves the descriptor route and isolates the appended
-        # H_q ABI from intentional policy differences caused by a host hint.
-        raw_v3_call(module, x, raw_out, raw_final, raw_workspace, 0)
+        bound = max(seq_lens) if packed else seq_lens[0]
+        descriptor_call(
+            x,
+            descriptor_out,
+            descriptor_final,
+            descriptor_workspace,
+            bound,
+        )
+        raw_v3_call(module, x, raw_out, raw_final, raw_workspace, bound)
         torch.cuda.synchronize(device)
 
         assert_same(
@@ -4773,10 +4689,8 @@ def check_raw_v3_gva_vs_descriptor(module, device: torch.device) -> None:
             if "raw-v1/v2 cannot represent GVA" not in str(error):
                 raise
         else:
-            raise AssertionError(
-                f"legacy raw ABI unexpectedly represented GVA {label}"
-            )
-        print(f"PASS raw-v3/descriptor GVA bitwise: {label}")
+            raise AssertionError(f"legacy raw ABI unexpectedly represented GVA {label}")
+        print(f"PASS hinted raw-v3/descriptor GVA bitwise: {label}")
 
 
 def check_state_layout_matrix(module, device: torch.device, heads: int):
@@ -4880,15 +4794,18 @@ def check_forced_hybrid_route(module, device: torch.device, heads: int):
         skip_poisoned = run(poison_plain_k1=True)
         torch.cuda.synchronize(device)
         assert_same(
-            skip_poisoned[0], ordinary[0],
+            skip_poisoned[0],
+            ordinary[0],
             "forced hybrid was overridden by the plain K1 skip route",
         )
         assert_same(
-            skip_poisoned[1], ordinary[1],
+            skip_poisoned[1],
+            ordinary[1],
             "forced hybrid state was overridden by the plain K1 skip route",
         )
         assert_same(
-            x["initial_state"], initial_copy,
+            x["initial_state"],
+            initial_copy,
             "forced hybrid route assertion mutated initial state",
         )
         print("PASS forced hybrid selects context on packed 1024/1025")
@@ -4896,9 +4813,7 @@ def check_forced_hybrid_route(module, device: torch.device, heads: int):
         restore_env()
 
 
-def check_context_tight_scan_matrix(
-    module, device: torch.device, heads: int
-):
+def check_context_tight_scan_matrix(module, device: torch.device, heads: int):
     """Prove the strict hybrid scan-grid specialization is bitwise exact.
 
     The matrix deliberately keeps ``context_upper < N`` for every launch, so
@@ -4947,9 +4862,7 @@ def check_context_tight_scan_matrix(
     )
     previous_env = {name: os.environ.get(name) for name in controlled_env}
 
-    def assert_tight_active(
-        seq_lens: tuple[int, ...], group_chunks: int
-    ) -> None:
+    def assert_tight_active(seq_lens: tuple[int, ...], group_chunks: int) -> None:
         # Mirror policy.hpp's metadata-free conservative upper.  This turns a
         # future route/bound change into an explicit test failure instead of
         # allowing OFF/ON to become a silent comparison of the same kernel.
@@ -4958,11 +4871,7 @@ def check_context_tight_scan_matrix(
         max_affine_sequences = min(sequences, total_tiles // 65)
         context_upper = max(
             1,
-            (
-                total_tiles
-                + max_affine_sequences * (group_chunks - 1)
-            )
-            // group_chunks,
+            (total_tiles + max_affine_sequences * (group_chunks - 1)) // group_chunks,
         )
         if sequences < 9 or context_upper >= sequences:
             raise AssertionError(
@@ -5030,15 +4939,11 @@ def check_context_tight_scan_matrix(
         )
         nodes = (ctypes.c_void_p * count.value)()
         checked(
-            hip.hipGraphGetNodes(
-                graph_handle, nodes, ctypes.byref(count)
-            ),
+            hip.hipGraphGetNodes(graph_handle, nodes, ctypes.byref(count)),
             "hipGraphGetNodes(nodes)",
         )
 
-        stream = ctypes.c_void_p(
-            torch.cuda.current_stream(device).cuda_stream
-        )
+        stream = ctypes.c_void_p(torch.cuda.current_stream(device).cuda_stream)
         kernel_names = []
         for node in nodes[: count.value]:
             node_type = ctypes.c_int()
@@ -5050,9 +4955,7 @@ def check_context_tight_scan_matrix(
                 continue
             params = HipKernelNodeParams()
             checked(
-                hip.hipGraphKernelNodeGetParams(
-                    node, ctypes.byref(params)
-                ),
+                hip.hipGraphKernelNodeGetParams(node, ctypes.byref(params)),
                 "hipGraphKernelNodeGetParams",
             )
             raw_name = hip.hipKernelNameRefByPtr(params.func, stream)
@@ -5064,11 +4967,7 @@ def check_context_tight_scan_matrix(
                 demangled = torch._C._demangle(raw_text)
             except (AttributeError, RuntimeError):
                 pass
-            name = (
-                raw_text
-                if demangled == raw_text
-                else f"{raw_text}\n{demangled}"
-            )
+            name = raw_text if demangled == raw_text else f"{raw_text}\n{demangled}"
             kernel_names.append(name)
 
         scan_names = [
@@ -5081,10 +4980,7 @@ def check_context_tight_scan_matrix(
             "k2_kda_context_affine_scan_nw4_kernel"
             f"<64,2,true,true,true,true,{tight_arg},"
         )
-        mangled_args = (
-            "ILi64ELi2ELb1ELb1ELb1ELb1"
-            f"ELb{1 if expected_tight else 0}E"
-        )
+        mangled_args = "ILi64ELi2ELb1ELb1ELb1ELb1" f"ELb{1 if expected_tight else 0}E"
         compact_name = "".join(scan_names[0].split()) if scan_names else ""
         if len(scan_names) != 1 or (
             needle not in compact_name and mangled_args not in compact_name
@@ -5100,14 +4996,10 @@ def check_context_tight_scan_matrix(
         os.environ["FLASH_KDA_GFX950_BT16_K1"] = "1"
         os.environ["FLASH_KDA_GFX950_BT16_FUSED"] = "vector_x32"
         os.environ["FLASH_KDA_GFX950_CONTEXT_HYBRID"] = "1"
-        os.environ["FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS"] = str(
-            group_chunks
-        )
+        os.environ["FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS"] = str(group_chunks)
         os.environ["FLASH_KDA_GFX950_CONTEXT_DIRECT_NW"] = "4"
         os.environ["FLASH_KDA_GFX950_CONTEXT_SCAN_NW"] = str(scan_nw)
-        os.environ["FLASH_KDA_GFX950_CONTEXT_TIGHT_SCAN"] = (
-            "1" if tight else "0"
-        )
+        os.environ["FLASH_KDA_GFX950_CONTEXT_TIGHT_SCAN"] = "1" if tight else "0"
         os.environ["FLASH_KDA_GFX950_CONTEXT_OPERAND_CACHE"] = "1"
 
     def run(x, group_chunks: int, scan_nw: int, tight: bool):
@@ -5121,33 +5013,34 @@ def check_context_tight_scan_matrix(
 
     def compare(x, label: str, group_chunks: int, scan_nw: int):
         seq_prefix = x["cu_seqlens"].cpu().tolist()
-        seq_lens = tuple(
-            end - start for start, end in zip(seq_prefix, seq_prefix[1:])
-        )
+        seq_lens = tuple(end - start for start, end in itertools.pairwise(seq_prefix))
         assert_tight_active(seq_lens, group_chunks)
         initial_copy = x["initial_state"].clone()
         ordinary = run(x, group_chunks, scan_nw, False)
         tight = run(x, group_chunks, scan_nw, True)
         torch.cuda.synchronize(device)
         for mode_name, tensors in (("legacy", ordinary), ("tight", tight)):
-            checked = (tensors[0], tensors[1]) if x["output_final_state"] else (
-                tensors[0],
+            checked = (
+                (tensors[0], tensors[1]) if x["output_final_state"] else (tensors[0],)
             )
             if any(not bool(torch.isfinite(tensor).all().item()) for tensor in checked):
                 raise AssertionError(
                     f"tight scan {label}: {mode_name} produced non-finite data"
                 )
         assert_same(
-            tight[0], ordinary[0],
+            tight[0],
+            ordinary[0],
             f"tight scan {label}: output mismatch",
         )
         if x["output_final_state"]:
             assert_same(
-                tight[1], ordinary[1],
+                tight[1],
+                ordinary[1],
                 f"tight scan {label}: final-state mismatch",
             )
         assert_same(
-            x["initial_state"], initial_copy,
+            x["initial_state"],
+            initial_copy,
             f"tight scan {label}: initial state mutated",
         )
         return ordinary
@@ -5218,18 +5111,12 @@ def check_context_tight_scan_matrix(
         # that always selected either route could still pass every exact A/B.
         configure(64, 2, False)
         off_out, off_final, off_workspace = allocate(graph_x)
-        preallocated_call(
-            "raw", module, graph_x, off_out, off_final, off_workspace
-        )
+        preallocated_call("raw", module, graph_x, off_out, off_final, off_workspace)
         torch.cuda.synchronize(device)
         off_graph = torch.cuda.CUDAGraph(keep_graph=True)
         with torch.cuda.graph(off_graph):
-            preallocated_call(
-                "raw", module, graph_x, off_out, off_final, off_workspace
-            )
-        assert_captured_scan_specialization(
-            off_graph, expected_tight=False
-        )
+            preallocated_call("raw", module, graph_x, off_out, off_final, off_workspace)
+        assert_captured_scan_specialization(off_graph, expected_tight=False)
         off_graph.reset()
 
         configure(64, 2, True)
@@ -5267,11 +5154,13 @@ def check_context_tight_scan_matrix(
         graph.replay()
         torch.cuda.synchronize(device)
         assert_same(
-            out, changed_reference[0],
+            out,
+            changed_reference[0],
             "tight captured graph changed-prefix output mismatch",
         )
         assert_same(
-            final, changed_reference[1],
+            final,
+            changed_reference[1],
             "tight captured graph changed-prefix state mismatch",
         )
         print(
@@ -5286,9 +5175,7 @@ def check_context_tight_scan_matrix(
                 os.environ[name] = value
 
 
-def check_context_scan_b_stream_matrix(
-    module, device: torch.device, heads: int
-):
+def check_context_scan_b_stream_matrix(module, device: torch.device, heads: int):
     """Prove the strict streamed-b scan candidate is bitwise exact.
 
     Dense and packed affine launches cover every state dispatch while the
@@ -5348,18 +5235,16 @@ def check_context_scan_b_stream_matrix(
         os.environ["FLASH_KDA_GFX950_BT16_K1"] = "1"
         os.environ["FLASH_KDA_GFX950_BT16_FUSED"] = "vector_x32"
         os.environ[
-            "FLASH_KDA_GFX950_CONTEXT_HYBRID"
-            if hybrid
-            else "FLASH_KDA_GFX950_CONTEXT_AFFINE"
+            (
+                "FLASH_KDA_GFX950_CONTEXT_HYBRID"
+                if hybrid
+                else "FLASH_KDA_GFX950_CONTEXT_AFFINE"
+            )
         ] = "1"
-        os.environ["FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS"] = str(
-            group_chunks
-        )
+        os.environ["FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS"] = str(group_chunks)
         os.environ["FLASH_KDA_GFX950_CONTEXT_DIRECT_NW"] = "4"
         os.environ["FLASH_KDA_GFX950_CONTEXT_SCAN_NW"] = str(scan_nw)
-        os.environ["FLASH_KDA_GFX950_CONTEXT_TIGHT_SCAN"] = (
-            "1" if tight else "0"
-        )
+        os.environ["FLASH_KDA_GFX950_CONTEXT_TIGHT_SCAN"] = "1" if tight else "0"
         os.environ["FLASH_KDA_GFX950_CONTEXT_OPERAND_CACHE"] = "1"
         os.environ["FLASH_KDA_GFX950_CONTEXT_U_FORWARD"] = "0"
         os.environ["FLASH_KDA_GFX950_CONTEXT_V_FORWARD"] = "0"
@@ -5417,16 +5302,14 @@ def check_context_scan_b_stream_matrix(
             tight=tight,
         )
         torch.cuda.synchronize(device)
-        for mode_name, tensors in (("established", established),
-                                   ("streamed", streamed)):
+        for mode_name, tensors in (
+            ("established", established),
+            ("streamed", streamed),
+        ):
             checked = tensors if x["output_final_state"] else tensors[:1]
-            if any(
-                not bool(torch.isfinite(tensor).all().item())
-                for tensor in checked
-            ):
+            if any(not bool(torch.isfinite(tensor).all().item()) for tensor in checked):
                 raise AssertionError(
-                    f"scan streamed-b {label}: {mode_name} produced "
-                    "non-finite data"
+                    f"scan streamed-b {label}: {mode_name} produced " "non-finite data"
                 )
         assert_same(
             streamed[0],
@@ -5498,9 +5381,7 @@ def check_context_scan_b_stream_matrix(
 
         def checked(status: int, operation: str) -> None:
             if status != 0:
-                raise RuntimeError(
-                    f"{operation} failed with HIP status {status}"
-                )
+                raise RuntimeError(f"{operation} failed with HIP status {status}")
 
         configure(64, 2, b_stream)
         out, final, workspace = allocate(x)
@@ -5518,15 +5399,11 @@ def check_context_scan_b_stream_matrix(
         )
         nodes = (ctypes.c_void_p * count.value)()
         checked(
-            hip.hipGraphGetNodes(
-                graph_handle, nodes, ctypes.byref(count)
-            ),
+            hip.hipGraphGetNodes(graph_handle, nodes, ctypes.byref(count)),
             "hipGraphGetNodes(nodes)",
         )
 
-        stream = ctypes.c_void_p(
-            torch.cuda.current_stream(device).cuda_stream
-        )
+        stream = ctypes.c_void_p(torch.cuda.current_stream(device).cuda_stream)
         kernel_names = []
         for node in nodes[: count.value]:
             node_type = ctypes.c_int()
@@ -5538,9 +5415,7 @@ def check_context_scan_b_stream_matrix(
                 continue
             params = HipKernelNodeParams()
             checked(
-                hip.hipGraphKernelNodeGetParams(
-                    node, ctypes.byref(params)
-                ),
+                hip.hipGraphKernelNodeGetParams(node, ctypes.byref(params)),
                 "hipGraphKernelNodeGetParams",
             )
             raw_name = hip.hipKernelNameRefByPtr(params.func, stream)
@@ -5553,15 +5428,11 @@ def check_context_scan_b_stream_matrix(
             except (AttributeError, RuntimeError):
                 pass
             kernel_names.append(
-                raw_text
-                if demangled == raw_text
-                else f"{raw_text}\n{demangled}"
+                raw_text if demangled == raw_text else f"{raw_text}\n{demangled}"
             )
 
         scan_names = [
-            name
-            for name in kernel_names
-            if "k2_kda_context_affine_scan" in name
+            name for name in kernel_names if "k2_kda_context_affine_scan" in name
         ]
         expected_name = (
             "k2_kda_context_affine_scan_b_stream_nw4_kernel"
@@ -5610,26 +5481,17 @@ def check_context_scan_b_stream_matrix(
                     )
                     compare(
                         x,
-                        f"{layout_name}/G{group_chunks}/NW{scan_nw}/"
-                        f"{mode_name}",
+                        f"{layout_name}/G{group_chunks}/NW{scan_nw}/" f"{mode_name}",
                         group_chunks,
                         scan_nw,
                     )
 
         tight_lens = (1,) * 16 + (1025,) + (0,) * 16
-        tight_total_tiles = (
-            (sum(tight_lens) + 15) // 16 + len(tight_lens)
-        )
-        tight_max_affine_sequences = min(
-            len(tight_lens), tight_total_tiles // 65
-        )
+        tight_total_tiles = (sum(tight_lens) + 15) // 16 + len(tight_lens)
+        tight_max_affine_sequences = min(len(tight_lens), tight_total_tiles // 65)
         tight_context_upper = max(
             1,
-            (
-                tight_total_tiles
-                + tight_max_affine_sequences * (64 - 1)
-            )
-            // 64,
+            (tight_total_tiles + tight_max_affine_sequences * (64 - 1)) // 64,
         )
         if tight_context_upper >= len(tight_lens):
             raise AssertionError(
@@ -5702,9 +5564,7 @@ def check_context_scan_b_stream_matrix(
                 os.environ[name] = value
 
 
-def check_context_scan_a_gll_matrix(
-    module, device: torch.device, heads: int
-):
+def check_context_scan_a_gll_matrix(module, device: torch.device, heads: int):
     """Prove the NW2 streamed-b A-GLL candidate is bitwise exact.
 
     Dense, packed-VL, and strict tight-grid launches cover every state mode
@@ -5764,18 +5624,16 @@ def check_context_scan_a_gll_matrix(
         os.environ["FLASH_KDA_GFX950_BT16_K1"] = "1"
         os.environ["FLASH_KDA_GFX950_BT16_FUSED"] = "vector_x32"
         os.environ[
-            "FLASH_KDA_GFX950_CONTEXT_HYBRID"
-            if hybrid
-            else "FLASH_KDA_GFX950_CONTEXT_AFFINE"
+            (
+                "FLASH_KDA_GFX950_CONTEXT_HYBRID"
+                if hybrid
+                else "FLASH_KDA_GFX950_CONTEXT_AFFINE"
+            )
         ] = "1"
-        os.environ["FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS"] = str(
-            group_chunks
-        )
+        os.environ["FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS"] = str(group_chunks)
         os.environ["FLASH_KDA_GFX950_CONTEXT_DIRECT_NW"] = "4"
         os.environ["FLASH_KDA_GFX950_CONTEXT_SCAN_NW"] = str(scan_nw)
-        os.environ["FLASH_KDA_GFX950_CONTEXT_TIGHT_SCAN"] = (
-            "1" if tight else "0"
-        )
+        os.environ["FLASH_KDA_GFX950_CONTEXT_TIGHT_SCAN"] = "1" if tight else "0"
         os.environ["FLASH_KDA_GFX950_CONTEXT_OPERAND_CACHE"] = "1"
         os.environ["FLASH_KDA_GFX950_CONTEXT_U_FORWARD"] = "0"
         os.environ["FLASH_KDA_GFX950_CONTEXT_V_FORWARD"] = "0"
@@ -5836,13 +5694,9 @@ def check_context_scan_a_gll_matrix(
             tight=tight,
         )
         torch.cuda.synchronize(device)
-        for mode_name, tensors in (("established", established),
-                                   ("A-GLL", a_gll)):
+        for mode_name, tensors in (("established", established), ("A-GLL", a_gll)):
             checked = tensors if x["output_final_state"] else tensors[:1]
-            if any(
-                not bool(torch.isfinite(tensor).all().item())
-                for tensor in checked
-            ):
+            if any(not bool(torch.isfinite(tensor).all().item()) for tensor in checked):
                 raise AssertionError(
                     f"scan A-GLL {label}: {mode_name} produced non-finite data"
                 )
@@ -5917,9 +5771,7 @@ def check_context_scan_a_gll_matrix(
 
         def checked(status: int, operation: str) -> None:
             if status != 0:
-                raise RuntimeError(
-                    f"{operation} failed with HIP status {status}"
-                )
+                raise RuntimeError(f"{operation} failed with HIP status {status}")
 
         configure(
             64,
@@ -5942,15 +5794,11 @@ def check_context_scan_a_gll_matrix(
         )
         nodes = (ctypes.c_void_p * count.value)()
         checked(
-            hip.hipGraphGetNodes(
-                graph_handle, nodes, ctypes.byref(count)
-            ),
+            hip.hipGraphGetNodes(graph_handle, nodes, ctypes.byref(count)),
             "hipGraphGetNodes(nodes)",
         )
 
-        stream = ctypes.c_void_p(
-            torch.cuda.current_stream(device).cuda_stream
-        )
+        stream = ctypes.c_void_p(torch.cuda.current_stream(device).cuda_stream)
         kernel_names = []
         for node in nodes[: count.value]:
             node_type = ctypes.c_int()
@@ -5962,9 +5810,7 @@ def check_context_scan_a_gll_matrix(
                 continue
             params = HipKernelNodeParams()
             checked(
-                hip.hipGraphKernelNodeGetParams(
-                    node, ctypes.byref(params)
-                ),
+                hip.hipGraphKernelNodeGetParams(node, ctypes.byref(params)),
                 "hipGraphKernelNodeGetParams",
             )
             raw_name = hip.hipKernelNameRefByPtr(params.func, stream)
@@ -5977,15 +5823,11 @@ def check_context_scan_a_gll_matrix(
             except (AttributeError, RuntimeError):
                 pass
             kernel_names.append(
-                raw_text
-                if demangled == raw_text
-                else f"{raw_text}\n{demangled}"
+                raw_text if demangled == raw_text else f"{raw_text}\n{demangled}"
             )
 
         scan_names = [
-            name
-            for name in kernel_names
-            if "k2_kda_context_affine_scan" in name
+            name for name in kernel_names if "k2_kda_context_affine_scan" in name
         ]
         if len(scan_names) != 1 or expected_name not in scan_names[0]:
             raise AssertionError(
@@ -6017,18 +5859,11 @@ def check_context_scan_a_gll_matrix(
 
     try:
         for group_chunks in (32, 64, 128):
-            tight_total_tiles = (
-                (sum(tight_lens) + 15) // 16 + len(tight_lens)
-            )
-            tight_max_affine_sequences = min(
-                len(tight_lens), tight_total_tiles // 65
-            )
+            tight_total_tiles = (sum(tight_lens) + 15) // 16 + len(tight_lens)
+            tight_max_affine_sequences = min(len(tight_lens), tight_total_tiles // 65)
             tight_context_upper = max(
                 1,
-                (
-                    tight_total_tiles
-                    + tight_max_affine_sequences * (group_chunks - 1)
-                )
+                (tight_total_tiles + tight_max_affine_sequences * (group_chunks - 1))
                 // group_chunks,
             )
             if tight_context_upper >= len(tight_lens):
@@ -6172,9 +6007,7 @@ def check_context_scan_a_gll_matrix(
                 os.environ[name] = value
 
 
-def check_context_scan_b_phased_matrix(
-    module, device: torch.device, heads: int
-):
+def check_context_scan_b_phased_matrix(module, device: torch.device, heads: int):
     """Prove the HI=false/NW2 two-phase streamed-b scan is exact.
 
     Dense, packed-VL, and strict tight-grid cases cover every HI=false state
@@ -6235,18 +6068,16 @@ def check_context_scan_b_phased_matrix(
         os.environ["FLASH_KDA_GFX950_BT16_K1"] = "1"
         os.environ["FLASH_KDA_GFX950_BT16_FUSED"] = "vector_x32"
         os.environ[
-            "FLASH_KDA_GFX950_CONTEXT_HYBRID"
-            if hybrid
-            else "FLASH_KDA_GFX950_CONTEXT_AFFINE"
+            (
+                "FLASH_KDA_GFX950_CONTEXT_HYBRID"
+                if hybrid
+                else "FLASH_KDA_GFX950_CONTEXT_AFFINE"
+            )
         ] = "1"
-        os.environ["FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS"] = str(
-            group_chunks
-        )
+        os.environ["FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS"] = str(group_chunks)
         os.environ["FLASH_KDA_GFX950_CONTEXT_DIRECT_NW"] = "4"
         os.environ["FLASH_KDA_GFX950_CONTEXT_SCAN_NW"] = str(scan_nw)
-        os.environ["FLASH_KDA_GFX950_CONTEXT_TIGHT_SCAN"] = (
-            "1" if tight else "0"
-        )
+        os.environ["FLASH_KDA_GFX950_CONTEXT_TIGHT_SCAN"] = "1" if tight else "0"
         os.environ["FLASH_KDA_GFX950_CONTEXT_OPERAND_CACHE"] = "1"
         os.environ["FLASH_KDA_GFX950_CONTEXT_U_FORWARD"] = "0"
         os.environ["FLASH_KDA_GFX950_CONTEXT_V_FORWARD"] = "0"
@@ -6311,16 +6142,11 @@ def check_context_scan_b_phased_matrix(
             tight=tight,
         )
         torch.cuda.synchronize(device)
-        for mode_name, tensors in (("established", established),
-                                   ("two-phase", phased)):
+        for mode_name, tensors in (("established", established), ("two-phase", phased)):
             checked = tensors if x["output_final_state"] else tensors[:1]
-            if any(
-                not bool(torch.isfinite(tensor).all().item())
-                for tensor in checked
-            ):
+            if any(not bool(torch.isfinite(tensor).all().item()) for tensor in checked):
                 raise AssertionError(
-                    f"scan two-phase {label}: {mode_name} produced "
-                    "non-finite data"
+                    f"scan two-phase {label}: {mode_name} produced " "non-finite data"
                 )
         assert_same(
             phased[0],
@@ -6394,9 +6220,7 @@ def check_context_scan_b_phased_matrix(
 
         def checked(status: int, operation: str) -> None:
             if status != 0:
-                raise RuntimeError(
-                    f"{operation} failed with HIP status {status}"
-                )
+                raise RuntimeError(f"{operation} failed with HIP status {status}")
 
         configure(
             64,
@@ -6420,15 +6244,11 @@ def check_context_scan_b_phased_matrix(
         )
         nodes = (ctypes.c_void_p * count.value)()
         checked(
-            hip.hipGraphGetNodes(
-                graph_handle, nodes, ctypes.byref(count)
-            ),
+            hip.hipGraphGetNodes(graph_handle, nodes, ctypes.byref(count)),
             "hipGraphGetNodes(nodes)",
         )
 
-        stream = ctypes.c_void_p(
-            torch.cuda.current_stream(device).cuda_stream
-        )
+        stream = ctypes.c_void_p(torch.cuda.current_stream(device).cuda_stream)
         kernel_names = []
         for node in nodes[: count.value]:
             node_type = ctypes.c_int()
@@ -6440,9 +6260,7 @@ def check_context_scan_b_phased_matrix(
                 continue
             params = HipKernelNodeParams()
             checked(
-                hip.hipGraphKernelNodeGetParams(
-                    node, ctypes.byref(params)
-                ),
+                hip.hipGraphKernelNodeGetParams(node, ctypes.byref(params)),
                 "hipGraphKernelNodeGetParams",
             )
             raw_name = hip.hipKernelNameRefByPtr(params.func, stream)
@@ -6455,15 +6273,11 @@ def check_context_scan_b_phased_matrix(
             except (AttributeError, RuntimeError):
                 pass
             kernel_names.append(
-                raw_text
-                if demangled == raw_text
-                else f"{raw_text}\n{demangled}"
+                raw_text if demangled == raw_text else f"{raw_text}\n{demangled}"
             )
 
         scan_names = [
-            name
-            for name in kernel_names
-            if "k2_kda_context_affine_scan" in name
+            name for name in kernel_names if "k2_kda_context_affine_scan" in name
         ]
         if len(scan_names) != 1 or expected_name not in scan_names[0]:
             raise AssertionError(
@@ -6485,27 +6299,18 @@ def check_context_scan_b_phased_matrix(
         ("packed-vl", (0, 1025, 2049), True, False, False),
         ("packed-tight", tight_lens, True, True, True),
     )
-    phased_name = (
-        "k2_kda_context_affine_scan_b_stream_b_phased_nw2_kernel"
-    )
+    phased_name = "k2_kda_context_affine_scan_b_stream_b_phased_nw2_kernel"
     a_gll_name = "k2_kda_context_affine_scan_b_stream_a_gll_nw2_kernel"
     b_stream_name = "k2_kda_context_affine_scan_b_stream_nw4_kernel"
     legacy_name = "k2_kda_context_affine_scan_nw4_kernel"
 
     try:
         for group_chunks in (32, 64, 128):
-            tight_total_tiles = (
-                (sum(tight_lens) + 15) // 16 + len(tight_lens)
-            )
-            tight_max_affine_sequences = min(
-                len(tight_lens), tight_total_tiles // 65
-            )
+            tight_total_tiles = (sum(tight_lens) + 15) // 16 + len(tight_lens)
+            tight_max_affine_sequences = min(len(tight_lens), tight_total_tiles // 65)
             tight_context_upper = max(
                 1,
-                (
-                    tight_total_tiles
-                    + tight_max_affine_sequences * (group_chunks - 1)
-                )
+                (tight_total_tiles + tight_max_affine_sequences * (group_chunks - 1))
                 // group_chunks,
             )
             if tight_context_upper >= len(tight_lens):
@@ -6633,12 +6438,8 @@ def check_context_scan_b_phased_matrix(
                 expected_name=b_stream_name,
             )
 
-        a_gll_reference = run(
-            parser_x, 64, 2, "0", a_gll="1"
-        )
-        a_gll_requested = run(
-            parser_x, 64, 2, "1", a_gll="1"
-        )
+        a_gll_reference = run(parser_x, 64, 2, "0", a_gll="1")
+        a_gll_requested = run(parser_x, 64, 2, "1", a_gll="1")
         torch.cuda.synchronize(device)
         assert_same(
             a_gll_requested[0],
@@ -6658,9 +6459,7 @@ def check_context_scan_b_phased_matrix(
             expected_name=a_gll_name,
         )
 
-        a_gll_fallback = run(
-            parser_x, 64, 2, "1", a_gll="true"
-        )
+        a_gll_fallback = run(parser_x, 64, 2, "1", a_gll="true")
         torch.cuda.synchronize(device)
         assert_same(
             a_gll_fallback[0],
@@ -6726,9 +6525,7 @@ def check_context_scan_b_phased_matrix(
                 os.environ[name] = value
 
 
-def check_context_scan_ksplit_matrix(
-    module, device: torch.device, heads: int
-) -> None:
+def check_context_scan_ksplit_matrix(module, device: torch.device, heads: int) -> None:
     """A/B the WG4 K64+K64 affine scan with numerical error gates."""
 
     if flash_kda._device_arch(device) != "gfx950":
@@ -6779,9 +6576,7 @@ def check_context_scan_ksplit_matrix(
             os.environ.pop(name, None)
         os.environ["FLASH_KDA_GFX950_BT16_K1"] = "1"
         os.environ["FLASH_KDA_GFX950_BT16_FUSED"] = "vector_x32"
-        os.environ["FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS"] = str(
-            group_chunks
-        )
+        os.environ["FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS"] = str(group_chunks)
         os.environ["FLASH_KDA_GFX950_CONTEXT_DIRECT_NW"] = "4"
         os.environ[_CONTEXT_NW8_ENV] = "0"
         os.environ[_CONTEXT_AFFINE_AB_FUSED_ENV] = "1"
@@ -6823,32 +6618,22 @@ def check_context_scan_ksplit_matrix(
         reference_f = reference.float()
         if not bool(torch.isfinite(actual_f).all().item()):
             raise AssertionError(f"{label}: candidate contains non-finite data")
-        difference_rms = torch.sqrt(
-            torch.mean(torch.square(actual_f - reference_f))
-        )
+        difference_rms = torch.sqrt(torch.mean(torch.square(actual_f - reference_f)))
         reference_rms = torch.sqrt(torch.mean(torch.square(reference_f)))
-        relative_rms = float(
-            (difference_rms / reference_rms.clamp_min(1.0e-12)).item()
-        )
+        relative_rms = float((difference_rms / reference_rms.clamp_min(1.0e-12)).item())
         if relative_rms > 1.0e-4:
             raise AssertionError(
                 f"{label}: relative RMS {relative_rms:.6e} exceeds 1e-4"
             )
         return relative_rms
 
-    def assert_candidate(
-        actual, reference, label: str
-    ) -> tuple[float, float | None]:
-        output_error = assert_relative_rms(
-            actual[0], reference[0], f"{label} output"
-        )
+    def assert_candidate(actual, reference, label: str) -> tuple[float, float | None]:
+        output_error = assert_relative_rms(actual[0], reference[0], f"{label} output")
         state_error = None
         if reference[1] is not None:
             if actual[1] is None:
                 raise AssertionError(f"{label}: candidate omitted final state")
-            state_error = assert_relative_rms(
-                actual[1], reference[1], f"{label} state"
-            )
+            state_error = assert_relative_rms(actual[1], reference[1], f"{label} state")
         return output_error, state_error
 
     def stress_inputs(x, stress: str) -> None:
@@ -6910,9 +6695,7 @@ def check_context_scan_ksplit_matrix(
 
         def checked(status: int, operation: str) -> None:
             if status != 0:
-                raise RuntimeError(
-                    f"{operation} failed with HIP status {status}"
-                )
+                raise RuntimeError(f"{operation} failed with HIP status {status}")
 
         configure(**configuration)
         out, final, workspace = allocate(x)
@@ -6932,14 +6715,10 @@ def check_context_scan_ksplit_matrix(
         )
         nodes = (ctypes.c_void_p * count.value)()
         checked(
-            hip.hipGraphGetNodes(
-                graph_handle, nodes, ctypes.byref(count)
-            ),
+            hip.hipGraphGetNodes(graph_handle, nodes, ctypes.byref(count)),
             "hipGraphGetNodes(nodes)",
         )
-        stream = ctypes.c_void_p(
-            torch.cuda.current_stream(device).cuda_stream
-        )
+        stream = ctypes.c_void_p(torch.cuda.current_stream(device).cuda_stream)
         records = []
         for node in nodes[: count.value]:
             node_type = ctypes.c_int()
@@ -6951,9 +6730,7 @@ def check_context_scan_ksplit_matrix(
                 continue
             params = HipKernelNodeParams()
             checked(
-                hip.hipGraphKernelNodeGetParams(
-                    node, ctypes.byref(params)
-                ),
+                hip.hipGraphKernelNodeGetParams(node, ctypes.byref(params)),
                 "hipGraphKernelNodeGetParams",
             )
             raw_name = hip.hipKernelNameRefByPtr(params.func, stream)
@@ -7000,12 +6777,13 @@ def check_context_scan_ksplit_matrix(
                 f"{label}: K-split selection={has_ksplit}, expected {ksplit}: "
                 f"{record['name']!r}"
             )
-        if ksplit and re.search(
-            rf"ksplit_wg4_kernelI(?:Li)?{group_chunks}E", record["name"]
-        ) is None:
+        if (
+            ksplit
+            and re.search(rf"ksplit_wg4_kernelI(?:Li)?{group_chunks}E", record["name"])
+            is None
+        ):
             raise AssertionError(
-                f"{label}: selected the wrong G specialization: "
-                f"{record['name']!r}"
+                f"{label}: selected the wrong G specialization: " f"{record['name']!r}"
             )
         expected_block = (256 if ksplit else 128, 1, 1)
         expected_grid = (expected_grid_x, 4, 1)
@@ -7104,17 +6882,13 @@ def check_context_scan_ksplit_matrix(
             reference = run(x, ksplit="0", **common)
             candidate = run(x, ksplit="1", **common)
             torch.cuda.synchronize(device)
-            output_error, state_error = assert_candidate(
-                candidate, reference, label
-            )
+            output_error, state_error = assert_candidate(candidate, reference, label)
             assert_same(
                 x["initial_state"],
                 initial_copy,
                 f"{label}: initial state mutated",
             )
-            state_text = (
-                "n/a" if state_error is None else f"{state_error:.3e}"
-            )
+            state_text = "n/a" if state_error is None else f"{state_error:.3e}"
             print(
                 f"PASS context K-split {label}: "
                 f"output_rms={output_error:.3e}, state_rms={state_text}"
@@ -7235,18 +7009,19 @@ def check_context_scan_ksplit_matrix(
             requested = run(x, **requested_options)
             torch.cuda.synchronize(device)
             assert_same(
-                requested[0], reference[0],
+                requested[0],
+                reference[0],
                 f"K-split {label} fallback output mismatch",
             )
             if x["output_final_state"]:
                 assert_same(
-                    requested[1], reference[1],
+                    requested[1],
+                    reference[1],
                     f"K-split {label} fallback state mismatch",
                 )
             records = capture_scan_records(x, **requested_options)
             if any(
-                "affine_scan_ksplit_wg4_kernel" in record["name"]
-                for record in records
+                "affine_scan_ksplit_wg4_kernel" in record["name"] for record in records
             ):
                 raise AssertionError(
                     f"K-split {label} fallback reached candidate: {records!r}"
@@ -7376,9 +7151,7 @@ def check_plain_beta_cache_matrix(module, device: torch.device, heads: int):
         for name in controlled_env:
             os.environ.pop(name, None)
         os.environ["FLASH_KDA_GFX950_BT16_K1"] = "1"
-        os.environ["FLASH_KDA_GFX950_BT16_FUSED"] = (
-            "vector_x32" if fused else "0"
-        )
+        os.environ["FLASH_KDA_GFX950_BT16_FUSED"] = "vector_x32" if fused else "0"
         os.environ["FLASH_KDA_GFX950_FUSED_K1"] = "1"
         os.environ["FLASH_KDA_GFX950_PLAIN_BETA_CACHE"] = "1" if cache else "0"
         os.environ["FLASH_KDA_GFX950_SCAN_DECAY_CACHE"] = "0"
@@ -7459,11 +7232,13 @@ def check_plain_beta_cache_matrix(module, device: torch.device, heads: int):
         fallback_on = run(fallback, cache=True, fused=False)
         torch.cuda.synchronize(device)
         assert_same(
-            fallback_on[0], fallback_off[0],
+            fallback_on[0],
+            fallback_off[0],
             "disabled fused producer consumed stale beta output",
         )
         assert_same(
-            fallback_on[1], fallback_off[1],
+            fallback_on[1],
+            fallback_off[1],
             "disabled fused producer consumed stale beta state",
         )
         print("PASS fused-producer beta-cache handshake fallback")
@@ -7484,9 +7259,7 @@ def check_plain_beta_cache_matrix(module, device: torch.device, heads: int):
         restore_env()
 
 
-def check_forced_csplit_empty_state_matrix(
-    module, device: torch.device, heads: int
-):
+def check_forced_csplit_empty_state_matrix(module, device: torch.device, heads: int):
     """Prove every explicit C-split scan leaves the empty-state identity."""
 
     if flash_kda._device_arch(device) != "gfx950":
@@ -7612,9 +7385,9 @@ def check_forced_csplit_empty_state_matrix(
             raise AssertionError(
                 f"forced csplit64 graph has wrong prefix topology: {names!r}"
             )
-        if sum(
-            "k2_kda_csplit_bt64_scan_kernel" in name for name in names
-        ) != 1 or any("k2_kda_context" in name for name in names):
+        if sum("k2_kda_csplit_bt64_scan_kernel" in name for name in names) != 1 or any(
+            "k2_kda_context" in name for name in names
+        ):
             raise AssertionError(
                 f"forced csplit64 graph reached the wrong K2 route: {names!r}"
             )
@@ -7752,15 +7525,11 @@ def check_plain_decay_cache_matrix(module, device: torch.device, heads: int):
             os.environ.pop(name, None)
         os.environ["FLASH_KDA_GFX950_BT16_K1"] = "1" if bt16_k1 else "0"
         os.environ["FLASH_KDA_GFX950_BT16_FUSED"] = "vector_x32"
-        os.environ["FLASH_KDA_GFX950_FUSED_K1"] = (
-            "1" if fused_postprep else "0"
-        )
+        os.environ["FLASH_KDA_GFX950_FUSED_K1"] = "1" if fused_postprep else "0"
         # Exercise the supported combined-cache specialization throughout.
         os.environ["FLASH_KDA_GFX950_PLAIN_BETA_CACHE"] = "1"
         if decay is not None:
-            os.environ["FLASH_KDA_GFX950_SCAN_DECAY_CACHE"] = (
-                "1" if decay else "0"
-            )
+            os.environ["FLASH_KDA_GFX950_SCAN_DECAY_CACHE"] = "1" if decay else "0"
         if k2 is not None:
             os.environ["FLASH_KDA_K2"] = k2
         if skip_prep:
@@ -7822,13 +7591,9 @@ def check_plain_decay_cache_matrix(module, device: torch.device, heads: int):
                 cached = run(x, decay=True)
                 torch.cuda.synchronize(device)
                 label = f"plain suffix decay {layout_name}/{mode_name}"
-                assert_result_same(
-                    rollback, unset, f"{label} unset-vs-zero rollback"
-                )
+                assert_result_same(rollback, unset, f"{label} unset-vs-zero rollback")
                 assert_result_same(cached, rollback, f"{label} off-vs-on")
-                assert_same(
-                    x["initial_state"], initial_copy, f"{label} input mutated"
-                )
+                assert_same(x["initial_state"], initial_copy, f"{label} input mutated")
                 print(f"PASS bitwise {label}")
 
         fallback = make_inputs((257, 513), heads, device, packed=True)
@@ -7975,18 +7740,12 @@ def check_plain_postprep_opt_matrix(module, device: torch.device, heads: int):
     ):
         for name in controlled_env:
             os.environ.pop(name, None)
-        os.environ["FLASH_KDA_GFX950_BT16_K1"] = (
-            "1" if bt16_k1 else "0"
-        )
+        os.environ["FLASH_KDA_GFX950_BT16_K1"] = "1" if bt16_k1 else "0"
         os.environ["FLASH_KDA_GFX950_BT16_FUSED"] = "vector_x32"
         os.environ["FLASH_KDA_GFX950_FUSED_K1"] = "1"
         os.environ["FLASH_KDA_GFX950_FUSED_K1_PADDED"] = "1"
-        os.environ["FLASH_KDA_GFX950_PLAIN_BETA_CACHE"] = (
-            "1" if beta_cache else "0"
-        )
-        os.environ["FLASH_KDA_GFX950_SCAN_DECAY_CACHE"] = (
-            "1" if decay_cache else "0"
-        )
+        os.environ["FLASH_KDA_GFX950_PLAIN_BETA_CACHE"] = "1" if beta_cache else "0"
+        os.environ["FLASH_KDA_GFX950_SCAN_DECAY_CACHE"] = "1" if decay_cache else "0"
         if dead is not None:
             os.environ[dead_axis] = dead
         if merged is not None:
@@ -8074,9 +7833,7 @@ def check_plain_postprep_opt_matrix(module, device: torch.device, heads: int):
                             )
                         )
                     torch.cuda.synchronize(device)
-                    label = (
-                        f"postprep {cache_name}/{layout_name}/{mode_name}"
-                    )
+                    label = f"postprep {cache_name}/{layout_name}/{mode_name}"
                     for schedule_name, candidate in candidates:
                         assert_result_same(
                             candidate,
@@ -8427,8 +8184,7 @@ def check_plain_internal_layout_matrix(module, device: torch.device, heads: int)
                     f"plain internal layout {layout_name}/{mode_name} input mutated",
                 )
                 print(
-                    "PASS bitwise plain internal layout "
-                    f"{layout_name}/{mode_name}"
+                    "PASS bitwise plain internal layout " f"{layout_name}/{mode_name}"
                 )
 
         probe = make_inputs(
@@ -8610,9 +8366,7 @@ def check_public_graph(x, reference_out, reference_final):
     print("PASS allocation-owning public graph capture/replay")
 
 
-def check_preallocated_multistream(
-    abi, module, x, reference_out, reference_final
-):
+def check_preallocated_multistream(abi, module, x, reference_out, reference_final):
     device = x["q"].device
     stream_a = torch.cuda.Stream(device=device)
     stream_b = torch.cuda.Stream(device=device)
@@ -8655,9 +8409,7 @@ def check_public_multistream(x, reference_out, reference_final):
     print("PASS concurrent allocation-owning public two-stream calls")
 
 
-def check_context_affine_ab_fused_matrix(
-    module, device: torch.device, heads: int
-):
+def check_context_affine_ab_fused_matrix(module, device: torch.device, heads: int):
     """A/B the packed NW4/P0 fused affine B+A producer."""
 
     if flash_kda._device_arch(device) != "gfx950":
@@ -8707,17 +8459,13 @@ def check_context_affine_ab_fused_matrix(
         global_pipeline: str = "0",
         pipeline_mask: str = "000",
     ) -> None:
-        if len(pipeline_mask) != 3 or any(
-            bit not in "01" for bit in pipeline_mask
-        ):
+        if len(pipeline_mask) != 3 or any(bit not in "01" for bit in pipeline_mask):
             raise ValueError(f"invalid B/A/replay mask: {pipeline_mask!r}")
         for name in controlled_env:
             os.environ.pop(name, None)
         os.environ["FLASH_KDA_GFX950_BT16_K1"] = "1"
         os.environ["FLASH_KDA_GFX950_BT16_FUSED"] = "vector_x32"
-        os.environ["FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS"] = str(
-            group_chunks
-        )
+        os.environ["FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS"] = str(group_chunks)
         os.environ["FLASH_KDA_GFX950_CONTEXT_DIRECT_NW"] = "4"
         os.environ[_CONTEXT_NW8_ENV] = nw8
         os.environ["FLASH_KDA_GFX950_CONTEXT_SCAN_NW"] = "2"
@@ -8807,9 +8555,7 @@ def check_context_affine_ab_fused_matrix(
 
         def checked(status: int, operation: str) -> None:
             if status != 0:
-                raise RuntimeError(
-                    f"{operation} failed with HIP status {status}"
-                )
+                raise RuntimeError(f"{operation} failed with HIP status {status}")
 
         configure(**configuration)
         out, final, workspace = allocate(x)
@@ -8827,14 +8573,10 @@ def check_context_affine_ab_fused_matrix(
         )
         nodes = (ctypes.c_void_p * count.value)()
         checked(
-            hip.hipGraphGetNodes(
-                graph_handle, nodes, ctypes.byref(count)
-            ),
+            hip.hipGraphGetNodes(graph_handle, nodes, ctypes.byref(count)),
             "hipGraphGetNodes(nodes)",
         )
-        stream = ctypes.c_void_p(
-            torch.cuda.current_stream(device).cuda_stream
-        )
+        stream = ctypes.c_void_p(torch.cuda.current_stream(device).cuda_stream)
         records = []
         for node in nodes[: count.value]:
             node_type = ctypes.c_int()
@@ -8846,9 +8588,7 @@ def check_context_affine_ab_fused_matrix(
                 continue
             params = HipKernelNodeParams()
             checked(
-                hip.hipGraphKernelNodeGetParams(
-                    node, ctypes.byref(params)
-                ),
+                hip.hipGraphKernelNodeGetParams(node, ctypes.byref(params)),
                 "hipGraphKernelNodeGetParams",
             )
             raw_name = hip.hipKernelNameRefByPtr(params.func, stream)
@@ -8922,9 +8662,7 @@ def check_context_affine_ab_fused_matrix(
             if producer_kind(record["name"]) == "affine_a"
         ]
         fused_nodes = [
-            record
-            for record in fused
-            if producer_kind(record["name"]) == "fused"
+            record for record in fused if producer_kind(record["name"]) == "fused"
         ]
         residual_producers = [
             record
@@ -8954,12 +8692,8 @@ def check_context_affine_ab_fused_matrix(
                 f"{node['name']!r}"
             )
         if node["block"] != (256, 1, 1) or node["grid"][1:] != (2, 1):
-            raise AssertionError(
-                f"{label}: fused launch block/grid is wrong: {node}"
-            )
-        if node["shared"] != 0 or not (
-            node["has_params"] or node["has_extra"]
-        ):
+            raise AssertionError(f"{label}: fused launch block/grid is wrong: {node}")
+        if node["shared"] != 0 or not (node["has_params"] or node["has_extra"]):
             raise AssertionError(
                 f"{label}: fused graph kernel ABI fields are wrong: {node}"
             )
@@ -8972,9 +8706,7 @@ def check_context_affine_ab_fused_matrix(
                 raise AssertionError(
                     f"{label}: fused grid differs from standalone producer"
                 )
-        established_rest = normalized_records(
-            established, {"affine_b", "affine_a"}
-        )
+        established_rest = normalized_records(established, {"affine_b", "affine_a"})
         fused_rest = normalized_records(fused, {"fused"})
         if established_rest != fused_rest:
             raise AssertionError(
@@ -8983,15 +8715,11 @@ def check_context_affine_ab_fused_matrix(
 
     def assert_fallback_graph(reference, candidate, label: str) -> None:
         fused_nodes = [
-            record
-            for record in candidate
-            if producer_kind(record["name"]) == "fused"
+            record for record in candidate if producer_kind(record["name"]) == "fused"
         ]
         if fused_nodes:
             raise AssertionError(f"{label}: unexpectedly launched fusion")
-        if normalized_records(reference, set()) != normalized_records(
-            candidate, set()
-        ):
+        if normalized_records(reference, set()) != normalized_records(candidate, set()):
             raise AssertionError(
                 f"{label}: fallback graph differs from established graph"
             )
@@ -9070,9 +8798,7 @@ def check_context_affine_ab_fused_matrix(
                     initial_copy,
                     f"affine B/A fused {case_name}/{state_name} input mutated",
                 )
-                print(
-                    f"PASS bitwise affine B/A fused {case_name}/{state_name}"
-                )
+                print(f"PASS bitwise affine B/A fused {case_name}/{state_name}")
 
         graph_x = make_inputs(
             (0, 1023, 1024, 1025, 2049),
@@ -9084,12 +8810,8 @@ def check_context_affine_ab_fused_matrix(
             output_final_state=True,
         )
         graph_options = {"route": "affine", "group_chunks": 64}
-        established_graph = capture_kernel_records(
-            graph_x, fused="0", **graph_options
-        )
-        fused_graph = capture_kernel_records(
-            graph_x, fused="1", **graph_options
-        )
+        established_graph = capture_kernel_records(graph_x, fused="0", **graph_options)
+        fused_graph = capture_kernel_records(graph_x, fused="1", **graph_options)
         assert_fused_topology(
             established_graph,
             fused_graph,
@@ -9157,9 +8879,7 @@ def check_context_affine_ab_fused_matrix(
         hybrid_established = capture_kernel_records(
             hybrid_x, fused="0", **hybrid_options
         )
-        hybrid_fused = capture_kernel_records(
-            hybrid_x, fused="1", **hybrid_options
-        )
+        hybrid_fused = capture_kernel_records(hybrid_x, fused="1", **hybrid_options)
         assert_fused_topology(
             hybrid_established,
             hybrid_fused,
@@ -9172,9 +8892,7 @@ def check_context_affine_ab_fused_matrix(
         )
 
         parser_reference = run(graph_x, fused=None, **graph_options)
-        reference_graph = capture_kernel_records(
-            graph_x, fused=None, **graph_options
-        )
+        reference_graph = capture_kernel_records(graph_x, fused=None, **graph_options)
         for spelling in (None, "", "0", "01", "true", "1 ", " 1"):
             candidate = run(graph_x, fused=spelling, **graph_options)
             torch.cuda.synchronize(device)
@@ -9212,12 +8930,8 @@ def check_context_affine_ab_fused_matrix(
                 reference,
                 f"affine B/A fused missing {prerequisite}",
             )
-            reference_nodes = capture_kernel_records(
-                graph_x, fused="0", **options
-            )
-            candidate_nodes = capture_kernel_records(
-                graph_x, fused="1", **options
-            )
+            reference_nodes = capture_kernel_records(graph_x, fused="0", **options)
+            candidate_nodes = capture_kernel_records(graph_x, fused="1", **options)
             assert_fallback_graph(
                 reference_nodes,
                 candidate_nodes,
@@ -9232,12 +8946,8 @@ def check_context_affine_ab_fused_matrix(
             **graph_options,
             "pipeline_mask": "001",
         }
-        replay_pipeline_reference = run(
-            graph_x, fused="0", **replay_pipeline_options
-        )
-        replay_pipeline_candidate = run(
-            graph_x, fused="1", **replay_pipeline_options
-        )
+        replay_pipeline_reference = run(graph_x, fused="0", **replay_pipeline_options)
+        replay_pipeline_candidate = run(graph_x, fused="1", **replay_pipeline_options)
         torch.cuda.synchronize(device)
         assert_result_same(
             replay_pipeline_candidate,
@@ -9245,12 +8955,8 @@ def check_context_affine_ab_fused_matrix(
             "affine B/A fused with replay pipeline",
         )
         assert_fused_topology(
-            capture_kernel_records(
-                graph_x, fused="0", **replay_pipeline_options
-            ),
-            capture_kernel_records(
-                graph_x, fused="1", **replay_pipeline_options
-            ),
+            capture_kernel_records(graph_x, fused="0", **replay_pipeline_options),
+            capture_kernel_records(graph_x, fused="1", **replay_pipeline_options),
             group_chunks=64,
             label="packed affine G64 with replay pipeline",
         )
@@ -9415,18 +9121,14 @@ def check_context_nw8_matrix(module, device: torch.device, heads: int):
         global_pipeline: str = "0",
         pipeline_mask: str = "000",
     ) -> None:
-        if len(pipeline_mask) != 3 or any(
-            bit not in "01" for bit in pipeline_mask
-        ):
+        if len(pipeline_mask) != 3 or any(bit not in "01" for bit in pipeline_mask):
             raise ValueError(f"invalid B/A/replay mask: {pipeline_mask!r}")
         for name in controlled_env:
             os.environ.pop(name, None)
         os.environ["FLASH_KDA_GFX950_BT16_K1"] = "1"
         os.environ["FLASH_KDA_GFX950_BT16_FUSED"] = "vector_x32"
         os.environ["FLASH_KDA_GFX950_CONTEXT_DIRECT_NW"] = direct_nw
-        os.environ["FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS"] = str(
-            group_chunks
-        )
+        os.environ["FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS"] = str(group_chunks)
         os.environ["FLASH_KDA_GFX950_CONTEXT_SCAN_NW"] = "2"
         os.environ["FLASH_KDA_GFX950_CONTEXT_TIGHT_SCAN"] = "0"
         os.environ["FLASH_KDA_GFX950_CONTEXT_OPERAND_CACHE"] = operand_cache
@@ -9513,9 +9215,7 @@ def check_context_nw8_matrix(module, device: torch.device, heads: int):
 
         def checked(status: int, operation: str) -> None:
             if status != 0:
-                raise RuntimeError(
-                    f"{operation} failed with HIP status {status}"
-                )
+                raise RuntimeError(f"{operation} failed with HIP status {status}")
 
         configure(**configuration)
         out, final, workspace = allocate(x)
@@ -9532,14 +9232,10 @@ def check_context_nw8_matrix(module, device: torch.device, heads: int):
         )
         nodes = (ctypes.c_void_p * count.value)()
         checked(
-            hip.hipGraphGetNodes(
-                graph_handle, nodes, ctypes.byref(count)
-            ),
+            hip.hipGraphGetNodes(graph_handle, nodes, ctypes.byref(count)),
             "hipGraphGetNodes(nodes)",
         )
-        stream = ctypes.c_void_p(
-            torch.cuda.current_stream(device).cuda_stream
-        )
+        stream = ctypes.c_void_p(torch.cuda.current_stream(device).cuda_stream)
         records = []
         for node in nodes[: count.value]:
             node_type = ctypes.c_int()
@@ -9551,9 +9247,7 @@ def check_context_nw8_matrix(module, device: torch.device, heads: int):
                 continue
             params = HipKernelNodeParams()
             checked(
-                hip.hipGraphKernelNodeGetParams(
-                    node, ctypes.byref(params)
-                ),
+                hip.hipGraphKernelNodeGetParams(node, ctypes.byref(params)),
                 "hipGraphKernelNodeGetParams",
             )
             raw_name = hip.hipKernelNameRefByPtr(params.func, stream)
@@ -9598,8 +9292,7 @@ def check_context_nw8_matrix(module, device: torch.device, heads: int):
         records = capture_context_topology(x, **configuration)
         if len(records) != expected_nodes:
             raise AssertionError(
-                f"{label}: expected {expected_nodes} context nodes, "
-                f"got {records!r}"
+                f"{label}: expected {expected_nodes} context nodes, " f"got {records!r}"
             )
         expected_block = (expected_nw * 64, 1, 1)
         for record in records:
@@ -9609,8 +9302,7 @@ def check_context_nw8_matrix(module, device: torch.device, heads: int):
                 )
             if record["nw"] != expected_nw:
                 raise AssertionError(
-                    f"{label}: symbol NW={record['nw']}, "
-                    f"expected {expected_nw}"
+                    f"{label}: symbol NW={record['nw']}, " f"expected {expected_nw}"
                 )
             if record["tail_first"] != expected_tail_first:
                 raise AssertionError(
@@ -9619,8 +9311,7 @@ def check_context_nw8_matrix(module, device: torch.device, heads: int):
                 )
             if record["block"] != expected_block:
                 raise AssertionError(
-                    f"{label}: block={record['block']}, "
-                    f"expected {expected_block}"
+                    f"{label}: block={record['block']}, " f"expected {expected_block}"
                 )
             if record["direct"]:
                 expected_grid = (x["N"] * heads, 8 // expected_nw, 1)
@@ -9631,10 +9322,7 @@ def check_context_nw8_matrix(module, device: torch.device, heads: int):
                     )
             else:
                 expected_grid_y = 8 // expected_nw
-                if (
-                    record["grid"][1] != expected_grid_y
-                    or record["grid"][2] != 1
-                ):
+                if record["grid"][1] != expected_grid_y or record["grid"][2] != 1:
                     raise AssertionError(
                         f"{label}: affine grid={record['grid']}, expected "
                         f"grid.y={expected_grid_y}, grid.z=1"
@@ -9682,9 +9370,7 @@ def check_context_nw8_matrix(module, device: torch.device, heads: int):
                                 f"context {mode_name} {case_name}/{state_name} "
                                 "produced non-finite data"
                             )
-                assert_result_same(
-                    nw8, nw4, f"context NW8 {case_name}/{state_name}"
-                )
+                assert_result_same(nw8, nw4, f"context NW8 {case_name}/{state_name}")
                 assert_same(
                     x["initial_state"],
                     initial_copy,
@@ -9766,9 +9452,7 @@ def check_context_nw8_matrix(module, device: torch.device, heads: int):
 
         # Any missing prerequisite must select the established NW4 launch,
         # even when either NW8 control requests the larger workgroup.
-        affine_fallback_x = make_inputs(
-            (0, 1025, 2049), heads, device, packed=True
-        )
+        affine_fallback_x = make_inputs((0, 1025, 2049), heads, device, packed=True)
         for prerequisite, overrides in (
             ("operand-cache", {"operand_cache": "0"}),
             ("U-forward", {"u_forward": "0"}),
@@ -9810,9 +9494,7 @@ def check_context_nw8_matrix(module, device: torch.device, heads: int):
                 **options,
                 "direct_nw": "8",
             }
-            direct_candidate = run(
-                parser_x, nw8=None, **direct_options
-            )
+            direct_candidate = run(parser_x, nw8=None, **direct_options)
             torch.cuda.synchronize(device)
             assert_result_same(
                 direct_candidate,
@@ -9829,13 +9511,9 @@ def check_context_nw8_matrix(module, device: torch.device, heads: int):
             )
         print("PASS context NW8 cache/U/V prerequisite fallback to NW4")
 
-        direct_nw8 = run(
-            parser_x, nw8=None, direct_nw="8", **parser_options
-        )
+        direct_nw8 = run(parser_x, nw8=None, direct_nw="8", **parser_options)
         torch.cuda.synchronize(device)
-        assert_result_same(
-            direct_nw8, parser_reference, "context DIRECT_NW=8"
-        )
+        assert_result_same(direct_nw8, parser_reference, "context DIRECT_NW=8")
         assert_topology(
             parser_x,
             nw8=None,
@@ -9876,9 +9554,7 @@ def check_context_nw8_matrix(module, device: torch.device, heads: int):
                 candidate = run(tail_x, tail_first="1", **options)
                 torch.cuda.synchronize(device)
                 label = f"context tail-first {case_name}/{state_name}"
-                assert_bitwise_same(
-                    candidate[0], reference[0], f"{label} output"
-                )
+                assert_bitwise_same(candidate[0], reference[0], f"{label} output")
                 if output_final_state:
                     if candidate[1] is None or reference[1] is None:
                         raise AssertionError(f"{label} omitted final state")
@@ -9949,8 +9625,8 @@ def check_context_nw8_matrix(module, device: torch.device, heads: int):
                 reference,
                 f"context tail-first missing {prerequisite}",
             )
-            expected_nw = 8 if prerequisite == "NW8" else int(
-                options.get("direct_nw", "4")
+            expected_nw = (
+                8 if prerequisite == "NW8" else int(options.get("direct_nw", "4"))
             )
             assert_topology(
                 parser_x,
@@ -9963,9 +9639,7 @@ def check_context_nw8_matrix(module, device: torch.device, heads: int):
             )
         print("PASS context tail-first prerequisite fallback")
 
-        affine_x = make_inputs(
-            (0, 1025, 2049), heads, device, packed=True
-        )
+        affine_x = make_inputs((0, 1025, 2049), heads, device, packed=True)
         hybrid_x = make_inputs(
             (0, 1, 1024, 1025, 2049, 65, 513, 1537, 257),
             heads,
@@ -10099,9 +9773,7 @@ def check_context_u_forward_matrix(module, device: torch.device, heads: int):
         os.environ["FLASH_KDA_GFX950_BT16_K1"] = "1"
         os.environ["FLASH_KDA_GFX950_BT16_FUSED"] = "vector_x32"
         os.environ["FLASH_KDA_GFX950_CONTEXT_DIRECT_NW"] = str(direct_nw)
-        os.environ["FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS"] = str(
-            group_chunks
-        )
+        os.environ["FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS"] = str(group_chunks)
         os.environ["FLASH_KDA_GFX950_CONTEXT_SCAN_NW"] = "2"
         os.environ["FLASH_KDA_GFX950_CONTEXT_TIGHT_SCAN"] = "0"
         os.environ["FLASH_KDA_GFX950_CONTEXT_OPERAND_CACHE"] = (
@@ -10137,9 +9809,7 @@ def check_context_u_forward_matrix(module, device: torch.device, heads: int):
         # preserves the original u0v0/u1v0 rollback matrix; with V=1 it covers
         # the new production-default u0v1/u1v1 pair across every route/state.
         for v_forward, case in (
-            (v_forward, case)
-            for v_forward in ("0", "1")
-            for case in cases
+            (v_forward, case) for v_forward in ("0", "1") for case in cases
         ):
             (
                 case_name,
@@ -10185,8 +9855,7 @@ def check_context_u_forward_matrix(module, device: torch.device, heads: int):
                         torch.isfinite(tensor).all().item()
                     ):
                         raise RuntimeError(
-                            f"context U-forward {label}: "
-                            f"non-finite {value_name}"
+                            f"context U-forward {label}: " f"non-finite {value_name}"
                         )
                 assert_result_same(
                     on,
@@ -10320,9 +9989,7 @@ def check_context_v_forward_matrix(module, device: torch.device, heads: int):
         os.environ["FLASH_KDA_GFX950_BT16_K1"] = "1"
         os.environ["FLASH_KDA_GFX950_BT16_FUSED"] = "vector_x32"
         os.environ["FLASH_KDA_GFX950_CONTEXT_DIRECT_NW"] = str(direct_nw)
-        os.environ["FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS"] = str(
-            group_chunks
-        )
+        os.environ["FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS"] = str(group_chunks)
         os.environ["FLASH_KDA_GFX950_CONTEXT_SCAN_NW"] = "2"
         os.environ["FLASH_KDA_GFX950_CONTEXT_TIGHT_SCAN"] = "0"
         os.environ["FLASH_KDA_GFX950_CONTEXT_OPERAND_CACHE"] = (
@@ -10463,9 +10130,7 @@ def check_context_v_forward_matrix(module, device: torch.device, heads: int):
         restore_env()
 
 
-def check_context_lds_pipeline_matrix(
-    module, device: torch.device, heads: int
-):
+def check_context_lds_pipeline_matrix(module, device: torch.device, heads: int):
     """A/B the bit-exact U+V-forward dual-LDS context pipeline."""
 
     if flash_kda._device_arch(device) != "gfx950":
@@ -10598,9 +10263,7 @@ def check_context_lds_pipeline_matrix(
         os.environ["FLASH_KDA_GFX950_BT16_K1"] = "1"
         os.environ["FLASH_KDA_GFX950_BT16_FUSED"] = "vector_x32"
         os.environ["FLASH_KDA_GFX950_CONTEXT_DIRECT_NW"] = str(direct_nw)
-        os.environ["FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS"] = str(
-            group_chunks
-        )
+        os.environ["FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS"] = str(group_chunks)
         os.environ["FLASH_KDA_GFX950_CONTEXT_SCAN_NW"] = "2"
         os.environ["FLASH_KDA_GFX950_CONTEXT_TIGHT_SCAN"] = tight_scan
         os.environ["FLASH_KDA_GFX950_CONTEXT_OPERAND_CACHE"] = (
@@ -10729,13 +10392,9 @@ def check_context_lds_pipeline_matrix(
                 assert_same(
                     x["initial_state"],
                     initial_copy,
-                    f"context LDS pipeline {case_name}/{state_name} "
-                    "input mutated",
+                    f"context LDS pipeline {case_name}/{state_name} " "input mutated",
                 )
-                print(
-                    "PASS bitwise context LDS pipeline "
-                    f"{case_name}/{state_name}"
-                )
+                print("PASS bitwise context LDS pipeline " f"{case_name}/{state_name}")
 
         probe = make_inputs(
             (0, 1, 16, 17, 1024, 1025, 2049, 65, 513),
@@ -10912,9 +10571,7 @@ def check_context_lds_pipeline_matrix(
         global_roles = capture_context_roles(
             graph_probe, mask="000", global_pipeline="1"
         )
-        if any(
-            role["lds_pipeline"] != 1 for role in global_roles.values()
-        ):
+        if any(role["lds_pipeline"] != 1 for role in global_roles.values()):
             raise AssertionError(
                 "legacy global LDS pipeline no longer enables every pass"
             )
@@ -10925,10 +10582,7 @@ def check_context_lds_pipeline_matrix(
                 u_forward=u_forward,
                 v_forward=v_forward,
             )
-            if any(
-                role["lds_pipeline"] != 0
-                for role in inactive_roles.values()
-            ):
+            if any(role["lds_pipeline"] != 0 for role in inactive_roles.values()):
                 raise AssertionError(
                     "per-pass LDS pipeline bypassed U/V guard for "
                     f"U={u_forward}, V={v_forward}: {inactive_roles}"
@@ -10958,12 +10612,8 @@ def check_context_lds_pipeline_matrix(
             )
         print("PASS context LDS-pipeline restricted to U=V=true")
 
-        uncached_p0 = run(
-            probe, pipeline="0", operand_cache=False, **options
-        )
-        uncached_p1 = run(
-            probe, pipeline="1", operand_cache=False, **options
-        )
+        uncached_p0 = run(probe, pipeline="0", operand_cache=False, **options)
+        uncached_p1 = run(probe, pipeline="1", operand_cache=False, **options)
         torch.cuda.synchronize(device)
         assert_result_same(
             uncached_p1,
@@ -10975,9 +10625,7 @@ def check_context_lds_pipeline_matrix(
         restore_env()
 
 
-def check_context_persistent_matrix(
-    module, device: torch.device, heads: int
-) -> None:
+def check_context_persistent_matrix(module, device: torch.device, heads: int) -> None:
     """Gate the packed-hybrid G64 persistent topology as one opt-in.
 
     The candidate is deliberately indivisible: its compact prefix, fused
@@ -11057,17 +10705,13 @@ def check_context_persistent_matrix(
         pipeline_mask: str = "000",
         explicit_k2: str | None = None,
     ) -> None:
-        if len(pipeline_mask) != 3 or any(
-            bit not in "01" for bit in pipeline_mask
-        ):
+        if len(pipeline_mask) != 3 or any(bit not in "01" for bit in pipeline_mask):
             raise ValueError(f"invalid B/A/replay mask: {pipeline_mask!r}")
         for name in controlled_env:
             os.environ.pop(name, None)
         os.environ["FLASH_KDA_GFX950_BT16_K1"] = bt16_k1
         os.environ["FLASH_KDA_GFX950_BT16_FUSED"] = bt16_fused
-        os.environ["FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS"] = str(
-            group_chunks
-        )
+        os.environ["FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS"] = str(group_chunks)
         os.environ["FLASH_KDA_GFX950_CONTEXT_DIRECT_NW"] = direct_nw
         os.environ[_CONTEXT_NW8_ENV] = nw8
         os.environ[_CONTEXT_AFFINE_AB_FUSED_ENV] = fused
@@ -11133,8 +10777,7 @@ def check_context_persistent_matrix(
     persistent_symbols = (
         "k1_build_tile_prefix_hybrid_g64_compact_kernel",
         "k2_kda_context_affine_ab_fused_persistent_g64_nw4_kernel",
-        "k2_kda_context_affine_scan_hybrid_g64_compact_"
-        "grid_stride_nw2_kernel",
+        ("k2_kda_context_affine_scan_hybrid_g64_compact_" "grid_stride_nw2_kernel"),
         "k2_kda_context_replay_hybrid_g64_grid_stride_nw4_kernel",
     )
 
@@ -11154,9 +10797,7 @@ def check_context_persistent_matrix(
                     f"all nodes={names!r}"
                 )
 
-        prefix_nodes = [
-            name for name in names if "k1_build_tile_prefix" in name
-        ]
+        prefix_nodes = [name for name in names if "k1_build_tile_prefix" in name]
         if len(prefix_nodes) != 1 or persistent_symbols[0] not in prefix_nodes[0]:
             raise AssertionError(
                 f"{label}: persistent prefix did not wholly replace the "
@@ -11169,9 +10810,7 @@ def check_context_persistent_matrix(
             if "k2_kda_context_affine_ab_fused_nw4_kernel" in name
         ]
         legacy_scan = [
-            name
-            for name in names
-            if "k2_kda_context_affine_scan_nw4_kernel" in name
+            name for name in names if "k2_kda_context_affine_scan_nw4_kernel" in name
         ]
         legacy_context_roles = []
         direct_roles = []
@@ -11187,8 +10826,7 @@ def check_context_persistent_matrix(
                 legacy_context_roles.append(name)
         if len(direct_roles) != 1:
             raise AssertionError(
-                f"{label}: direct short/empty owner count changed: "
-                f"{direct_roles!r}"
+                f"{label}: direct short/empty owner count changed: " f"{direct_roles!r}"
             )
         if legacy_fused or legacy_scan or legacy_context_roles:
             raise AssertionError(
@@ -11222,13 +10860,8 @@ def check_context_persistent_matrix(
             ("persistent", candidate),
         ):
             checked = result[:2] if result[1] is not None else result[:1]
-            if any(
-                not bool(torch.isfinite(tensor).all().item())
-                for tensor in checked
-            ):
-                raise AssertionError(
-                    f"{label}: {route_name} produced non-finite data"
-                )
+            if any(not bool(torch.isfinite(tensor).all().item()) for tensor in checked):
+                raise AssertionError(f"{label}: {route_name} produced non-finite data")
         assert_result_same(candidate, reference, label)
         assert_same(
             x["initial_state"],
@@ -11240,12 +10873,8 @@ def check_context_persistent_matrix(
     def compare_fallback(x, label: str, **configuration) -> None:
         reference = compare_off_on(x, label, **configuration)
         del reference
-        reference_names = capture_kernel_names(
-            x, persistent="0", **configuration
-        )
-        candidate_names = capture_kernel_names(
-            x, persistent="1", **configuration
-        )
+        reference_names = capture_kernel_names(x, persistent="0", **configuration)
+        candidate_names = capture_kernel_names(x, persistent="1", **configuration)
         assert_fallback_graph(reference_names, candidate_names, label)
 
     boundary_lens = (0, 1, 16, 65, 1024, 1025, 2049, 513, 1537)
@@ -11333,9 +10962,7 @@ def check_context_persistent_matrix(
                 reference_result,
                 f"persistent parser {spelling!r}",
             )
-            candidate_names = capture_kernel_names(
-                graph_x, persistent=spelling
-            )
+            candidate_names = capture_kernel_names(graph_x, persistent=spelling)
             assert_fallback_graph(
                 reference_names,
                 candidate_names,
@@ -11527,9 +11154,7 @@ def check_context_persistent_matrix(
             "persistent changed-prefix graph state mismatch",
         )
         graph.reset()
-        print(
-            "PASS persistent graph replay after same-N/same-token prefix change"
-        )
+        print("PASS persistent graph replay after same-N/same-token prefix change")
 
         stream_x = make_inputs(
             mixed_64,
@@ -11668,10 +11293,7 @@ def check_context_graph_stream_matrix(module, device: torch.device):
                 check_preallocated_multistream(
                     "raw", module, x, reference_out, reference_final
                 )
-                print(
-                    "PASS context graph/stream route: "
-                    f"{label}/{schedule}"
-                )
+                print("PASS context graph/stream route: " f"{label}/{schedule}")
             del x, reference_out, reference_final, p0_reference
             torch.cuda.empty_cache()
 
@@ -11737,9 +11359,7 @@ def check_context_graph_stream_matrix(module, device: torch.device):
         changed_prefix_x["cu_seqlens"].copy_(
             torch.tensor(changed_offsets, device=device, dtype=torch.int32)
         )
-        reference_out, reference_final, reference_workspace = allocate(
-            changed_prefix_x
-        )
+        reference_out, reference_final, reference_workspace = allocate(changed_prefix_x)
         raw_call(
             module,
             changed_prefix_x,
@@ -11764,10 +11384,7 @@ def check_context_graph_stream_matrix(module, device: torch.device):
             "tail-first changed-prefix graph final state",
         )
         graph.reset()
-        print(
-            "PASS tail-first graph replay after same-N/same-token prefix "
-            "rotation"
-        )
+        print("PASS tail-first graph replay after same-N/same-token prefix " "rotation")
     finally:
         for name, value in previous_env.items():
             if value is None:
@@ -11779,9 +11396,7 @@ def check_context_graph_stream_matrix(module, device: torch.device):
 def check_raw_v2_zero_equivalence(module, x, label: str):
     """Prove raw-v2 bound zero preserves both legacy ABI results."""
 
-    x, reference_out, reference_final = check_raw_vs_descriptor(
-        module, x, label
-    )
+    x, reference_out, reference_final = check_raw_vs_descriptor(module, x, label)
     initial_copy = x["initial_state"].clone()
     v2_out, v2_final, v2_workspace = allocate(x)
     raw_v2_call(module, x, v2_out, v2_final, v2_workspace, 0)
@@ -11850,9 +11465,7 @@ def _assert_mixed_boundary_direct_topology(
             f"{kernel_names!r}"
         )
 
-    prefix_nodes = [
-        name for name in kernel_names if "k1_build_tile_prefix" in name
-    ]
+    prefix_nodes = [name for name in kernel_names if "k1_build_tile_prefix" in name]
     expected_prefix_nodes = 0 if prefixless else 1
     if len(prefix_nodes) != expected_prefix_nodes:
         raise AssertionError(
@@ -11860,9 +11473,7 @@ def _assert_mixed_boundary_direct_topology(
             f"{prefix_nodes!r}; all kernels={kernel_names!r}"
         )
 
-    k1_names = [
-        name for name in kernel_names if "k1_kda_bt16_fused_kernel" in name
-    ]
+    k1_names = [name for name in kernel_names if "k1_kda_bt16_fused_kernel" in name]
     if len(k1_names) != 1:
         raise AssertionError(
             f"{label}: expected one fused K1 node, got {k1_names!r}; "
@@ -11939,8 +11550,7 @@ def _assert_mixed_boundary_direct_topology(
     }
     if mismatches:
         raise AssertionError(
-            f"{label}: direct K2 specialization mismatch {mismatches!r}: "
-            f"{name!r}"
+            f"{label}: direct K2 specialization mismatch {mismatches!r}: " f"{name!r}"
         )
 
 
@@ -11968,8 +11578,7 @@ def _assert_k3_16k_no_hint_topology(
     prefix_names = [
         name
         for name in prefix_like_names
-        if "20k1_build_tile_prefix" in name
-        and "hybrid_g64_compact" not in name
+        if "20k1_build_tile_prefix" in name and "hybrid_g64_compact" not in name
     ]
     if len(prefix_names) != 1 or prefix_names != prefix_like_names:
         raise AssertionError(
@@ -11978,9 +11587,7 @@ def _assert_k3_16k_no_hint_topology(
             f"generic={prefix_names!r}; all kernels={kernel_names!r}"
         )
 
-    k1_names = [
-        name for name in kernel_names if "k1_kda_bt16_fused_kernel" in name
-    ]
+    k1_names = [name for name in kernel_names if "k1_kda_bt16_fused_kernel" in name]
     if len(k1_names) != 1:
         raise AssertionError(
             f"{label}: expected one packed fused K1 node, got {k1_names!r}; "
@@ -12022,19 +11629,19 @@ def _assert_k3_16k_no_hint_topology(
     ]
 
     if sequences == 4:
-        _assert_context_route_topology(
-            kernel_names, ((64, 2, 4),), label
-        )
-        if len(fused_names) != 1 or re.search(
-            rf"{fused_symbol}I(?:Li)?64E", fused_names[0]
-        ) is None:
+        _assert_context_route_topology(kernel_names, ((64, 2, 4),), label)
+        if (
+            len(fused_names) != 1
+            or re.search(rf"{fused_symbol}I(?:Li)?64E", fused_names[0]) is None
+        ):
             raise AssertionError(
                 f"{label}: expected one packed fused G64 A/B producer, got "
                 f"{fused_names!r}; all kernels={kernel_names!r}"
             )
-        if len(ksplit_names) != 1 or re.search(
-            r"ksplit_wg4_kernelI(?:Li)?64E", ksplit_names[0]
-        ) is None:
+        if (
+            len(ksplit_names) != 1
+            or re.search(r"ksplit_wg4_kernelI(?:Li)?64E", ksplit_names[0]) is None
+        ):
             raise AssertionError(
                 f"{label}: expected one G64 K-split scan, got "
                 f"{ksplit_names!r}; all kernels={kernel_names!r}"
@@ -12171,10 +11778,14 @@ def _assert_k3_16k_no_hint_topology(
                     f"{label}: N8 context node {key} specialization "
                     f"mismatch {mismatches!r}: {name!r}"
                 )
-        if len(ordinary_scan_names) != 1 or re.search(
-            r"affine_scan_nw4_kernelI(?:Li)?32E(?:Li)?2E",
-            ordinary_scan_names[0],
-        ) is None:
+        if (
+            len(ordinary_scan_names) != 1
+            or re.search(
+                r"affine_scan_nw4_kernelI(?:Li)?32E(?:Li)?2E",
+                ordinary_scan_names[0],
+            )
+            is None
+        ):
             raise AssertionError(
                 f"{label}: expected one ordinary G32/NW2 affine scan, got "
                 f"{ordinary_scan_names!r}; all kernels={kernel_names!r}"
@@ -12212,28 +11823,21 @@ def _assert_k3_16k_no_hint_topology(
         )
 
 
-def _assert_k3_dense_n4_g64_topology(
-    kernel_names: list[str], label: str
-) -> None:
+def _assert_k3_dense_n4_g64_topology(kernel_names: list[str], label: str) -> None:
     """Require the exact four-node true-dense K3 N4/G64 graph."""
 
     if len(kernel_names) != 4:
         raise AssertionError(
-            f"{label}: expected exactly four kernel nodes, got "
-            f"{kernel_names!r}"
+            f"{label}: expected exactly four kernel nodes, got " f"{kernel_names!r}"
         )
-    prefix_names = [
-        name for name in kernel_names if "k1_build_tile_prefix" in name
-    ]
+    prefix_names = [name for name in kernel_names if "k1_build_tile_prefix" in name]
     if prefix_names:
         raise AssertionError(
             f"{label}: true-dense graph retained packed prefix nodes: "
             f"{prefix_names!r}"
         )
 
-    k1_names = [
-        name for name in kernel_names if "k1_kda_bt16_fused_kernel" in name
-    ]
+    k1_names = [name for name in kernel_names if "k1_kda_bt16_fused_kernel" in name]
     if len(k1_names) != 1:
         raise AssertionError(
             f"{label}: expected one fused K1 node, got {k1_names!r}; "
@@ -12255,12 +11859,8 @@ def _assert_k3_dense_n4_g64_topology(
             f"name={k1_names[0]!r}"
         )
 
-    producer_symbol = (
-        "k2_kda_context_affine_ab_fused_equal_n4_g64_nw4_kernel"
-    )
-    producer_names = [
-        name for name in kernel_names if producer_symbol in name
-    ]
+    producer_symbol = "k2_kda_context_affine_ab_fused_equal_n4_g64_nw4_kernel"
+    producer_names = [name for name in kernel_names if producer_symbol in name]
     if len(producer_names) != 1 or any(
         "equal_n4_g64_stage_early" in name for name in kernel_names
     ):
@@ -12271,17 +11871,15 @@ def _assert_k3_dense_n4_g64_topology(
 
     ksplit_symbol = "k2_kda_context_affine_scan_ksplit_wg4_kernel"
     ksplit_names = [name for name in kernel_names if ksplit_symbol in name]
-    if len(ksplit_names) != 1 or re.search(
-        r"ksplit_wg4_kernelI(?:Li)?64E", ksplit_names[0]
-    ) is None:
+    if (
+        len(ksplit_names) != 1
+        or re.search(r"ksplit_wg4_kernelI(?:Li)?64E", ksplit_names[0]) is None
+    ):
         raise AssertionError(
             f"{label}: expected one dense G64 K-split scan, got "
             f"{ksplit_names!r}; all kernels={kernel_names!r}"
         )
-    if any(
-        "k2_kda_context_affine_scan_nw4_kernel" in name
-        for name in kernel_names
-    ):
+    if any("k2_kda_context_affine_scan_nw4_kernel" in name for name in kernel_names):
         raise AssertionError(
             f"{label}: automatic graph retained the ordinary affine scan: "
             f"{kernel_names!r}"
@@ -12346,9 +11944,7 @@ def _assert_k3_dense_n4_g64_rollback_topology(
             f"{leaked!r}; all kernels={kernel_names!r}"
         )
     plain_scan_names = [
-        name
-        for name in kernel_names
-        if "k2_kda_csplit_bt64_plain_kernel" in name
+        name for name in kernel_names if "k2_kda_csplit_bt64_plain_kernel" in name
     ]
     if len(plain_scan_names) != 1:
         raise AssertionError(
@@ -12357,29 +11953,22 @@ def _assert_k3_dense_n4_g64_rollback_topology(
         )
 
 
-def _assert_gva_n4_16k_no_hint_topology(
-    kernel_names: list[str], label: str
-) -> None:
+def _assert_gva_n4_16k_no_hint_topology(kernel_names: list[str], label: str) -> None:
     """Require packed GVA K1 plus the ordinary G32/NW4 affine graph."""
 
     if len(kernel_names) != 6:
         raise AssertionError(
-            f"{label}: expected exactly six kernel nodes, got "
-            f"{kernel_names!r}"
+            f"{label}: expected exactly six kernel nodes, got " f"{kernel_names!r}"
         )
 
-    prefix_names = [
-        name for name in kernel_names if "k1_build_tile_prefix" in name
-    ]
+    prefix_names = [name for name in kernel_names if "k1_build_tile_prefix" in name]
     if len(prefix_names) != 1:
         raise AssertionError(
             f"{label}: packed GVA must retain one prefix node, got "
             f"{prefix_names!r}; all kernels={kernel_names!r}"
         )
 
-    k1_names = [
-        name for name in kernel_names if "k1_kda_bt16_fused_kernel" in name
-    ]
+    k1_names = [name for name in kernel_names if "k1_kda_bt16_fused_kernel" in name]
     if len(k1_names) != 1:
         raise AssertionError(
             f"{label}: expected one GVA fused K1 node, got {k1_names!r}; "
@@ -12456,9 +12045,11 @@ def _assert_gva_n4_16k_no_hint_topology(
 
     scan_symbol = "k2_kda_context_affine_scan_nw4_kernel"
     scan_names = [name for name in kernel_names if scan_symbol in name]
-    if len(scan_names) != 1 or re.search(
-        r"affine_scan_nw4_kernelI(?:Li)?32E(?:Li)?4E", scan_names[0]
-    ) is None:
+    if (
+        len(scan_names) != 1
+        or re.search(r"affine_scan_nw4_kernelI(?:Li)?32E(?:Li)?4E", scan_names[0])
+        is None
+    ):
         raise AssertionError(
             f"{label}: expected one ordinary G32/NW4 scan, got "
             f"{scan_names!r}; all kernels={kernel_names!r}"
@@ -12472,21 +12063,15 @@ def _assert_gva_mixed_boundary_no_hint_topology(
 
     if len(kernel_names) != 2:
         raise AssertionError(
-            f"{label}: expected exactly two kernel nodes, got "
-            f"{kernel_names!r}"
+            f"{label}: expected exactly two kernel nodes, got " f"{kernel_names!r}"
         )
-    prefix_names = [
-        name for name in kernel_names if "k1_build_tile_prefix" in name
-    ]
+    prefix_names = [name for name in kernel_names if "k1_build_tile_prefix" in name]
     if prefix_names:
         raise AssertionError(
-            f"{label}: prefixless GVA graph retained prefix nodes: "
-            f"{prefix_names!r}"
+            f"{label}: prefixless GVA graph retained prefix nodes: " f"{prefix_names!r}"
         )
 
-    k1_names = [
-        name for name in kernel_names if "k1_kda_bt16_fused_kernel" in name
-    ]
+    k1_names = [name for name in kernel_names if "k1_kda_bt16_fused_kernel" in name]
     if len(k1_names) != 1:
         raise AssertionError(
             f"{label}: expected one prefixless GVA K1, got {k1_names!r}; "
@@ -12635,13 +12220,9 @@ def _route_relative_rms(
         raise AssertionError(f"{label}: candidate contains non-finite data")
     if not bool(torch.isfinite(reference_f).all().item()):
         raise AssertionError(f"{label}: reference contains non-finite data")
-    difference_rms = torch.sqrt(
-        torch.mean(torch.square(actual_f - reference_f))
-    )
+    difference_rms = torch.sqrt(torch.mean(torch.square(actual_f - reference_f)))
     reference_rms = torch.sqrt(torch.mean(torch.square(reference_f)))
-    error = float(
-        (difference_rms / reference_rms.clamp_min(1.0e-12)).item()
-    )
+    error = float((difference_rms / reference_rms.clamp_min(1.0e-12)).item())
     if not torch.isfinite(torch.tensor(error)) or error > tolerance:
         raise AssertionError(
             f"{label}: relative RMS {error:.6e} exceeds {tolerance:.1e}"
@@ -12707,18 +12288,14 @@ def _assert_packed_route_numerically_equivalent(
     return max(output_errors), max(state_errors)
 
 
-def check_raw_v3_k3_dense_n4_g64(
-    module, device: torch.device
-) -> None:
+def check_raw_v3_k3_dense_n4_g64(module, device: torch.device) -> None:
     """Validate the automatic true-dense K3 B4x4K whole graph."""
 
     if flash_kda._device_arch(device) != "gfx950":
         print("SKIP raw-v3 K3 true-dense N4/G64 matrix: gfx950 only")
         return
 
-    previous_env = {
-        name: os.environ.get(name) for name in _RAW_V2_POLICY_ENV
-    }
+    previous_env = {name: os.environ.get(name) for name in _RAW_V2_POLICY_ENV}
     seq_lens = (4096,) * 4
     tolerance = 1.0e-2
 
@@ -12756,9 +12333,7 @@ def check_raw_v3_k3_dense_n4_g64(
         if not bool(torch.isfinite(out).all().item()):
             raise AssertionError(f"{label}: output contains non-finite data")
         if not bool(torch.isfinite(final).all().item()):
-            raise AssertionError(
-                f"{label}: final state contains non-finite data"
-            )
+            raise AssertionError(f"{label}: final state contains non-finite data")
         assert_bitwise_same(
             x["initial_state"], initial_copy, f"{label}: mutated initial state"
         )
@@ -12854,8 +12429,7 @@ def check_raw_v3_k3_dense_n4_g64(
                     assert_dense_equivalent(
                         candidate,
                         reference,
-                        f"raw-v3 K3 dense {mode}/hint-{bound} "
-                        "vs forced-general",
+                        f"raw-v3 K3 dense {mode}/hint-{bound} " "vs forced-general",
                     )
                 )
 
@@ -12945,10 +12519,7 @@ def _check_raw_v3_no_hint_changed_prefix_replay(
 
     if x["cu_seqlens"] is None:
         raise AssertionError(f"{label}: graph replay requires packed metadata")
-    if (
-        len(replay_lens) != x["N"]
-        or sum(replay_lens) != x["q"].shape[1]
-    ):
+    if len(replay_lens) != x["N"] or sum(replay_lens) != x["q"].shape[1]:
         raise AssertionError(
             f"{label}: invalid same-N/same-token replay fixture {replay_lens}"
         )
@@ -12980,9 +12551,7 @@ def _check_raw_v3_no_hint_changed_prefix_replay(
     graph = torch.cuda.CUDAGraph(keep_graph=True)
     try:
         with torch.cuda.graph(graph):
-            raw_v3_call(
-                module, x, graph_out, graph_final, graph_workspace, 0
-            )
+            raw_v3_call(module, x, graph_out, graph_final, graph_workspace, 0)
         topology_assertion(captured_graph_kernel_names(graph, device), label)
         graph.instantiate()
         assert_bitwise_same(
@@ -12994,20 +12563,14 @@ def _check_raw_v3_no_hint_changed_prefix_replay(
         offsets = [0]
         for length in replay_lens:
             offsets.append(offsets[-1] + length)
-        x["cu_seqlens"].copy_(
-            torch.tensor(offsets, device=device, dtype=torch.int32)
-        )
+        x["cu_seqlens"].copy_(torch.tensor(offsets, device=device, dtype=torch.int32))
         # Make zero-length ownership observable independently of the forced
         # reference route.  Finite signed-zero/subnormal patterns preserve the
         # numerical comparator while catching state conversion or overwrite.
-        seed_empty_state_bit_patterns(
-            x, replay_lens, device, include_nonfinite=False
-        )
+        seed_empty_state_bit_patterns(x, replay_lens, device, include_nonfinite=False)
         initial_copy = x["initial_state"].clone()
         torch.cuda.synchronize(device)
-        if tuple(tensor.data_ptr() for tensor in stable_tensors) != (
-            stable_addresses
-        ):
+        if tuple(tensor.data_ptr() for tensor in stable_tensors) != (stable_addresses):
             raise AssertionError(
                 f"{label}: changed-prefix replay replaced a captured tensor"
             )
@@ -13066,18 +12629,14 @@ def _check_raw_v3_no_hint_changed_prefix_replay(
         graph.reset()
 
 
-def check_raw_v3_k3_mixed_boundary_no_hint(
-    module, device: torch.device
-) -> None:
+def check_raw_v3_k3_mixed_boundary_no_hint(module, device: torch.device) -> None:
     """Pin K3 H12's no-hint/exact/over-hint results and direct graph."""
 
     if flash_kda._device_arch(device) != "gfx950":
         print("SKIP raw-v3 K3 no-hint route/graph matrix: gfx950 only")
         return
 
-    previous_env = {
-        name: os.environ.get(name) for name in _RAW_V2_POLICY_ENV
-    }
+    previous_env = {name: os.environ.get(name) for name in _RAW_V2_POLICY_ENV}
 
     def clear_policy_environment() -> None:
         for name in _RAW_V2_POLICY_ENV:
@@ -13113,9 +12672,7 @@ def check_raw_v3_k3_mixed_boundary_no_hint(
                 # for the automatic prefixless/NW1-flat mapping.
                 configure_general_reference()
                 reference_out, reference_final, reference_workspace = allocate(x)
-                descriptor_call(
-                    x, reference_out, reference_final, reference_workspace
-                )
+                descriptor_call(x, reference_out, reference_final, reference_workspace)
                 torch.cuda.synchronize(device)
 
                 no_hint_result = None
@@ -13208,12 +12765,8 @@ def check_raw_v3_k3_mixed_boundary_no_hint(
                     ) in rollback_recipes:
                         clear_policy_environment()
                         os.environ[environment_name] = environment_value
-                        rollback_names = _capture_raw_v3_kernel_names(
-                            module, x, 0
-                        )
-                        rollback_label = (
-                            f"raw-v3 K3 no-hint rollback {rollback}"
-                        )
+                        rollback_names = _capture_raw_v3_kernel_names(module, x, 0)
+                        rollback_label = f"raw-v3 K3 no-hint rollback {rollback}"
                         _assert_context_route_topology(
                             rollback_names,
                             ((1, 2, rollback_nw),),
@@ -13231,9 +12784,7 @@ def check_raw_v3_k3_mixed_boundary_no_hint(
                     initial_copy,
                     f"raw-v3 {label} mutated initial state",
                 )
-                print(
-                    f"PASS raw-v3 K3 no-hint/exact/over-hint result: {label}"
-                )
+                print(f"PASS raw-v3 K3 no-hint/exact/over-hint result: {label}")
 
         # Capture the automatic prefixless/NW1-flat graph on the production
         # layout, then replay it with fifteen empty sequences and the same
@@ -13282,18 +12833,14 @@ def check_raw_v3_k3_mixed_boundary_no_hint(
                 os.environ[name] = value
 
 
-def check_raw_v3_gva_mixed_boundary_no_hint(
-    module, device: torch.device
-) -> None:
+def check_raw_v3_gva_mixed_boundary_no_hint(module, device: torch.device) -> None:
     """Validate Hq2/Hv4-or-8 prefixless 1K-boundary GVA graphs."""
 
     if flash_kda._device_arch(device) != "gfx950":
         print("SKIP raw-v3 GVA mixed-boundary no-hint matrix: gfx950 only")
         return
 
-    previous_env = {
-        name: os.environ.get(name) for name in _RAW_V2_POLICY_ENV
-    }
+    previous_env = {name: os.environ.get(name) for name in _RAW_V2_POLICY_ENV}
 
     def clear_policy_environment() -> None:
         for name in _RAW_V2_POLICY_ENV:
@@ -13334,12 +12881,8 @@ def check_raw_v3_gva_mixed_boundary_no_hint(
                         if prefill_first
                         else decodes + (prefill_tokens,)
                     )
-                    order = (
-                        "prefill-first" if prefill_first else "decode-first"
-                    )
-                    label = (
-                        f"Hq2-Hv{value_heads}-{order}-{prefill_tokens}"
-                    )
+                    order = "prefill-first" if prefill_first else "decode-first"
+                    label = f"Hq2-Hv{value_heads}-{order}-{prefill_tokens}"
                     x = make_inputs(
                         seq_lens,
                         2,
@@ -13354,12 +12897,8 @@ def check_raw_v3_gva_mixed_boundary_no_hint(
                     initial_copy = x["initial_state"].clone()
 
                     configure_general_reference()
-                    reference_out, reference_final, reference_workspace = (
-                        allocate(x)
-                    )
-                    raw_reference_out, raw_reference_final, raw_workspace = (
-                        allocate(x)
-                    )
+                    reference_out, reference_final, reference_workspace = allocate(x)
+                    raw_reference_out, raw_reference_final, raw_workspace = allocate(x)
                     descriptor_call(
                         x,
                         reference_out,
@@ -13398,13 +12937,11 @@ def check_raw_v3_gva_mixed_boundary_no_hint(
                         0,
                         f"raw-v3 GVA mixed {label}/no-hint",
                     )
-                    no_hint_errors = (
-                        _assert_packed_route_numerically_equivalent(
-                            no_hint,
-                            reference,
-                            seq_lens,
-                            f"raw-v3 GVA mixed {label}/no-hint vs reference",
-                        )
+                    no_hint_errors = _assert_packed_route_numerically_equivalent(
+                        no_hint,
+                        reference,
+                        seq_lens,
+                        f"raw-v3 GVA mixed {label}/no-hint vs reference",
                     )
 
                     clear_policy_environment()
@@ -13420,12 +12957,8 @@ def check_raw_v3_gva_mixed_boundary_no_hint(
 
                     if prefill_tokens == 1025 and not prefill_first:
                         clear_policy_environment()
-                        os.environ[
-                            "FLASH_KDA_GFX950_CONTEXT_OPERAND_CACHE"
-                        ] = "0"
-                        rollback_out, rollback_final, rollback_workspace = (
-                            allocate(x)
-                        )
+                        os.environ["FLASH_KDA_GFX950_CONTEXT_OPERAND_CACHE"] = "0"
+                        rollback_out, rollback_final, rollback_workspace = allocate(x)
                         raw_v3_call(
                             module,
                             x,
@@ -13441,9 +12974,7 @@ def check_raw_v3_gva_mixed_boundary_no_hint(
                             seq_lens,
                             f"raw-v3 GVA mixed {label}/cache-0 rollback",
                         )
-                        rollback_names = _capture_raw_v3_kernel_names(
-                            module, x, 0
-                        )
+                        rollback_names = _capture_raw_v3_kernel_names(module, x, 0)
                         _assert_gva_mixed_boundary_no_hint_topology(
                             rollback_names,
                             f"raw-v3 GVA mixed {label}/cache-0 rollback",
@@ -13469,15 +13000,13 @@ def check_raw_v3_gva_mixed_boundary_no_hint(
                             hinted,
                             no_hint,
                             seq_lens,
-                            f"raw-v3 GVA mixed {label}/{hint_label} "
-                            "vs no-hint",
+                            f"raw-v3 GVA mixed {label}/{hint_label} " "vs no-hint",
                         )
                         _assert_packed_route_numerically_equivalent(
                             hinted,
                             reference,
                             seq_lens,
-                            f"raw-v3 GVA mixed {label}/{hint_label} "
-                            "vs reference",
+                            f"raw-v3 GVA mixed {label}/{hint_label} " "vs reference",
                         )
 
                     # Do not test an aggregate-valid under-hint: the maximum
@@ -13515,9 +13044,7 @@ def check_raw_v3_gva_mixed_boundary_no_hint(
             graph_out, graph_final, graph_workspace = allocate(x)
 
             # Resolve all lazy module/runtime state before entering capture.
-            raw_v3_call(
-                module, x, graph_out, graph_final, graph_workspace, 0
-            )
+            raw_v3_call(module, x, graph_out, graph_final, graph_workspace, 0)
             torch.cuda.synchronize(device)
             assert_bitwise_same(
                 x["initial_state"],
@@ -13539,9 +13066,7 @@ def check_raw_v3_gva_mixed_boundary_no_hint(
                 graph_final,
                 graph_workspace,
             )
-            stable_addresses = tuple(
-                tensor.data_ptr() for tensor in stable_tensors
-            )
+            stable_addresses = tuple(tensor.data_ptr() for tensor in stable_tensors)
             graph = torch.cuda.CUDAGraph(keep_graph=True)
             try:
                 with torch.cuda.graph(graph):
@@ -13572,14 +13097,13 @@ def check_raw_v3_gva_mixed_boundary_no_hint(
                     for length in replay_lens:
                         offsets.append(offsets[-1] + length)
                     x["cu_seqlens"].copy_(
-                        torch.tensor(
-                            offsets, device=device, dtype=torch.int32
-                        )
+                        torch.tensor(offsets, device=device, dtype=torch.int32)
                     )
                     torch.cuda.synchronize(device)
-                    if tuple(
-                        tensor.data_ptr() for tensor in stable_tensors
-                    ) != stable_addresses:
+                    if (
+                        tuple(tensor.data_ptr() for tensor in stable_tensors)
+                        != stable_addresses
+                    ):
                         raise AssertionError(
                             "GVA changed-prefix replay replaced a captured "
                             "tensor allocation"
@@ -13588,9 +13112,7 @@ def check_raw_v3_gva_mixed_boundary_no_hint(
                     # Use the ordinary prefix-building direct graph as the
                     # independent oracle for the changed device metadata.
                     configure_general_reference()
-                    reference_out, reference_final, reference_workspace = (
-                        allocate(x)
-                    )
+                    reference_out, reference_final, reference_workspace = allocate(x)
                     raw_v3_call(
                         module,
                         x,
@@ -13652,9 +13174,7 @@ def check_raw_v3_mixed_hint_resume_chains(
         print("SKIP raw-v3 mixed-hint resume chains: gfx950 only")
         return
 
-    previous_env = {
-        name: os.environ.get(name) for name in _RAW_V2_POLICY_ENV
-    }
+    previous_env = {name: os.environ.get(name) for name in _RAW_V2_POLICY_ENV}
 
     def clear_policy_environment() -> None:
         for name in _RAW_V2_POLICY_ENV:
@@ -13689,12 +13209,8 @@ def check_raw_v3_mixed_hint_resume_chains(
                 for index, (label, _, _) in enumerate(hint_steps)
             }
             for starts_without_state in (False, True):
-                start_label = (
-                    "fresh-none" if starts_without_state else "materialized"
-                )
-                for order_index, steps in enumerate(
-                    itertools.permutations(hint_steps)
-                ):
+                start_label = "fresh-none" if starts_without_state else "materialized"
+                for order_index, steps in enumerate(itertools.permutations(hint_steps)):
                     candidate_state = None
                     reference_state = None
                     for step_index, (
@@ -13704,9 +13220,7 @@ def check_raw_v3_mixed_hint_resume_chains(
                     ) in enumerate(steps):
                         maximum = max(seq_lens)
                         if hint_label == "no-hint" and bound != 0:
-                            raise AssertionError(
-                                "invalid no-hint resume-chain fixture"
-                            )
+                            raise AssertionError("invalid no-hint resume-chain fixture")
                         if hint_label == "exact-hint" and bound != maximum:
                             raise AssertionError(
                                 "invalid exact-hint resume-chain fixture"
@@ -13716,9 +13230,7 @@ def check_raw_v3_mixed_hint_resume_chains(
                                 "invalid over-hint resume-chain fixture"
                             )
                         if bound and not maximum <= bound <= sum(seq_lens):
-                            raise AssertionError(
-                                "illegal positive resume-chain hint"
-                            )
+                            raise AssertionError("illegal positive resume-chain hint")
 
                         has_initial_state = not (
                             starts_without_state and step_index == 0
@@ -13767,19 +13279,15 @@ def check_raw_v3_mixed_hint_resume_chains(
                             "has_initial_state": reference_state is not None,
                         }
                         candidate_input_copy = (
-                            None
-                            if candidate_state is None
-                            else candidate_state.clone()
+                            None if candidate_state is None else candidate_state.clone()
                         )
                         reference_input_copy = (
-                            None
-                            if reference_state is None
-                            else reference_state.clone()
+                            None if reference_state is None else reference_state.clone()
                         )
 
                         clear_policy_environment()
-                        candidate_out, candidate_final, candidate_workspace = (
-                            allocate(candidate_x)
+                        candidate_out, candidate_final, candidate_workspace = allocate(
+                            candidate_x
                         )
                         candidate_out.fill_(float("nan"))
                         candidate_final.fill_(float("nan"))
@@ -13803,8 +13311,8 @@ def check_raw_v3_mixed_hint_resume_chains(
                             )
 
                         configure_general_reference()
-                        reference_out, reference_final, reference_workspace = (
-                            allocate(reference_x)
+                        reference_out, reference_final, reference_workspace = allocate(
+                            reference_x
                         )
                         reference_out.fill_(float("nan"))
                         reference_final.fill_(float("nan"))
@@ -13867,9 +13375,7 @@ def check_raw_v3_k3_16k_no_hint_matrix(
         print("SKIP raw-v3 K3 16K no-hint route/graph matrix: gfx950 only")
         return
 
-    previous_env = {
-        name: os.environ.get(name) for name in _RAW_V2_POLICY_ENV
-    }
+    previous_env = {name: os.environ.get(name) for name in _RAW_V2_POLICY_ENV}
     tolerance = 1.0e-2
 
     def clear_policy_environment() -> None:
@@ -13904,13 +13410,9 @@ def check_raw_v3_k3_16k_no_hint_matrix(
             raise AssertionError(f"{label}: candidate contains non-finite data")
         if not bool(torch.isfinite(reference_f).all().item()):
             raise AssertionError(f"{label}: reference contains non-finite data")
-        difference_rms = torch.sqrt(
-            torch.mean(torch.square(actual_f - reference_f))
-        )
+        difference_rms = torch.sqrt(torch.mean(torch.square(actual_f - reference_f)))
         reference_rms = torch.sqrt(torch.mean(torch.square(reference_f)))
-        error = float(
-            (difference_rms / reference_rms.clamp_min(1.0e-12)).item()
-        )
+        error = float((difference_rms / reference_rms.clamp_min(1.0e-12)).item())
         if error > tolerance:
             raise AssertionError(
                 f"{label}: relative RMS {error:.6e} exceeds {tolerance:.1e}"
@@ -13925,9 +13427,7 @@ def check_raw_v3_k3_16k_no_hint_matrix(
     ) -> tuple[float, float]:
         """Compare route-dependent reductions globally and per sequence."""
 
-        output_errors = [
-            relative_rms(actual[0], reference[0], f"{label} output")
-        ]
+        output_errors = [relative_rms(actual[0], reference[0], f"{label} output")]
         offset = 0
         for sequence, length in enumerate(seq_lens):
             next_offset = offset + length
@@ -13946,9 +13446,7 @@ def check_raw_v3_k3_16k_no_hint_matrix(
                 f"output contains {actual[0].shape[1]}"
             )
 
-        state_errors = [
-            relative_rms(actual[1], reference[1], f"{label} final state")
-        ]
+        state_errors = [relative_rms(actual[1], reference[1], f"{label} final state")]
         for sequence in range(len(seq_lens)):
             state_errors.append(
                 relative_rms(
@@ -14025,13 +13523,14 @@ def check_raw_v3_k3_16k_no_hint_matrix(
                 output_final_state=True,
                 seed=20260920 + case_index,
             )
-            seed_empty_state_bit_patterns(
-                x, seq_lens, device, include_nonfinite=False
-            )
+            seed_empty_state_bit_patterns(x, seq_lens, device, include_nonfinite=False)
             initial_copy = x["initial_state"].clone()
 
             def assert_empty_state_identity(
-                final: torch.Tensor, result_label: str
+                final: torch.Tensor,
+                result_label: str,
+                seq_lens: tuple[int, ...] = seq_lens,
+                initial_copy: torch.Tensor = initial_copy,
             ) -> None:
                 for sequence, length in enumerate(seq_lens):
                     if length == 0:
@@ -14055,12 +13554,8 @@ def check_raw_v3_k3_16k_no_hint_matrix(
                 reference_final, f"raw-v3 K3 16K {label}/forced-general"
             )
 
-            no_hint = run_raw_v3(
-                x, initial_copy, 0, f"raw-v3 K3 16K {label}/no-hint"
-            )
-            assert_empty_state_identity(
-                no_hint[1], f"raw-v3 K3 16K {label}/no-hint"
-            )
+            no_hint = run_raw_v3(x, initial_copy, 0, f"raw-v3 K3 16K {label}/no-hint")
+            assert_empty_state_identity(no_hint[1], f"raw-v3 K3 16K {label}/no-hint")
             no_hint_errors = assert_numerically_equivalent(
                 no_hint,
                 reference,
@@ -14114,16 +13609,11 @@ def check_raw_v3_k3_16k_no_hint_matrix(
                 )
                 if sequences == 8:
                     clear_policy_environment()
-                    hinted_names = _capture_raw_v3_kernel_names(
-                        module, x, bound
-                    )
+                    hinted_names = _capture_raw_v3_kernel_names(module, x, bound)
                     leaked_no_hint_nodes = []
                     for name in hinted_names:
                         match = _CONTEXT_PIPELINE_SYMBOL.search(name)
-                        if (
-                            match is not None
-                            and int(match.group("direct_max")) == 128
-                        ):
+                        if match is not None and int(match.group("direct_max")) == 128:
                             leaked_no_hint_nodes.append(name)
                     if leaked_no_hint_nodes:
                         raise AssertionError(
@@ -14213,18 +13703,14 @@ def check_raw_v3_k3_16k_no_hint_matrix(
                 os.environ[name] = value
 
 
-def check_raw_v3_gva_n4_16k_no_hint_matrix(
-    module, device: torch.device
-) -> None:
+def check_raw_v3_gva_n4_16k_no_hint_matrix(module, device: torch.device) -> None:
     """Validate ratio-2/4 GVA no-hint G32/NW4 routes and hint results."""
 
     if flash_kda._device_arch(device) != "gfx950":
         print("SKIP raw-v3 GVA N4/16K no-hint route/graph matrix: gfx950 only")
         return
 
-    previous_env = {
-        name: os.environ.get(name) for name in _RAW_V2_POLICY_ENV
-    }
+    previous_env = {name: os.environ.get(name) for name in _RAW_V2_POLICY_ENV}
     tolerance = 1.0e-2
 
     def clear_policy_environment() -> None:
@@ -14259,13 +13745,9 @@ def check_raw_v3_gva_n4_16k_no_hint_matrix(
             raise AssertionError(f"{label}: candidate contains non-finite data")
         if not bool(torch.isfinite(reference_f).all().item()):
             raise AssertionError(f"{label}: reference contains non-finite data")
-        difference_rms = torch.sqrt(
-            torch.mean(torch.square(actual_f - reference_f))
-        )
+        difference_rms = torch.sqrt(torch.mean(torch.square(actual_f - reference_f)))
         reference_rms = torch.sqrt(torch.mean(torch.square(reference_f)))
-        error = float(
-            (difference_rms / reference_rms.clamp_min(1.0e-12)).item()
-        )
+        error = float((difference_rms / reference_rms.clamp_min(1.0e-12)).item())
         if error > tolerance:
             raise AssertionError(
                 f"{label}: relative RMS {error:.6e} exceeds {tolerance:.1e}"
@@ -14278,9 +13760,7 @@ def check_raw_v3_gva_n4_16k_no_hint_matrix(
         seq_lens: tuple[int, ...],
         label: str,
     ) -> tuple[float, float]:
-        output_errors = [
-            relative_rms(actual[0], reference[0], f"{label} output")
-        ]
+        output_errors = [relative_rms(actual[0], reference[0], f"{label} output")]
         offset = 0
         for sequence, length in enumerate(seq_lens):
             next_offset = offset + length
@@ -14299,9 +13779,7 @@ def check_raw_v3_gva_n4_16k_no_hint_matrix(
                 f"output contains {actual[0].shape[1]}"
             )
 
-        state_errors = [
-            relative_rms(actual[1], reference[1], f"{label} final state")
-        ]
+        state_errors = [relative_rms(actual[1], reference[1], f"{label} final state")]
         for sequence in range(len(seq_lens)):
             state_errors.append(
                 relative_rms(
@@ -14358,9 +13836,7 @@ def check_raw_v3_gva_n4_16k_no_hint_matrix(
             configure_general_reference()
             descriptor_out, descriptor_final, descriptor_workspace = allocate(x)
             raw_out, raw_final, raw_workspace = allocate(x)
-            descriptor_call(
-                x, descriptor_out, descriptor_final, descriptor_workspace
-            )
+            descriptor_call(x, descriptor_out, descriptor_final, descriptor_workspace)
             raw_v3_call(module, x, raw_out, raw_final, raw_workspace, 0)
             torch.cuda.synchronize(device)
             assert_same(
@@ -14380,9 +13856,7 @@ def check_raw_v3_gva_n4_16k_no_hint_matrix(
             )
             reference = (descriptor_out, descriptor_final)
 
-            no_hint = run_raw_v3(
-                x, initial_copy, 0, f"raw-v3 GVA {label}/no-hint"
-            )
+            no_hint = run_raw_v3(x, initial_copy, 0, f"raw-v3 GVA {label}/no-hint")
             no_hint_errors = assert_numerically_equivalent(
                 no_hint,
                 reference,
@@ -14392,9 +13866,7 @@ def check_raw_v3_gva_n4_16k_no_hint_matrix(
 
             clear_policy_environment()
             names = _capture_raw_v3_kernel_names(module, x, 0)
-            _assert_gva_n4_16k_no_hint_topology(
-                names, f"raw-v3 GVA {label}/no-hint"
-            )
+            _assert_gva_n4_16k_no_hint_topology(names, f"raw-v3 GVA {label}/no-hint")
             assert_bitwise_same(
                 x["initial_state"],
                 initial_copy,
@@ -14454,9 +13926,7 @@ def check_raw_v3_gva_n4_16k_no_hint_matrix(
                 seed=20261060 + graph_index,
             )
 
-            def assert_gva_n4_topology(
-                names: list[str], graph_label: str
-            ) -> None:
+            def assert_gva_n4_topology(names: list[str], graph_label: str) -> None:
                 _assert_gva_n4_16k_no_hint_topology(names, graph_label)
 
             replay_errors = _check_raw_v3_no_hint_changed_prefix_replay(
@@ -14482,9 +13952,47 @@ def check_raw_v3_gva_n4_16k_no_hint_matrix(
                 os.environ[name] = value
 
 
-def check_raw_v2_invalid_bounds(
-    module, device: torch.device, heads: int
-) -> None:
+def check_descriptor_invalid_hints(device: torch.device, heads: int) -> None:
+    """Reject invalid launch hints in the descriptor ABI."""
+
+    packed = make_inputs((3, 4), heads, device, packed=True)
+    dense = make_inputs((7, 7), heads, device, packed=False)
+
+    def reject(
+        x,
+        *,
+        bound: int = 0,
+        label: str,
+    ) -> None:
+        out, final, workspace = allocate(x)
+        expect_rejection(
+            label,
+            lambda: descriptor_call(
+                x,
+                out,
+                final,
+                workspace,
+                bound,
+            ),
+        )
+
+    for bound, label in (
+        (-1, "descriptor packed negative bound"),
+        (3, "descriptor packed bound below ceil(total/N)"),
+        (8, "descriptor packed bound above total"),
+        (1 << 31, "descriptor packed bound above native int ABI"),
+    ):
+        reject(packed, bound=bound, label=label)
+    for bound, label in (
+        (6, "descriptor dense bound below T"),
+        (8, "descriptor dense bound above T"),
+        (14, "descriptor dense bound equal B*T instead of T"),
+    ):
+        reject(dense, bound=bound, label=label)
+    print("PASS descriptor hint rejection matrix")
+
+
+def check_raw_v2_invalid_bounds(module, device: torch.device, heads: int) -> None:
     """Reject raw-v2 bounds outside the packed and dense contracts."""
 
     packed = make_inputs((3, 4), heads, device, packed=True)
@@ -14494,9 +14002,7 @@ def check_raw_v2_invalid_bounds(
         out, final, workspace = allocate(x)
         expect_rejection(
             label,
-            lambda: raw_v2_call(
-                module, x, out, final, workspace, bound
-            ),
+            lambda: raw_v2_call(module, x, out, final, workspace, bound),
         )
 
     # Packed total=7/N=2 permits only zero or a positive hint in [4, 7].
@@ -14518,18 +14024,14 @@ def check_raw_v2_invalid_bounds(
     print("PASS raw-v2 packed/dense invalid-bound rejection matrix")
 
 
-def check_raw_v2_hint_policy_matrix(
-    module, device: torch.device, heads: int
-) -> None:
+def check_raw_v2_hint_policy_matrix(module, device: torch.device, heads: int) -> None:
     """Validate gfx950's three production hint routes and bucket replay."""
 
     if flash_kda._device_arch(device) != "gfx950":
         print("SKIP raw-v2 hint route/graph matrix: gfx950 only")
         return
 
-    previous_env = {
-        name: os.environ.get(name) for name in _RAW_V2_POLICY_ENV
-    }
+    previous_env = {name: os.environ.get(name) for name in _RAW_V2_POLICY_ENV}
 
     def configure(
         *,
@@ -14553,13 +14055,9 @@ def check_raw_v2_hint_policy_matrix(
                 raise ValueError(f"unsupported raw-v2 reference route: {route}")
             os.environ[route_environment] = "1"
         if group_chunks is not None:
-            os.environ["FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS"] = str(
-                group_chunks
-            )
+            os.environ["FLASH_KDA_GFX950_CONTEXT_GROUP_CHUNKS"] = str(group_chunks)
         if direct_nw is not None:
-            os.environ["FLASH_KDA_GFX950_CONTEXT_DIRECT_NW"] = str(
-                direct_nw
-            )
+            os.environ["FLASH_KDA_GFX950_CONTEXT_DIRECT_NW"] = str(direct_nw)
         if nw1_flat is not None:
             os.environ[_CONTEXT_DIRECT_NW1_FLAT_ENV] = nw1_flat
         if prefixless is not None:
@@ -14708,9 +14206,7 @@ def check_raw_v2_hint_policy_matrix(
                 f"raw-v2 {label} mutated initial state",
             )
 
-            kernel_names = _capture_raw_v2_kernel_names(
-                module, x, bound
-            )
+            kernel_names = _capture_raw_v2_kernel_names(module, x, bound)
             _assert_context_route_topology(
                 kernel_names,
                 expected_topology,
@@ -14787,13 +14283,14 @@ def check_raw_v2_hint_policy_matrix(
                         True,
                     ),
                 )
-                for rollback, environment, rollback_nw, rollback_flat in (
-                    rollback_recipes
-                ):
+                for (
+                    rollback,
+                    environment,
+                    rollback_nw,
+                    rollback_flat,
+                ) in rollback_recipes:
                     configure(**environment)
-                    rollback_names = _capture_raw_v2_kernel_names(
-                        module, x, bound
-                    )
+                    rollback_names = _capture_raw_v2_kernel_names(module, x, bound)
                     _assert_context_route_topology(
                         rollback_names,
                         ((1, 2, rollback_nw),),
@@ -14804,36 +14301,36 @@ def check_raw_v2_hint_policy_matrix(
                         prefixless=False,
                         nw=rollback_nw,
                         flat=rollback_flat,
-                        label=(
-                            "raw-v2 mixed-boundary rollback " + rollback
-                        ),
+                        label=("raw-v2 mixed-boundary rollback " + rollback),
                     )
                 configure()
             if expected_fused_group is not None:
                 fused_symbol = "k2_kda_context_affine_ab_fused_nw4_kernel"
-                fused_names = [
-                    name for name in kernel_names if fused_symbol in name
-                ]
-                if len(fused_names) != 1 or re.search(
-                    rf"{fused_symbol}I(?:Li)?{expected_fused_group}E",
-                    fused_names[0],
-                ) is None:
+                fused_names = [name for name in kernel_names if fused_symbol in name]
+                if (
+                    len(fused_names) != 1
+                    or re.search(
+                        rf"{fused_symbol}I(?:Li)?{expected_fused_group}E",
+                        fused_names[0],
+                    )
+                    is None
+                ):
                     raise AssertionError(
                         f"raw-v2 {label}: expected one fused G"
                         f"{expected_fused_group} producer, got "
                         f"{fused_names!r}; all kernels={kernel_names!r}"
                     )
             if expected_ksplit_group is not None:
-                ksplit_symbol = (
-                    "k2_kda_context_affine_scan_ksplit_wg4_kernel"
-                )
-                ksplit_names = [
-                    name for name in kernel_names if ksplit_symbol in name
-                ]
-                if len(ksplit_names) != 1 or re.search(
-                    rf"ksplit_wg4_kernelI(?:Li)?{expected_ksplit_group}E",
-                    ksplit_names[0],
-                ) is None:
+                ksplit_symbol = "k2_kda_context_affine_scan_ksplit_wg4_kernel"
+                ksplit_names = [name for name in kernel_names if ksplit_symbol in name]
+                if (
+                    len(ksplit_names) != 1
+                    or re.search(
+                        rf"ksplit_wg4_kernelI(?:Li)?{expected_ksplit_group}E",
+                        ksplit_names[0],
+                    )
+                    is None
+                ):
                     raise AssertionError(
                         f"raw-v2 {label}: expected one G"
                         f"{expected_ksplit_group} K-split scan, got "
@@ -14887,9 +14384,7 @@ def check_raw_v2_hint_policy_matrix(
                 or sum(changed_lens) != batch_x["q"].shape[1]
                 or max(changed_lens) > batch_bound
             ):
-                raise AssertionError(
-                    "invalid raw-v2 static-bucket replay fixture"
-                )
+                raise AssertionError("invalid raw-v2 static-bucket replay fixture")
             offsets = [0]
             for length in changed_lens:
                 offsets.append(offsets[-1] + length)
@@ -14897,9 +14392,7 @@ def check_raw_v2_hint_policy_matrix(
                 torch.tensor(offsets, device=device, dtype=torch.int32)
             )
 
-            reference_out, reference_final, reference_workspace = allocate(
-                batch_x
-            )
+            reference_out, reference_final, reference_workspace = allocate(batch_x)
             raw_v2_call(
                 module,
                 batch_x,
@@ -14924,9 +14417,7 @@ def check_raw_v2_hint_policy_matrix(
                 reference_final,
                 "raw-v2 static-bucket graph replay state mismatch",
             )
-            print(
-                "PASS raw-v2 static 1K bucket graph changed-prefix replay"
-            )
+            print("PASS raw-v2 static 1K bucket graph changed-prefix replay")
         finally:
             graph.reset()
     finally:
@@ -15061,16 +14552,13 @@ def main():
     check_module_abi_surface(module)
     if args.k3_no_hint_only:
         check_raw_v3_k3_dense_n4_g64(module, device)
-        check_raw_v3_mixed_hint_resume_chains(
-            module, device, k3_only=True
-        )
+        check_raw_v3_mixed_hint_resume_chains(module, device, k3_only=True)
         check_raw_v3_k3_mixed_boundary_no_hint(module, device)
-        check_raw_v3_k3_16k_no_hint_matrix(
-            module, device, empty_only=True
-        )
+        check_raw_v3_k3_16k_no_hint_matrix(module, device, empty_only=True)
         print("TARGETED K3 NO-HINT ABI CHECKS PASSED")
         return
     check_raw_v3_gva_vs_descriptor(module, device)
+    check_descriptor_invalid_hints(device, min(args.heads, 2))
 
     x = make_inputs(split_packed_tokens(args.tokens), args.heads, device)
     x, reference_out, reference_final = check_raw_v2_zero_equivalence(
@@ -15092,9 +14580,7 @@ def main():
     check_context_scan_b_phased_matrix(module, device, min(args.heads, 2))
     check_context_scan_ksplit_matrix(module, device, min(args.heads, 2))
     check_plain_beta_cache_matrix(module, device, min(args.heads, 2))
-    check_forced_csplit_empty_state_matrix(
-        module, device, min(args.heads, 2)
-    )
+    check_forced_csplit_empty_state_matrix(module, device, min(args.heads, 2))
     check_plain_decay_cache_matrix(module, device, min(args.heads, 2))
     check_plain_postprep_opt_matrix(module, device, min(args.heads, 2))
     check_plain_internal_layout_matrix(module, device, min(args.heads, 2))
@@ -15115,9 +14601,7 @@ def main():
         check_preallocated_graph(abi, module, x, reference_out, reference_final)
     check_public_graph(x, reference_out, reference_final)
     for abi in ("raw", "descriptor"):
-        check_preallocated_multistream(
-            abi, module, x, reference_out, reference_final
-        )
+        check_preallocated_multistream(abi, module, x, reference_out, reference_final)
     check_public_multistream(x, reference_out, reference_final)
     check_invalid_metadata(module, x)
     check_two_devices(module, min(args.tokens, 512), args.heads)

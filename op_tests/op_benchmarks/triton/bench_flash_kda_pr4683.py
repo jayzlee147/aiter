@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Canonical gfx950 comparison for the dense table in ROCm/aiter PR #4683.
+"""Canonical gfx950 comparison for the dense table introduced by PR #4683.
 
 The pull request published six dense, eager FlashKDA rows: ``B=1``,
 ``T in {8192, 16384}``, ``H in {32, 64, 96}``, and ``K=V=128``.  This runner
 keeps that geometry and input contract, but measures the current native HIP
-operator against the PR's two-kernel Triton FlashKDA implementation in the same
-process.  The Triton implementation is forced by importing its internal
-``flash_kda_fwd`` directly; no public auto-router participates in the result.
+operator against the current-main descendant of that Triton FlashKDA
+implementation in the same process. The Triton implementation is selected by
+importing its internal ``flash_kda_fwd`` directly with Gluon explicitly
+disabled; no shared backend router participates in the result.
 
 The formal run has 18 seed cells (six shapes crossed with seeds 42, 43, and
 44).  Each cell checks output relative RMS, performs position-balanced
@@ -67,10 +68,11 @@ MIN_PAIRED_WIN_FRACTION = 0.5
 EXPECTED_ARCH = "gfx950"
 EXPECTED_COMPUTE_UNITS = 256
 NATIVE_BACKEND = "native-hip-direct"
-TRITON_BACKEND = "pr4683-triton-direct"
-PR4683_HEAD = "71647be6262f757b99b172a975a3a914674be9ac"
-PR4683_TRITON_SOURCE_SHA256 = (
-    "86a89bc82720a5a7f67d055ef4120417074f55e4468655d612624873046a5dc6"
+TRITON_BACKEND = "latest-main-triton-direct"
+REQUIRED_ROUTE_ENV = {"AITER_FDA_USE_GLUON": "0"}
+SOURCE_TABLE_PR_HEAD = "71647be6262f757b99b172a975a3a914674be9ac"
+TRITON_SOURCE_SHA256 = (
+    "c4f536616802286f4a73557cf08a15d6948eb3af582d67c1909550e9ad9b707e"
 )
 
 # Values copied from the gfx950 table in PR #4683.  They are provenance only:
@@ -104,7 +106,7 @@ PUBLISHED_PR_TABLE = {
 }
 
 EXPECTED_PLAN_SHA256 = (
-    "f78e32aa80d754d7f02c91f9f138a68b77720f286c9f667f1f26a598f50ae894"
+    "8e651f53b430ef4fe8a947de1ee0ed64687a7d8192369351b65ab71a0b4a1fab"
 )
 _RUNTIME_LOADED = False
 
@@ -199,7 +201,7 @@ def _bootstrap(
         wins.append(sum(value < 0.0 for value in sample) / len(sample))
 
     return {
-        "delta_definition": "native_hip_ms-minus-pr4683_triton_ms; negative is native win",
+        "delta_definition": "native_hip_ms-minus-latest_main_triton_ms; negative is native win",
         "delta_unit": "microseconds",
         "strata": {name: len(values) for name, values in sorted(strata.items())},
         "samples": len(flat),
@@ -267,7 +269,7 @@ def _hierarchical_bootstrap(
         wins.append(sum(value < 0.0 for value in sample) / len(sample))
 
     return {
-        "delta_definition": "native_hip_ms-minus-pr4683_triton_ms; negative is native win",
+        "delta_definition": "native_hip_ms-minus-latest_main_triton_ms; negative is native win",
         "delta_unit": "microseconds",
         "hierarchy": {
             str(seed): {
@@ -382,9 +384,12 @@ def _plan() -> dict[str, Any]:
         "cpu_only": True,
         "source_table": "https://github.com/ROCm/aiter/pull/4683",
         "comparator": {
-            "pr_head": PR4683_HEAD,
-            "triton_source_sha256": PR4683_TRITON_SOURCE_SHA256,
+            "implementation": "latest-main descendant of PR #4683",
+            "source_table_pr_head": SOURCE_TABLE_PR_HEAD,
+            "expected_triton_source_sha256": TRITON_SOURCE_SHA256,
             "forced_direct_import": True,
+            "forced_route_environment": REQUIRED_ROUTE_ENV,
+            "gluon_disabled": True,
         },
         "logical_shapes": len(SHAPES),
         "seed_cells": len(cells),
@@ -530,10 +535,14 @@ def _load_runtime() -> SimpleNamespace:
             f"Triton import escaped this checkout: {actual_triton} != {expected_triton}"
         )
     actual_triton_sha256 = _sha256(actual_triton)
-    if actual_triton_sha256 != PR4683_TRITON_SOURCE_SHA256:
+    if actual_triton_sha256 != TRITON_SOURCE_SHA256:
         raise RuntimeError(
-            "forced Triton comparator is not the audited PR #4683 source: "
-            f"{actual_triton_sha256} != {PR4683_TRITON_SOURCE_SHA256}"
+            "direct Triton comparator is not the audited latest-main source: "
+            f"{actual_triton_sha256} != {TRITON_SOURCE_SHA256}"
+        )
+    if triton_module.AITER_FDA_USE_GLUON_K1 or triton_module.AITER_FDA_USE_GLUON_K2:
+        raise RuntimeError(
+            "direct Triton comparator unexpectedly enabled a Gluon KDA route"
         )
     effective_meta_dir = Path(jit_core.AITER_META_DIR).resolve()
     effective_csrc_dir = Path(jit_core.AITER_CSRC_DIR).resolve()
@@ -559,7 +568,7 @@ def _load_runtime() -> SimpleNamespace:
 
 def _control_environment() -> dict[str, str]:
     exact = {
-        "AITER_KDA_BACKEND",
+        "AITER_FDA_USE_GLUON",
         "AITER_TRITON_ONLY",
         "AITER_REBUILD",
     }
@@ -881,7 +890,7 @@ def _run_cell(
                 "aiter.ops.triton._triton_kernels.chunk_delta_attn."
                 "flash_kda.flash_kda_fwd"
             ),
-            "public_router_used": False,
+            "caller_selects_backend": True,
             "triton_chunks_per_seg": None,
         },
         "correctness": {
@@ -962,11 +971,11 @@ def _runtime_provenance(runtime: SimpleNamespace) -> dict[str, Any]:
     arch_detail = str(getattr(properties, "gcnArchName", "unknown"))
     arch = arch_detail.split(":", 1)[0]
 
-    native_jit_module = runtime.jit_core.get_module("module_flash_kda_hip")
+    native_jit_module = runtime.jit_core.get_module("module_flash_kda_hip_v2")
     native_jit_path = Path(native_jit_module.__file__).resolve()
     expected_jit_dir_text = os.environ.get("AITER_JIT_DIR")
     expected_jit_path = (
-        Path(expected_jit_dir_text).resolve() / "module_flash_kda_hip.so"
+        Path(expected_jit_dir_text).resolve() / "module_flash_kda_hip_v2.so"
         if expected_jit_dir_text
         else None
     )
@@ -989,9 +998,9 @@ def _runtime_provenance(runtime: SimpleNamespace) -> dict[str, Any]:
     benchmark_path = Path(__file__).resolve()
     controlled_names = (
         "AITER_AOT_IMPORT",
+        "AITER_FDA_USE_GLUON",
         "AITER_JIT_DIR",
         "AITER_META_DIR",
-        "AITER_KDA_BACKEND",
         "AITER_REBUILD",
         "AITER_TRITON_ONLY",
         "CK_DIR",
@@ -1059,15 +1068,21 @@ def _runtime_provenance(runtime: SimpleNamespace) -> dict[str, Any]:
                 "sha256": _sha256(native_source),
                 "callable_module": runtime.native_fn.__module__,
             },
-            "pr4683_triton_python": {
+            "latest_main_triton_python": {
                 "path": str(triton_source),
                 "sha256": _sha256(triton_source),
                 "callable_module": runtime.triton_fn.__module__,
                 "forced_direct_import": True,
-                "audited_pr_head": PR4683_HEAD,
-                "expected_source_sha256": PR4683_TRITON_SOURCE_SHA256,
-                "matches_audited_pr_source": (
-                    _sha256(triton_source) == PR4683_TRITON_SOURCE_SHA256
+                "source_table_pr_head": SOURCE_TABLE_PR_HEAD,
+                "expected_source_sha256": TRITON_SOURCE_SHA256,
+                "matches_expected_source": (
+                    _sha256(triton_source) == TRITON_SOURCE_SHA256
+                ),
+                "gluon_k1_enabled": runtime.triton_module.AITER_FDA_USE_GLUON_K1,
+                "gluon_k2_enabled": runtime.triton_module.AITER_FDA_USE_GLUON_K2,
+                "triton_only_route_verified": not (
+                    runtime.triton_module.AITER_FDA_USE_GLUON_K1
+                    or runtime.triton_module.AITER_FDA_USE_GLUON_K2
                 ),
             },
             "native_jit": {
@@ -1196,9 +1211,10 @@ def _run_gpu(output: Path) -> dict[str, Any]:
     checkpoint = output.with_name("partial-results.jsonl")
     if output.exists() or checkpoint.exists():
         raise RuntimeError("refusing to overwrite result or checkpoint evidence")
-    if _control_environment():
+    if _control_environment() != REQUIRED_ROUTE_ENV:
         raise RuntimeError(
-            "routing environment must be empty before runtime import: "
+            "routing environment must select the pure Triton comparator before "
+            f"runtime import: expected {REQUIRED_ROUTE_ENV}, got "
             f"{_control_environment()}"
         )
 
@@ -1260,7 +1276,7 @@ def _run_gpu(output: Path) -> dict[str, Any]:
 
         phase = "provenance"
         provenance = _runtime_provenance(runtime)
-        if provenance["active_route_control_environment"]:
+        if provenance["active_route_control_environment"] != REQUIRED_ROUTE_ENV:
             raise RuntimeError("route-control environment changed during the run")
         phase = "cross-seed-analysis"
         cross_seed = _cross_seed_summary(results)
@@ -1268,7 +1284,7 @@ def _run_gpu(output: Path) -> dict[str, Any]:
         payload = {
             "schema": SCHEMA,
             "source_pr": "https://github.com/ROCm/aiter/pull/4683",
-            "source_pr_head": PR4683_HEAD,
+            "source_table_pr_head": SOURCE_TABLE_PR_HEAD,
             "started_unix": started,
             "finished_unix": time.time(),
             "configuration": {
@@ -1291,6 +1307,7 @@ def _run_gpu(output: Path) -> dict[str, Any]:
                 "native_backend": NATIVE_BACKEND,
                 "triton_backend": TRITON_BACKEND,
                 "triton_forced_direct_internal_import": True,
+                "triton_gluon_disabled": True,
             },
             "plan": _plan(),
             "plan_sha256": _plan_sha256(_plan()),

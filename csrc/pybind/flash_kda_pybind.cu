@@ -28,7 +28,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("lower_bound"),
           py::arg("has_initial_state"),
           py::arg("output_final_state"),
-          py::arg("is_varlen"));
+          py::arg("is_varlen"),
+          py::arg("max_seqlen_upper_bound"));
     m.def("flash_kda_fwd_hip_raw",
           &aiter::flash_kda_fwd_hip_raw,
           "Internal validated-pointer FlashKDA forward fast path",
