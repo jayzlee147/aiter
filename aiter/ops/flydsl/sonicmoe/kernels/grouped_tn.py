@@ -956,6 +956,49 @@ def grouped_tn_launch_grid(
     )
 
 
+def grouped_tn_queue_3d_launch_grid(
+    schedule_capacity: int,
+    output_m: int,
+    output_n: int,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    stages: int,
+    m_waves: int,
+    n_waves: int,
+    gather_rhs: bool = False,
+) -> tuple[int, int, int] | None:
+    """Return an occupancy-capped queue 3D dispatch grid.
+
+    The x axis grid-strides over the device queue while y/z directly encode the
+    output tile.  If one expert's output tile set already exceeds the persistent
+    resource cap, the caller must retain the established flattened 1D schedule.
+    """
+
+    if schedule_capacity <= 0:
+        return None
+    if output_m % block_m or output_n % block_n:
+        return None
+    num_m_tiles = output_m // block_m
+    num_n_tiles = output_n // block_n
+    if num_m_tiles > 65535 or num_n_tiles > 65535:
+        return None
+    output_tiles = num_m_tiles * num_n_tiles
+    cap = grouped_tn_grid_cap(
+        block_m,
+        block_n,
+        block_k,
+        stages,
+        m_waves,
+        n_waves,
+        gather_rhs,
+    )
+    if output_tiles > cap:
+        return None
+    descriptor_lanes = min(schedule_capacity, max(1, cap // output_tiles))
+    return descriptor_lanes, num_n_tiles, num_m_tiles
+
+
 @functools.lru_cache(maxsize=128)
 def compile_grouped_tn(
     output_m: int,
@@ -978,6 +1021,7 @@ def compile_grouped_tn(
     active_guard_or_expert_rows: bool = False,
     exclude_hot_experts: bool = False,
     split_k_partials: bool = False,
+    queue_3d: bool = False,
 ):
     """Compile the persistent grouped TN consumer for a prebuilt queue.
 
@@ -1011,6 +1055,10 @@ def compile_grouped_tn(
     ``[count, (expert, first_row, valid_rows)*]`` and writes one FP32 output
     matrix per descriptor.  A separate deterministic reduction finalizes those
     matrices into the public BF16 gradient.
+    ``queue_3d`` maps the output M/N tiles directly to grid z/y and uses grid x
+    only for active queue descriptors.  This specialization is reserved for
+    bounded E16 regular-queue profiles; metadata-direct and split-K schedules
+    retain the flattened 1D traversal.
     """
 
     del device_index
@@ -1076,6 +1124,10 @@ def compile_grouped_tn(
         )
     if split_k_partials and metadata_direct:
         raise ValueError("split-K partials require queue metadata")
+    if not isinstance(queue_3d, bool):
+        raise TypeError("queue_3d must be a bool")
+    if queue_3d and (num_experts != 16 or metadata_direct or split_k_partials):
+        raise ValueError("queue_3d requires a regular E16 active-expert queue")
     if not isinstance(exclude_hot_experts, bool):
         raise TypeError("exclude_hot_experts must be a bool")
     if exclude_hot_experts and (metadata_direct or split_k_partials):
@@ -1151,6 +1203,7 @@ def compile_grouped_tn(
             f"_md{int(metadata_direct)}"
             f"_gr{int(gather_rhs)}"
             f"_skp{int(split_k_partials)}"
+            f"_q3d{int(queue_3d)}"
             f"_amin{min_active_experts}_amax{max_active_experts}"
             f"_rf{int(filter_expert_rows)}_rmax{int(has_max_expert_rows)}"
             f"_aor{int(active_guard_or_expert_rows)}"
@@ -1173,8 +1226,8 @@ def compile_grouped_tn(
         tiled_mma: fx.TiledMma,
     ):
         tid = gpu.thread_idx.x
-        bid = gpu.block_idx.x
-        grid_size = gpu.grid_dim.x
+        bid = fx.Int32(gpu.block_idx.x)
+        grid_size = fx.Int32(gpu.grid_dim.x)
         storage_rsrc = buffer_ops.create_buffer_resource(
             schedule_storage, max_size=True
         )
@@ -1258,8 +1311,15 @@ def compile_grouped_tn(
         wave_offset = get_wave_lds_offset(tid, async_load_bytes)
 
         def run_output_tile_unchecked(work_index):
-            descriptor_index = work_index // fx.Int32(output_tiles_per_expert)
-            output_tile = work_index % fx.Int32(output_tiles_per_expert)
+            if const_expr(queue_3d):
+                descriptor_index = work_index
+                block_m_index = fx.Int32(gpu.block_idx.z)
+                block_n_index = fx.Int32(gpu.block_idx.y)
+            else:
+                descriptor_index = work_index // fx.Int32(output_tiles_per_expert)
+                output_tile = work_index % fx.Int32(output_tiles_per_expert)
+                block_m_index = output_tile // fx.Int32(num_n_tiles)
+                block_n_index = output_tile % fx.Int32(num_n_tiles)
             if const_expr(split_k_partials):
                 descriptor_offset = fx.Int32(1) + descriptor_index * fx.Int32(3)
                 expert = rocdl.readfirstlane(
@@ -1367,8 +1427,6 @@ def compile_grouped_tn(
                         fx.Int64(resource_rows) * fx.Int64(output_n * in_data_bytes)
                     ),
                 )
-            block_m_index = output_tile // fx.Int32(num_n_tiles)
-            block_n_index = output_tile % fx.Int32(num_n_tiles)
             block_m_offset = block_m_index * fx.Int32(block_m)
             block_n_offset = block_n_index * fx.Int32(block_n)
 
@@ -1751,7 +1809,11 @@ def compile_grouped_tn(
             if const_expr(not filter_expert_rows and not exclude_hot_experts):
                 run_output_tile_unchecked(work_index)
             else:
-                descriptor_index = work_index // fx.Int32(output_tiles_per_expert)
+                descriptor_index = (
+                    work_index
+                    if const_expr(queue_3d)
+                    else work_index // fx.Int32(output_tiles_per_expert)
+                )
                 if const_expr(metadata_direct):
                     expert = rocdl.readfirstlane(
                         T.i32,
@@ -1825,11 +1887,23 @@ def compile_grouped_tn(
                 if selected:
                     run_output_tile_unchecked(work_index)
 
-        if bid < work_bound:
-            run_output_tile(bid)
-        for work_index in range(bid + grid_size, work_bound, grid_size):
-            gpu.barrier()
-            run_output_tile(fx.Int32(work_index))
+        if const_expr(queue_3d):
+            descriptor_bound = work_bound // fx.Int32(output_tiles_per_expert)
+            if bid < descriptor_bound:
+                run_output_tile(bid)
+            for descriptor_index in range(
+                bid + grid_size,
+                descriptor_bound,
+                grid_size,
+            ):
+                gpu.barrier()
+                run_output_tile(fx.Int32(descriptor_index))
+        else:
+            if bid < work_bound:
+                run_output_tile(bid)
+            for work_index in range(bid + grid_size, work_bound, grid_size):
+                gpu.barrier()
+                run_output_tile(fx.Int32(work_index))
 
     if gather_rhs:
 
@@ -1873,7 +1947,11 @@ def compile_grouped_tn(
                 i32_hot_split_min_rows,
                 tiled_mma,
             ).launch(
-                grid=(i32_grid, 1, 1),
+                grid=(
+                    (i32_grid, num_n_tiles, num_m_tiles)
+                    if queue_3d
+                    else (i32_grid, 1, 1)
+                ),
                 block=(block_threads, 1, 1),
                 stream=stream,
             )
@@ -1919,7 +1997,11 @@ def compile_grouped_tn(
                 i32_hot_split_min_rows,
                 tiled_mma,
             ).launch(
-                grid=(i32_grid, 1, 1),
+                grid=(
+                    (i32_grid, num_n_tiles, num_m_tiles)
+                    if queue_3d
+                    else (i32_grid, 1, 1)
+                ),
                 block=(block_threads, 1, 1),
                 stream=stream,
             )
@@ -2314,6 +2396,7 @@ def grouped_tn_from_queue_flydsl(
     active_guard_or_expert_rows: bool = False,
     hot_expert_storage: torch.Tensor | None = None,
     hot_split_min_rows: int | None = None,
+    use_queue_3d: bool = False,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     """Consume a prebuilt active-expert queue for one grouped TN contraction.
@@ -2330,6 +2413,9 @@ def grouped_tn_from_queue_flydsl(
     A hot-expert queue can independently exclude split-K-owned experts.  Its
     zero device count disables that exclusion, allowing a device-side cohort
     gate to keep the regular contraction without changing the launch graph.
+    ``use_queue_3d`` maps the output tile to grid y/z and reserves grid x for
+    device-queue descriptors.  It is intended for finite, preselected tuning
+    profiles; the runtime queue count remains device-side.
     """
 
     if lhs_rows.ndim != 2 or rhs_rows.ndim != 2 or output.ndim != 3:
@@ -2432,6 +2518,19 @@ def grouped_tn_from_queue_flydsl(
             )
     elif hot_split_min_rows is not None:
         raise ValueError("hot_split_min_rows requires hot_expert_storage")
+    if not isinstance(use_queue_3d, bool):
+        raise TypeError("use_queue_3d must be a bool")
+    if use_queue_3d and (
+        num_experts != 16
+        or gather_rhs
+        or min_active_experts != 0
+        or max_active_experts is not None
+        or filter_expert_rows
+        or exclude_hot_experts
+    ):
+        raise ValueError(
+            "queue 3D requires an unguarded E16 contraction with contiguous RHS"
+        )
 
     capacity = (int(queue_storage.numel()) - 1) // 2
     if capacity == 0:
@@ -2454,17 +2553,38 @@ def grouped_tn_from_queue_flydsl(
     k_padding = default_k_padding if k_padding is None else k_padding
     m_waves = default_m_waves if m_waves is None else m_waves
     n_waves = default_n_waves if n_waves is None else n_waves
-    grid = grouped_tn_launch_grid(
-        capacity,
-        output_m,
-        output_n,
-        block_m,
-        block_n,
-        block_k,
-        stages,
-        m_waves,
-        n_waves,
-        gather_rhs,
+    queue_3d_grid = (
+        grouped_tn_queue_3d_launch_grid(
+            capacity,
+            output_m,
+            output_n,
+            block_m,
+            block_n,
+            block_k,
+            stages,
+            m_waves,
+            n_waves,
+            gather_rhs,
+        )
+        if use_queue_3d
+        else None
+    )
+    queue_3d = queue_3d_grid is not None
+    grid = (
+        queue_3d_grid[0]
+        if queue_3d_grid is not None
+        else grouped_tn_launch_grid(
+            capacity,
+            output_m,
+            output_n,
+            block_m,
+            block_n,
+            block_k,
+            stages,
+            m_waves,
+            n_waves,
+            gather_rhs,
+        )
     )
     if stream is None:
         stream = torch.cuda.current_stream(lhs_rows.device)
@@ -2488,6 +2608,7 @@ def grouped_tn_from_queue_flydsl(
         has_max_expert_rows=has_max_expert_rows,
         active_guard_or_expert_rows=active_guard_or_expert_rows,
         exclude_hot_experts=exclude_hot_experts,
+        queue_3d=queue_3d,
     )
     runtime_max_expert_rows = (
         _MAX_SIGNED_I32 if max_expert_rows is None else max_expert_rows

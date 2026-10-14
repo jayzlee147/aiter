@@ -638,7 +638,28 @@ def _launch_grouped_dw2(
         if split_min_rows <= 0:
             raise ValueError("hot_split_min_rows must be positive")
 
-    if _use_e16_dw2_dual_profile(
+    if use_e16_policy_geometry and route_policy == E16RoutePolicy.MEDIUM:
+        # The 4K--16K dynamic bucket uses one rank-consistent profile.  BN128
+        # doubles dW2's output-tile parallelism under expert skew, while the
+        # capped queue-3D schedule below keeps balanced shards efficient without
+        # reading the device queue count or specializing on the exact route count.
+        grouped_dw2_profiles = (
+            (
+                256,
+                128,
+                _GROUPED_DW2_BK,
+                0,
+                4,
+                2,
+                _grouped_dw2_stages(profile_rows),
+                0,
+                None,
+                0,
+                None,
+                False,
+            ),
+        )
+    elif _use_e16_dw2_dual_profile(
         use_hostless_grouped=use_hostless_grouped,
         use_tn_metadata_direct=use_tn_metadata_direct,
         num_experts=int(expert_frequency.numel()),
@@ -796,6 +817,8 @@ def _launch_grouped_dw2(
             "stages": dw2_stages,
             "stream": stream,
         }
+        if use_e16_policy_geometry and route_policy == E16RoutePolicy.MEDIUM:
+            grouped_dw2_kwargs["use_queue_3d"] = True
         effective_max_profile_rows = max_profile_rows
         effective_min_profile_rows = min_profile_rows
         effective_active_guard = active_guard_or_expert_rows
