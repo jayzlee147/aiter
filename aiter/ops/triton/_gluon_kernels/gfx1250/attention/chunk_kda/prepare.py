@@ -17,7 +17,9 @@ def _get_config(overrides=None):
     return {**config, **(overrides or {})}
 
 
-_chunk_kda_prepare_repr = make_kernel_repr("chunk_kda_prepare_kernel", ["BT", "K", "V"])
+_chunk_kda_prepare_repr = make_kernel_repr(
+    "chunk_kda_prepare_kernel", ["BT", "H_Q", "H", "K", "V"]
+)
 
 
 @gluon.jit(repr=_chunk_kda_prepare_repr)
@@ -44,6 +46,7 @@ def chunk_kda_prepare_kernel(
     stride_g_token: gl.constexpr,
     stride_beta_token: gl.constexpr,
     scale: gl.constexpr,
+    H_Q: gl.constexpr,
     H: gl.constexpr,
     K: gl.constexpr,
     V: gl.constexpr,
@@ -57,6 +60,7 @@ def chunk_kda_prepare_kernel(
     gl.static_assert(
         BT == 64 and K == 128 and V == 128, "specialised to BT=64, K=V=128"
     )
+    gl.static_assert(H >= H_Q and H % H_Q == 0, "H must be a multiple of H_Q")
     gl.static_assert(NUM_WARPS == 4, "a 16-token band per warp")
     BC: gl.constexpr = 16  # band: 2^-lc stays finite over 16 tokens
     NB: gl.constexpr = BT // BC
@@ -102,6 +106,7 @@ def chunk_kda_prepare_kernel(
 
     i_t = gl.program_id(0)
     i_h = gl.program_id(1)
+    i_hq = i_h // (H // H_Q)
     i_n = gl.load(chunk_indices_ptr + 2 * i_t).to(gl.int32)
     bos = gl.load(cu_seqlens_ptr + i_n).to(gl.int32)
     t0 = bos + gl.load(chunk_indices_ptr + 2 * i_t + 1).to(gl.int32) * BT
@@ -117,14 +122,14 @@ def chunk_kda_prepare_kernel(
     g_s = gl.allocate_shared_memory(g_ptr.dtype.element_ty, [BT, K], SL)
     v_s = gl.allocate_shared_memory(v_ptr.dtype.element_ty, [BT, V], SL)
     dq = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=q_ptr + tok * stride_q_token + i_h * K,
+        base=q_ptr + tok * stride_q_token + i_hq * K,
         shape=(n, K),
         strides=(stride_q_token, 1),
         block_shape=(BT, K),
         layout=SL,
     )
     dk = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=k_ptr + tok * stride_k_token + i_h * K,
+        base=k_ptr + tok * stride_k_token + i_hq * K,
         shape=(n, K),
         strides=(stride_k_token, 1),
         block_shape=(BT, K),

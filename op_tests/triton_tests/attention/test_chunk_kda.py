@@ -21,8 +21,12 @@ from op_tests.triton_tests.utils.kda_ref import chunk_kda_ref, kda_gate_ref, l2n
 
 ARCH = get_arch()
 pytestmark = pytest.mark.skipif(
-    ARCH not in ("gfx1250", "gfx950"),
+    ARCH not in ("gfx1250", "gfx1250-strict", "gfx950"),
     reason=f"chunk KDA gluon needs gfx1250 or gfx950, got {ARCH}",
+)
+GFX1250_ONLY = pytest.mark.skipif(
+    ARCH not in ("gfx1250", "gfx1250-strict"),
+    reason="grouped value attention is currently gfx1250-only",
 )
 STATE_DTYPES = [
     torch.float32,
@@ -57,14 +61,24 @@ def assert_close(name, ref, tri, ratio=RATIO):
     assert r < ratio, f"{name}: err ratio {r:.6f} >= {ratio}"
 
 
-def make_inputs(seqlens, H, seed=0, dup_keys=False, gate_shift=0.0):
+def make_inputs(seqlens, H, seed=0, dup_keys=False, gate_shift=0.0, Hq=None):
     """K3 prefill inputs: raw projections, q/k/v as bands of one fused projection."""
     torch.manual_seed(seed)
+    Hq = H if Hq is None else Hq
     T = sum(seqlens)
-    mixed = torch.randn(1, T, 3 * H * D, dtype=torch.bfloat16, device=DEVICE)
-    q, k, v = (
-        mixed[..., i * H * D : (i + 1) * H * D].unflatten(-1, (H, D)) for i in range(3)
-    )
+    if Hq == H:
+        mixed = torch.randn(1, T, 3 * H * D, dtype=torch.bfloat16, device=DEVICE)
+        q, k, v = (
+            mixed[..., i * H * D : (i + 1) * H * D].unflatten(-1, (H, D))
+            for i in range(3)
+        )
+    else:
+        mixed = torch.randn(1, T, 2 * Hq * D, dtype=torch.bfloat16, device=DEVICE)
+        q, k = (
+            mixed[..., i * Hq * D : (i + 1) * Hq * D].unflatten(-1, (Hq, D))
+            for i in range(2)
+        )
+        v = torch.randn(1, T, H, D, dtype=torch.bfloat16, device=DEVICE)
     if dup_keys:  # near-duplicate neighbouring keys: the case that breaks a bf16 solve
         k.copy_(k[:, :1] + 0.02 * k)
     g = torch.randn(1, T, H, D, dtype=torch.bfloat16, device=DEVICE) + gate_shift
@@ -209,11 +223,15 @@ def workspace_ref(inp, scale):
     """fp64 chunk operands straight from the chunk equations (log2 units), for the prepare test."""
     q, k = l2norm_ref(inp["q"])[0].double(), l2norm_ref(inp["k"])[0].double()
     v = inp["v"][0].double()
+    H = v.shape[1]
+    group = H // q.shape[1]
+    q = q.repeat_interleave(group, dim=1)
+    k = k.repeat_interleave(group, dim=1)
     G2 = kda_gate_ref(inp["g"], inp["A_log"], inp["dt_bias"], LOWER_BOUND)[
         0
     ].double() / math.log(2)
     beta = torch.sigmoid(inp["beta"][0].double())
-    T, H, _ = q.shape
+    T = q.shape[0]
     out = {
         "qg": torch.zeros(T, H, D, dtype=torch.float64, device=DEVICE),
         "w": torch.zeros(T, H, D, dtype=torch.float64, device=DEVICE),
@@ -268,6 +286,26 @@ def test_chunk_kda(seqlens, state_dtype):
     assert_close("final_state", s_ref, s)
 
 
+@pytest.mark.parametrize(
+    ("Hq", "H", "seqlens"),
+    [
+        (2, 4, [1, 63, 65]),
+        (2, 6, [64, 65]),
+        (12, 24, [130]),
+    ],
+)
+@GFX1250_ONLY
+def test_chunk_kda_gva(Hq, H, seqlens):
+    """Each contiguous value-head group reads its shared q/k head."""
+    inp = make_inputs(seqlens, H, Hq=Hq)
+    h0 = torch.randn(len(seqlens), H, D, D, dtype=torch.float32, device=DEVICE)
+    o_ref, s_ref = run_ref(inp, h0)
+    o, s = run_kernel(inp, initial_state=h0, output_final_state=True)
+    assert o.shape == (1, sum(seqlens), H, D)
+    assert_close("o", o_ref, o)
+    assert_close("final_state", s_ref, s)
+
+
 @pytest.mark.parametrize("seqlens", [[64], [65], [1, 64, 130, 7]])
 def test_chunk_kda_workspace(seqlens):
     H = 4
@@ -280,12 +318,33 @@ def test_chunk_kda_workspace(seqlens):
     assert_close("decay", ref["decay"], ws["decay"])
 
 
-@pytest.mark.parametrize("padded", [False, True])
+@GFX1250_ONLY
+def test_chunk_kda_gva_workspace():
+    inp = make_inputs([65], 4, Hq=2)
+    ws = chunk_kda_prepare(**inp, lower_bound=LOWER_BOUND)
+    ref = workspace_ref(inp, D**-0.5)
+    for name in ("qg", "aqk", "w", "u"):
+        assert_close(name, ref[name], ws[name][0])
+    assert_close("kg_t", ref["kg_t"], ws["kg_t"])
+    assert_close("decay", ref["decay"], ws["decay"])
+
+
+@pytest.mark.parametrize(("Hq", "H"), [(4, 2), (3, 4)])
+def test_chunk_kda_rejects_invalid_gva(Hq, H):
+    inp = make_inputs([64], H, Hq=Hq)
+    with pytest.raises(AssertionError, match="value heads"):
+        run_kernel(inp)
+
+
+@pytest.mark.parametrize(
+    ("padded", "Hq"),
+    [(False, 24), (True, 24), pytest.param(False, 12, marks=GFX1250_ONLY)],
+)
 @pytest.mark.parametrize("state_dtype", STATE_DTYPES)
-def test_chunk_kda_paged(padded, state_dtype):
+def test_chunk_kda_paged(padded, Hq, state_dtype):
     """State cache in place, out aliasing v; ``padded`` gives a hybrid-page slot stride."""
     seqlens, H = [130, 1, 64, 257], 24
-    inp = make_inputs(seqlens, H, seed=1)
+    inp = make_inputs(seqlens, H, seed=1, Hq=Hq)
     N = len(seqlens)
     lead, tail = (3 * 2 * H * D, 1000) if padded else (0, 0)
     page = lead + H * D * D + tail
@@ -314,10 +373,11 @@ def test_chunk_kda_paged(padded, state_dtype):
     ).all(), "cache memory outside the used slots was written"
 
 
-def test_chunk_kda_fused_norm():
+@pytest.mark.parametrize("Hq", [4, pytest.param(2, marks=GFX1250_ONLY)])
+def test_chunk_kda_fused_norm(Hq):
     """Fused output norm; the resolved config must give it BV = V."""
     seqlens, H = [200, 70], 4
-    inp = make_inputs(seqlens, H, seed=2)
+    inp = make_inputs(seqlens, H, seed=2, Hq=Hq)
     og = torch.randn_like(inp["v"])
     nw = torch.rand(D, dtype=torch.float32, device=DEVICE) + 0.5
     eps = 1e-5
@@ -336,6 +396,9 @@ def test_chunk_kda_fused_norm():
         norm_eps=eps,
     )
     assert_close("o", o_ref, o)
+    if Hq != H:
+        with pytest.raises(AssertionError, match="out_gate must match"):
+            run_kernel(inp, out_gate=og[:, :, :Hq], norm_weight=nw)
 
 
 @pytest.mark.parametrize(

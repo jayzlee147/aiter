@@ -77,16 +77,29 @@ def chunk_kda_prepare(
     """The walk's workspace in one launch; see chunk_kda."""
     assert _ARCH in (
         "gfx1250",
+        "gfx1250-strict",
         "gfx950",
     ), f"chunk kda needs gfx1250 or gfx950, got {_ARCH}"
-    _, T, H, K = q.shape
+    _, T, H_Q, K = q.shape
+    H = v.shape[2]
     V = v.shape[-1]
     assert K == HEAD_DIM and V == HEAD_DIM, "chunk kda is specialised to K = V = 128"
+    assert k.shape == q.shape, "k must share q's [1, T, Hq, K] shape"
+    assert (
+        0 < H_Q <= H and H % H_Q == 0
+    ), "value heads must be a positive multiple of q/k heads"
+    if _ARCH == "gfx950":
+        assert H == H_Q, "grouped value attention is currently gfx1250-only"
     # the prepare's 16-token bands keep 2^-G finite only down to this floor
     assert -5.5 <= lower_bound < 0, "lower_bound must be in [-5.5, 0)"
-    for name, x, D in (("q", q, K), ("k", k, K), ("v", v, V), ("g", g, K)):
+    for name, x, D, heads in (
+        ("q", q, K, H_Q),
+        ("k", k, K, H_Q),
+        ("v", v, V, H),
+        ("g", g, K, H),
+    ):
         _check_tokens(name, x, D)
-        assert x.shape[1:3] == (T, H), f"{name} must share [T, H] with q"
+        assert x.shape[1:3] == (T, heads), f"{name} must have [T, H] = {(T, heads)}"
         assert x.stride(1) % 8 == 0, f"{name} rows must be 16-byte aligned"
     assert beta.shape == (1, T, H) and beta.stride(2) == 1, "beta must be [1, T, H]"
     assert A_log.numel() == H and A_log.is_contiguous(), "A_log must be [H]"
@@ -110,6 +123,7 @@ def chunk_kda_prepare(
         "decay": _empty((NT, H, K), torch.float32, q.device),
     }
     config = prepare._get_config(config)
+    kernel_extra = {"H_Q": H_Q} if _ARCH in ("gfx1250", "gfx1250-strict") else {}
     prepare.chunk_kda_prepare_kernel[(NT, H)](
         q_ptr=q,
         k_ptr=k,
@@ -141,6 +155,7 @@ def chunk_kda_prepare(
         NC=config["nc"],
         num_warps=config["num_warps"],
         waves_per_eu=config["waves_per_eu"],
+        **kernel_extra,
     )
     return ws
 
@@ -169,6 +184,7 @@ def chunk_kda_walk(
     """Chunk recurrence and output from the chunk_kda_prepare workspace; see chunk_kda."""
     assert _ARCH in (
         "gfx1250",
+        "gfx1250-strict",
         "gfx950",
     ), f"chunk kda needs gfx1250 or gfx950, got {_ARCH}"
     _, T, H, K = qg.shape
@@ -246,6 +262,7 @@ def chunk_kda_walk(
             assert s.stride(0) >= H * V * K, "state rows must not overlap"
     if fuse_norm:
         _check_tokens("out_gate", out_gate, V)
+        assert out_gate.shape == (1, T, H, V), "out_gate must match output shape"
         assert norm_weight.numel() == V and norm_weight.is_contiguous()
         config = {"BV": V, "num_warps": 4, "KS": 1, **(config or {})}
 
@@ -393,20 +410,23 @@ def chunk_kda(
     state_indices row must be valid.
 
     Args:
-        q, k, v: [1, T, H, 128] raw projections; token rows may be strided.
-        g: [1, T, H, 128] raw gate projection. beta: [1, T, H] raw beta projection.
-        A_log: [H] gate parameter. dt_bias: [H * 128] gate bias.
+        q, k: [1, T, Hq, 128] raw query/key projections; token rows may be strided.
+        v, g: [1, T, Hv, 128] raw value/gate projections. beta: [1, T, Hv]
+            raw beta projection. On the gfx1250 family, grouped value attention is
+            supported when Hv is a positive integer multiple of Hq. Each contiguous
+            group of Hv/Hq value heads shares one q/k head.
+        A_log: [Hv] gate parameter. dt_bias: [Hv * 128] gate bias.
         lower_bound: gate floor; g = lower_bound * sigmoid(exp(A_log) * (g + dt_bias)).
         cu_seqlens: int32 / int64 [N + 1] sequence offsets.
         chunk_indices, chunk_offsets: [NT, 2] (sequence, chunk) and [N + 1] first chunk
             per sequence; built by prepare_chunk_kda_metadata (a host sync) if None.
         scale: q scale, K**-0.5 if None.
-        out: [1, T, H, 128] output, may alias v; allocated if None.
-        initial_state: [N, H, V, K] start state, zeros if None. The Gluon path accepts
+        out: [1, T, Hv, 128] output, may alias v; allocated if None.
+        initial_state: [N, Hv, V, K] start state, zeros if None. The Gluon path accepts
             fp32, or bf16 on gfx950. Other archs use the Triton dtype contract.
-        output_final_state: return a new [N, H, V, K] final state with initial_state's
+        output_final_state: return a new [N, Hv, V, K] final state with initial_state's
             dtype, or fp32 without initial_state.
-        state_cache: [slots, H, V, K] state, with the same dtype limits as
+        state_cache: [slots, Hv, V, K] state, with the same dtype limits as
             initial_state. Updated in place at state_indices; replaces initial_state
             and output_final_state.
         state_indices: [N] distinct cache rows; a row outside [0, slots) is not read or
