@@ -13,6 +13,14 @@
 
 namespace {
 
+constexpr std::uintptr_t kFlashKdaWorkspaceAlignment = 16;
+
+#if defined(FLASH_KDA_GFX1250_BACKEND)
+constexpr bool kPreserveSingleSequencePackedMetadata = true;
+#else
+constexpr bool kPreserveSingleSequencePackedMetadata = false;
+#endif
+
 void check_gpu_contiguous(const aiter_tensor_t& tensor, const char* name)
 {
     AITER_CHECK(tensor.is_gpu(), name, " must be a GPU tensor");
@@ -175,6 +183,11 @@ void flash_kda_fwd_hip(
                 "beta must be float32 (the Python adapter widens bf16 logits)");
     AITER_CHECK(workspace.dtype() == AITER_DTYPE_u8,
                 "workspace must be a byte (uint8) tensor");
+    AITER_CHECK(
+        reinterpret_cast<std::uintptr_t>(workspace.data_ptr()) %
+                kFlashKdaWorkspaceAlignment ==
+            0,
+        "workspace must be 16-byte aligned");
     AITER_CHECK(A_log.dtype() == AITER_DTYPE_fp32, "A_log must be float32");
     AITER_CHECK(dt_bias.dtype() == AITER_DTYPE_fp32, "dt_bias must be float32");
 
@@ -307,13 +320,13 @@ void flash_kda_fwd_hip(
     }
 
     constexpr int64_t chunk = flashkda_hip::WorkspaceSizes::CHUNK;
-    // A one-sequence packed tensor is byte-for-byte identical to the dense
-    // B=1 layout: cu_seqlens is necessarily [0, B*T], so no device metadata
-    // is needed to resolve a tile.  Dispatch it through the dense kernels to
-    // remove the prefix launch, binary searches, and the conservative gap
-    // tile.  Multi-sequence packed calls retain the original prefix ABI.
-    const bool single_sequence_packed = is_varlen && N == 1;
-    const int64_t total_tiles64 = single_sequence_packed
+    // A one-sequence packed tensor is byte-for-byte identical to dense B=1.
+    // Wave64 therefore keeps its established dense fast path. gfx1250 retains
+    // the packed metadata because its measured auto-G16 policy deliberately
+    // distinguishes this serving shape from an ordinary dense invocation.
+    const bool single_sequence_dense =
+        is_varlen && N == 1 && !kPreserveSingleSequencePackedMetadata;
+    const int64_t total_tiles64 = single_sequence_dense
         ? (total_tokens + chunk - 1) / chunk
         : (is_varlen
             ? (total_tokens + chunk - 1) / chunk + N
@@ -331,6 +344,10 @@ void flash_kda_fwd_hip(
                 "workspace byte size overflows size_t");
     const size_t supplied_workspace_bytes =
         workspace.numel() * workspace_element_size;
+    AITER_CHECK(
+        supplied_workspace_bytes <=
+            static_cast<size_t>(std::numeric_limits<int64_t>::max()),
+        "workspace byte size exceeds int64_t");
     AITER_CHECK(workspace_bytes >= 0 &&
                     supplied_workspace_bytes >= static_cast<size_t>(workspace_bytes),
                 "workspace is too small: need ",
@@ -352,6 +369,7 @@ void flash_kda_fwd_hip(
         static_cast<float>(scale),
         out.data_ptr(),
         workspace.data_ptr(),
+        static_cast<int64_t>(supplied_workspace_bytes),
         static_cast<const float*>(A_log.data_ptr()),
         static_cast<const float*>(dt_bias.data_ptr()),
         gate_scale,
@@ -365,7 +383,7 @@ void flash_kda_fwd_hip(
         has_initial_state,
         output_final_state,
         state_fp32,
-        single_sequence_packed ? nullptr : cu_seqlens_ptr,
+        single_sequence_dense ? nullptr : cu_seqlens_ptr,
         stream,
         static_cast<int>(max_seqlen_upper_bound));
     HIP_CALL_LAUNCH(hipGetLastError());
@@ -406,7 +424,8 @@ void flash_kda_fwd_hip_raw_v3(
     raw_check_pointer(g_ptr, "g_ptr", alignof(uint16_t));
     raw_check_pointer(beta_ptr, "beta_ptr", alignof(float));
     raw_check_pointer(out_ptr, "out_ptr", alignof(uint16_t));
-    raw_check_pointer(workspace_ptr, "workspace_ptr", alignof(uint16_t));
+    raw_check_pointer(
+        workspace_ptr, "workspace_ptr", kFlashKdaWorkspaceAlignment);
     raw_check_pointer(A_log_ptr, "A_log_ptr", alignof(float));
     raw_check_pointer(dt_bias_ptr, "dt_bias_ptr", alignof(float));
     if(has_initial_state)
@@ -483,11 +502,12 @@ void flash_kda_fwd_hip_raw_v3(
     }
 
     constexpr int64_t chunk = flashkda_hip::WorkspaceSizes::CHUNK;
-    const bool single_sequence_packed = is_varlen && N == 1;
-    if(is_varlen && !single_sequence_packed)
+    const bool single_sequence_dense =
+        is_varlen && N == 1 && !kPreserveSingleSequencePackedMetadata;
+    if(is_varlen && !single_sequence_dense)
         raw_check_pointer(cu_seqlens_ptr, "cu_seqlens_ptr", alignof(int32_t));
 
-    const int64_t launch_tiles = single_sequence_packed
+    const int64_t launch_tiles = single_sequence_dense
         ? (total_tokens + chunk - 1) / chunk
         : (is_varlen ? (total_tokens + chunk - 1) / chunk + N
                      : N * ((T + chunk - 1) / chunk));
@@ -529,6 +549,7 @@ void flash_kda_fwd_hip_raw_v3(
         static_cast<float>(scale),
         reinterpret_cast<void*>(out_ptr),
         reinterpret_cast<void*>(workspace_ptr),
+        workspace_bytes,
         reinterpret_cast<const float*>(A_log_ptr),
         reinterpret_cast<const float*>(dt_bias_ptr),
         gate_scale,
@@ -542,8 +563,8 @@ void flash_kda_fwd_hip_raw_v3(
         has_initial_state,
         output_final_state,
         state_fp32,
-        single_sequence_packed ? nullptr
-                               : reinterpret_cast<const int32_t*>(cu_seqlens_ptr),
+        single_sequence_dense ? nullptr
+                              : reinterpret_cast<const int32_t*>(cu_seqlens_ptr),
         stream,
         static_cast<int>(max_seqlen_upper_bound));
     raw_check_hip(hipGetLastError(), "hipGetLastError");

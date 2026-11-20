@@ -53,6 +53,7 @@ void launch_fwd_hip(
     float scale,
     void* out_ptr,
     void* workspace_ptr,
+    int64_t workspace_bytes,
     const float* A_log_ptr,
     const float* dt_bias_ptr,
     float gate_scale,

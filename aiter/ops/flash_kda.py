@@ -4,7 +4,7 @@
 # The native kernel implementation wrapped by this module is adapted from
 # MoonshotAI/FlashKDA (MIT, Copyright (c) 2026 MoonshotAI).
 
-"""Native HIP/MFMA FlashKDA forward for gfx942 and gfx950.
+"""Native HIP FlashKDA forward for gfx942, gfx950, and gfx1250.
 
 This module owns the small aiter adapter around the architecture-specialized
 FlashKDA kernels.  It deliberately exposes an allocation-owning Python API:
@@ -34,13 +34,15 @@ from ..jit.core import compile_ops, get_module
 # changes. Aiter reuses importable JIT DSOs before consulting Ninja, so a new
 # cache key is required to prevent an older descriptor from being loaded.
 MD_NAME = "module_flash_kda_hip_v2"
+GFX1250_MD_NAME = "module_flash_kda_gfx1250"
 
-FLASH_KDA_NATIVE_ARCHS = frozenset({"gfx942", "gfx950"})
+FLASH_KDA_NATIVE_ARCHS = frozenset({"gfx942", "gfx950", "gfx1250"})
 FLASH_KDA_NATIVE_CHUNK = 16
 FLASH_KDA_NATIVE_DIM = 128
 _FLOAT32_MAX = float(torch.finfo(torch.float32).max)
 _INT32_MAX = (1 << 31) - 1
 _HIP_GRID_Y_MAX = 65535
+_GFX1250_ROUTE_ENV = "FLASH_KDA_GFX1250_ROUTE"
 
 # Workspace ABI shared with the imported FlashKDA K1/K2 launchers.  Keep these
 # names next to the sizing function so changes to the native hand-off layout
@@ -58,9 +60,11 @@ _CSPLIT_CROSS = FLASH_KDA_NATIVE_CHUNK * FLASH_KDA_NATIVE_CHUNK * 2
 _CSPLIT_CROSS64 = 4 * FLASH_KDA_NATIVE_CHUNK * FLASH_KDA_NATIVE_CHUNK * 2
 _CSPLIT_BETA = 64 * 4
 _CSPLIT_SEGMENT_A = 10 * FLASH_KDA_NATIVE_CHUNK * FLASH_KDA_NATIVE_CHUNK * 2
+_CONTEXT_GROUP_CHUNKS = frozenset({4, 8, 16})
+_CONTEXT_B_BYTES = FLASH_KDA_NATIVE_DIM * FLASH_KDA_NATIVE_DIM * 4
 
 
-@compile_ops(MD_NAME, develop=True)
+@compile_ops(MD_NAME, fc_name="flash_kda_fwd_hip", develop=True)
 def flash_kda_fwd_hip(
     q: Tensor,
     k: Tensor,
@@ -83,7 +87,34 @@ def flash_kda_fwd_hip(
 ) -> None: ...
 
 
-def flash_kda_workspace_size(total_tokens: int, num_heads: int, num_seqs: int) -> int:
+@compile_ops(GFX1250_MD_NAME, fc_name="flash_kda_fwd_hip", develop=True)
+def flash_kda_fwd_hip_gfx1250(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    g: Tensor,
+    beta: Tensor,
+    out: Tensor,
+    workspace: Tensor,
+    A_log: Tensor,
+    dt_bias: Tensor,
+    initial_state: Tensor,
+    final_state: Tensor,
+    cu_seqlens: Tensor,
+    scale: float,
+    lower_bound: float,
+    has_initial_state: bool,
+    output_final_state: bool,
+    is_varlen: bool,
+    max_seqlen_upper_bound: int,
+) -> None: ...
+
+
+def flash_kda_workspace_size(
+    total_tokens: int,
+    num_heads: int,
+    num_seqs: int,
+) -> int:
     """Return the native workspace size in bytes.
 
     The conservative ``+ num_seqs`` terms are part of FlashKDA's dense/varlen
@@ -112,6 +143,44 @@ def flash_kda_workspace_size(total_tokens: int, num_heads: int, num_seqs: int) -
         + num_heads * total_segments * _CSPLIT_BETA
         + num_heads * total_segments * _CSPLIT_SEGMENT_A
     )
+
+
+def _gfx1250_context_b_scratch_size(
+    batch: int,
+    seqlen: int,
+    num_heads: int,
+    num_seqs: int,
+    is_varlen: bool,
+    group_chunks: int,
+) -> int:
+    """Return the host launch-bound tail arena needed by a context route.
+
+    Packed metadata remains device-resident, so the backend and this allocator
+    both use the same conservative ``+ num_seqs`` group bound, including N=1.
+    """
+
+    if group_chunks not in _CONTEXT_GROUP_CHUNKS:
+        raise ValueError(f"unsupported gfx1250 context group: {group_chunks}")
+    total_tokens = batch * seqlen
+    if is_varlen:
+        total_tiles = (total_tokens + FLASH_KDA_NATIVE_CHUNK - 1) // (
+            FLASH_KDA_NATIVE_CHUNK
+        ) + num_seqs
+        total_context_groups = (
+            total_tokens + group_chunks * FLASH_KDA_NATIVE_CHUNK - 1
+        ) // (group_chunks * FLASH_KDA_NATIVE_CHUNK) + num_seqs
+    else:
+        tiles_per_sequence = (
+            seqlen + FLASH_KDA_NATIVE_CHUNK - 1
+        ) // FLASH_KDA_NATIVE_CHUNK
+        total_tiles = num_seqs * tiles_per_sequence
+        total_context_groups = num_seqs * (
+            (tiles_per_sequence + group_chunks - 1) // group_chunks
+        )
+
+    required_b = total_context_groups * num_heads * _CONTEXT_B_BYTES
+    available_b = total_tiles * num_heads * _CSPLIT_U
+    return required_b if required_b > available_b else 0
 
 
 def _normalize_max_seqlen_upper_bound(
@@ -144,6 +213,112 @@ def _normalize_max_seqlen_upper_bound(
     return value
 
 
+def _choose_gfx1250_auto_group_chunks(
+    total_tokens: int,
+    value_heads: int,
+    num_cus: int,
+) -> int:
+    """Mirror the native gfx1250 context auto-routing policy.
+
+    MI455 measurements choose G4 below six ``(C16 token chunk, value head)``
+    work units per CU and G8 at equality or above.  Keep this integer-only
+    arithmetic in sync with ``context_policy::choose_auto_group_chunks``:
+    Python must reserve the context scratch arena before C++ independently
+    resolves the route.
+    """
+
+    if total_tokens <= 0 or value_heads <= 0 or num_cus <= 0:
+        return 4
+    total_token_chunks = (
+        total_tokens + FLASH_KDA_NATIVE_CHUNK - 1
+    ) // FLASH_KDA_NATIVE_CHUNK
+    work_units = total_token_chunks * value_heads
+    return 4 if work_units < 6 * num_cus else 8
+
+
+_GFX1250_AUTO_G16_GROUPS = frozenset({12, 14, 15, 16, 24, 32, 48, 64})
+_GFX1250_AUTO_G16_QUERY_HEADS = frozenset({3, 12})
+
+
+def _should_use_gfx1250_auto_g16(
+    total_tokens: int,
+    query_heads: int,
+    value_heads: int,
+    num_seqs: int,
+    num_cus: int,
+    *,
+    is_varlen: bool,
+    output_final_state: bool,
+    state_fp32: bool,
+) -> bool:
+    """Mirror the narrow, measurement-backed native G16 promotion gate."""
+
+    group_tokens = 16 * FLASH_KDA_NATIVE_CHUNK
+    return (
+        is_varlen
+        and num_seqs == 1
+        and query_heads in _GFX1250_AUTO_G16_QUERY_HEADS
+        and value_heads == 12
+        and num_cus == 256
+        and output_final_state
+        and state_fp32
+        and total_tokens > 0
+        and total_tokens % group_tokens == 0
+        and total_tokens // group_tokens in _GFX1250_AUTO_G16_GROUPS
+    )
+
+
+def _resolve_gfx1250_route(
+    requested_route: str | None,
+    *,
+    total_tokens: int,
+    query_heads: int,
+    value_heads: int,
+    num_cus: int,
+    num_seqs: int = 1,
+    is_varlen: bool = False,
+    output_final_state: bool = False,
+    state_fp32: bool = False,
+) -> tuple[str, int | None]:
+    """Return the effective route and optional context group size.
+
+    An absent route is the production ``auto`` policy.  Auto uses only total
+    tokens, query/value heads, and the host-visible CU count.  It never reads
+    device-resident ``cu_seqlens`` or uses a maximum-sequence hint.  A narrow
+    MI455 evidence table promotes qualified single-sequence packed Hq=3/12,
+    HV=12 calls to G16; every other shape retains the established G4/G8
+    decision.  Explicit ``c16`` remains the rollback route.
+    """
+
+    route = "auto" if requested_route is None else requested_route
+    if route == "c16":
+        return route, None
+    if route != "auto":
+        raise ValueError(
+            f"{_GFX1250_ROUTE_ENV} must be c16 or auto; got {route!r}"
+        )
+
+    group_chunks = (
+        16
+        if _should_use_gfx1250_auto_g16(
+            total_tokens,
+            query_heads,
+            value_heads,
+            num_seqs,
+            num_cus,
+            is_varlen=is_varlen,
+            output_final_state=output_final_state,
+            state_fp32=state_fp32,
+        )
+        else _choose_gfx1250_auto_group_chunks(
+            total_tokens,
+            value_heads,
+            num_cus,
+        )
+    )
+    return f"context{group_chunks}", group_chunks
+
+
 @cache
 def _device_arch(device: torch.device) -> str | None:
     """Return the immutable GCN architecture without a per-call HIP query."""
@@ -160,6 +335,36 @@ def _device_arch(device: torch.device) -> str | None:
         return None
     arch = getattr(props, "gcnArchName", None)
     return arch.split(":", 1)[0] if arch else None
+
+
+@cache
+def _device_compute_units(device: torch.device) -> int | None:
+    """Return the immutable CU count used by gfx1250 host routing."""
+
+    if (
+        torch.device(device).type != "cuda"
+        or torch.version.hip is None
+        or not torch.cuda.is_available()
+    ):
+        return None
+    try:
+        props = torch.cuda.get_device_properties(device)
+    except (AssertionError, RuntimeError, ValueError):
+        return None
+    count = getattr(props, "multi_processor_count", None)
+    return int(count) if count is not None else None
+
+
+def _module_name_for_arch(arch: str | None) -> str:
+    """Return the architecture-compatible FlashKDA extension name."""
+
+    return GFX1250_MD_NAME if arch == "gfx1250" else MD_NAME
+
+
+def _descriptor_op_for_arch(arch: str | None) -> Any:
+    """Return the descriptor entry from the architecture-compatible DSO."""
+
+    return flash_kda_fwd_hip_gfx1250 if arch == "gfx1250" else flash_kda_fwd_hip
 
 
 def _native_rejection_reason(
@@ -201,11 +406,11 @@ def _native_rejection_reason(
     if HV < H or HV % H != 0:
         return "native FlashKDA requires HV >= H and HV divisible by H"
     if HV != H:
-        loaded_binding = _get_raw_pointer_binding()
+        loaded_binding = _get_raw_pointer_binding_for_arch(arch)
         if loaded_binding is not None and loaded_binding[1] < 3:
             return (
                 "the loaded native FlashKDA extension predates the raw-v3 "
-                f"GVA ABI; rebuild {MD_NAME}"
+                f"GVA ABI; rebuild {_module_name_for_arch(arch)}"
             )
     if tuple(g.shape) != (B, T, HV, K) or tuple(beta.shape) != (B, T, HV):
         return "g and beta must match v's batch/token/value-head dimensions"
@@ -326,10 +531,36 @@ def flash_kda_native_supported(
 
 
 _RAW_POINTER_BINDING: tuple[Any, int] | None = None
+_GFX1250_RAW_POINTER_BINDING: tuple[Any, int] | None = None
+
+
+def _resolve_raw_pointer_binding(
+    module_name: str,
+    cached_binding: tuple[Any, int] | None,
+) -> tuple[Any, int] | None:
+    """Resolve one module's newest raw ABI without triggering a JIT build."""
+
+    if _jit_core.AITER_REBUILD and module_name not in _jit_core.rebuilded_list:
+        return None
+    if cached_binding is not None:
+        return cached_binding
+    try:
+        module = get_module(module_name)
+    except ModuleNotFoundError:
+        return None
+    for version, symbol in (
+        (3, "flash_kda_fwd_hip_raw_v3"),
+        (2, "flash_kda_fwd_hip_raw_v2"),
+        (1, "flash_kda_fwd_hip_raw"),
+    ):
+        candidate = getattr(module, symbol, None)
+        if callable(candidate):
+            return candidate, version
+    return None
 
 
 def _get_raw_pointer_binding() -> tuple[Any, int] | None:
-    """Return ``(callable, ABI version)`` once the JIT module is available.
+    """Return the wave64 module's ``(callable, ABI version)`` when available.
 
     The first source-only invocation may still need ``compile_ops`` to build
     the extension.  In that case the caller uses the descriptor ABI once and
@@ -344,28 +575,44 @@ def _get_raw_pointer_binding() -> tuple[Any, int] | None:
         # the first post-build lookup can discover the newest additive symbol.
         _RAW_POINTER_BINDING = None
         return None
-    if _RAW_POINTER_BINDING is not None:
-        return _RAW_POINTER_BINDING
-    try:
-        module = get_module(MD_NAME)
-    except ModuleNotFoundError:
-        return None
-    for version, symbol in (
-        (3, "flash_kda_fwd_hip_raw_v3"),
-        (2, "flash_kda_fwd_hip_raw_v2"),
-        (1, "flash_kda_fwd_hip_raw"),
+    _RAW_POINTER_BINDING = _resolve_raw_pointer_binding(
+        MD_NAME,
+        _RAW_POINTER_BINDING,
+    )
+    return _RAW_POINTER_BINDING
+
+
+def _get_gfx1250_raw_pointer_binding() -> tuple[Any, int] | None:
+    """Return the wave32 gfx1250 module's best raw ABI when available."""
+
+    global _GFX1250_RAW_POINTER_BINDING
+    if (
+        _jit_core.AITER_REBUILD
+        and GFX1250_MD_NAME not in _jit_core.rebuilded_list
     ):
-        candidate = getattr(module, symbol, None)
-        if callable(candidate):
-            _RAW_POINTER_BINDING = (candidate, version)
-            return _RAW_POINTER_BINDING
-    return None
+        _GFX1250_RAW_POINTER_BINDING = None
+        return None
+    _GFX1250_RAW_POINTER_BINDING = _resolve_raw_pointer_binding(
+        GFX1250_MD_NAME,
+        _GFX1250_RAW_POINTER_BINDING,
+    )
+    return _GFX1250_RAW_POINTER_BINDING
 
 
-def _get_raw_pointer_op() -> Any | None:
+def _get_raw_pointer_binding_for_arch(
+    arch: str | None,
+) -> tuple[Any, int] | None:
+    """Resolve the raw binding from the DSO matching ``arch``."""
+
+    if arch == "gfx1250":
+        return _get_gfx1250_raw_pointer_binding()
+    return _get_raw_pointer_binding()
+
+
+def _get_raw_pointer_op(arch: str | None = None) -> Any | None:
     """Compatibility accessor returning the best direct pybind callable."""
 
-    binding = _get_raw_pointer_binding()
+    binding = _get_raw_pointer_binding_for_arch(arch)
     return None if binding is None else binding[0]
 
 
@@ -435,7 +682,10 @@ def _flash_kda_fwd_prevalidated(
 
     B, T, H, K = q.shape
     HV = int(v.shape[2])
+    arch = _device_arch(q.device)
+    module_name = _module_name_for_arch(arch)
     N = int(cu_seqlens.numel() - 1) if cu_seqlens is not None else B
+    is_varlen = cu_seqlens is not None
     normalized_max_seqlen = _normalize_max_seqlen_upper_bound(
         max_seqlen_upper_bound,
         total_tokens=B * T,
@@ -450,9 +700,35 @@ def _flash_kda_fwd_prevalidated(
             f"got {scale}."
         )
 
-    # The imported kernels use contiguous pointer arithmetic.  K3 serving
-    # tensors already satisfy this contract, so these branches are normally
-    # no-ops; standalone callers retain view and dtype normalization.
+    raw_binding = (
+        None
+        if _torch_is_compiling()
+        else _get_raw_pointer_binding_for_arch(arch)
+    )
+    requested_route = os.getenv(_GFX1250_ROUTE_ENV)
+    context_group_chunks = None
+    if arch == "gfx1250":
+        num_cus = 0
+        if requested_route is None or requested_route == "auto":
+            queried_num_cus = _device_compute_units(q.device)
+            if queried_num_cus is None or queried_num_cus <= 0:
+                raise RuntimeError(
+                    "FlashKDA gfx1250 auto route could not query the device CU count"
+                )
+            num_cus = queried_num_cus
+        _, context_group_chunks = _resolve_gfx1250_route(
+            requested_route,
+            total_tokens=B * T,
+            query_heads=H,
+            value_heads=HV,
+            num_cus=num_cus,
+            num_seqs=N,
+            is_varlen=is_varlen,
+            output_final_state=output_final_state,
+            state_fp32=(
+                initial_state is None or initial_state.dtype == torch.float32
+            ),
+        )
     if not (
         q.is_contiguous()
         and k.is_contiguous()
@@ -475,7 +751,6 @@ def _flash_kda_fwd_prevalidated(
     if initial_state is not None and not initial_state.is_contiguous():
         initial_state = initial_state.contiguous()
 
-    is_varlen = cu_seqlens is not None
     if is_varlen:
         # ATOM's native metadata contract is int32.  Accepting int64 here keeps
         # the standalone API friendly while avoiding any conversion in K3.
@@ -493,20 +768,29 @@ def _flash_kda_fwd_prevalidated(
         else None
     )
     out = torch.empty_like(v)
+    workspace_bytes = flash_kda_workspace_size(B * T, HV, N)
+    if context_group_chunks is not None:
+        workspace_bytes += _gfx1250_context_b_scratch_size(
+            B,
+            T,
+            HV,
+            N,
+            is_varlen,
+            context_group_chunks,
+        )
     workspace = torch.empty(
-        flash_kda_workspace_size(B * T, HV, N),
+        workspace_bytes,
         device=q.device,
         dtype=torch.uint8,
     )
 
-    raw_binding = None if _torch_is_compiling() else _get_raw_pointer_binding()
     # Raw ABI v1/v2 carry a single head count and therefore cannot describe
     # GVA.  A source build reaches the descriptor entry once, then discovers
     # the additive v3 symbol on subsequent calls.
     if raw_binding is not None and raw_binding[1] < 3 and H != HV:
         raise RuntimeError(
             "the loaded native FlashKDA extension predates the raw-v3 GVA "
-            f"ABI; rebuild {MD_NAME}"
+            f"ABI; rebuild {module_name}"
         )
 
     def launch() -> None:
@@ -555,7 +839,8 @@ def _flash_kda_fwd_prevalidated(
         initial_arg = initial_state if initial_state is not None else q
         final_arg = final_state if final_state is not None else initial_arg
         cu_arg = cu_seqlens if cu_seqlens is not None else q
-        flash_kda_fwd_hip(
+        descriptor_op = _descriptor_op_for_arch(arch)
+        descriptor_op(
             q,
             k,
             v,
@@ -628,6 +913,17 @@ def flash_kda_fwd(
     can be slower. ``None`` retains the conservative no-hint policy. Both the
     tensor-descriptor path used during JIT cold start or ``torch.compile`` and
     the eager raw-v3 path carry the same bound and GVA head geometry.
+
+    On gfx1250, an unset ``FLASH_KDA_GFX1250_ROUTE`` selects the same production
+    policy as ``auto``; explicit ``c16`` is the rollback.  Qualified MI455
+    single-sequence packed calls with FP32 state output use context16 only for
+    the measured G16 group counts ``{12,14,15,16,24,32,48,64}``. Remaining auto
+    calls select context4 when
+    ``ceil(total_tokens / 16) * HV < 6 * num_cus`` and context8 otherwise, with
+    equality selecting context8.  Device-resident ``cu_seqlens`` and
+    ``max_seqlen_upper_bound`` do not participate.  Python and C++ resolve the
+    same integer policy independently so workspace allocation remains
+    thread-safe; no process environment variable is rewritten during a call.
     """
 
     # Validate the public scalar before architecture admission so malformed
@@ -686,6 +982,7 @@ def flash_kda_fwd(
 __all__ = [
     "FLASH_KDA_NATIVE_ARCHS",
     "FLASH_KDA_NATIVE_CHUNK",
+    "GFX1250_MD_NAME",
     "flash_kda_fwd",
     "flash_kda_native_supported",
     "flash_kda_workspace_size",

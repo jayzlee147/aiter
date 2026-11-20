@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Kimi-K3 contract tests for the native gfx942/gfx950 FlashKDA path.
+"""Kimi-K3 contract tests for the native gfx942/gfx950/gfx1250 FlashKDA path.
 
 The native implementation has a deliberately narrower surface than the Triton
 KDA API. These tests keep its contract explicit: BF16 activations, FP32
@@ -158,6 +158,15 @@ def _native_support_kwargs(inputs: dict[str, object]) -> dict[str, object]:
 
 def _triton_call(inputs: dict[str, object]):
     return _PUBLIC_MODULE.chunk_kimi_delta_attn(**inputs)
+
+
+def _raw_binding_for_inputs(
+    inputs: dict[str, object],
+) -> tuple[object, int] | None:
+    """Resolve the raw ABI from the DSO selected for these inputs."""
+
+    arch = _NATIVE_MODULE._device_arch(inputs["q"].device)
+    return _NATIVE_MODULE._get_raw_pointer_binding_for_arch(arch)
 
 
 def _relative_rms(actual: torch.Tensor, reference: torch.Tensor) -> float:
@@ -349,7 +358,41 @@ def test_native_gva_packed_int64_empty_sequence_preserves_state():
 
 
 @requires_rocm_gpu
-def test_native_gva_descriptor_entry_matches_raw_v3(monkeypatch):
+def test_native_gfx1250_single_sequence_auto_g16_has_sufficient_workspace(
+    monkeypatch,
+):
+    """Keep Python allocation and native routing aligned for packed N=1 G16."""
+
+    device = torch.device("cuda")
+    if _NATIVE_MODULE._device_arch(device) != "gfx1250":
+        pytest.skip("auto-G16 routing is gfx1250-specific")
+    monkeypatch.delenv("AITER_TRITON_ONLY", raising=False)
+    monkeypatch.delenv("FLASH_KDA_GFX1250_ROUTE", raising=False)
+
+    # Twelve 256-token groups is the smallest measured auto-G16 bucket.
+    inputs = _make_k3_inputs(
+        (12 * 256,),
+        heads=3,
+        value_heads=12,
+        resume=True,
+        seed=43,
+    )
+    _require_native(inputs)
+    native_o, native_ht = flash_kda_native_fwd(**_native_kwargs(inputs))
+    gold_o, gold_ht = chunk_kda_ref(**inputs)
+    torch.cuda.synchronize(device)
+
+    assert native_ht is not None and gold_ht is not None
+    assert native_o.shape == inputs["v"].shape
+    assert native_ht.shape == inputs["initial_state"].shape
+    assert torch.isfinite(native_o).all()
+    assert torch.isfinite(native_ht).all()
+    assert _relative_rms(native_o, gold_o) < 4e-2
+    assert _relative_rms(native_ht, gold_ht) < 4e-2
+
+
+@requires_rocm_gpu
+def test_native_gva_descriptor_entry_matches_raw_pointer(monkeypatch):
     """Exercise hinted GVA geometry in the tensor-descriptor ABI explicitly."""
 
     inputs = _make_k3_inputs((19, 29), heads=2, value_heads=4, resume=True, seed=37)
@@ -360,12 +403,17 @@ def test_native_gva_descriptor_entry_matches_raw_v3(monkeypatch):
     }
     # A source-only checkout reaches the descriptor entry while compiling the
     # extension. Warm it first, then prove that the comparison side is really
-    # the additive raw-v3 ABI rather than a second descriptor invocation.
+    # the additive GVA-capable raw ABI rather than a second descriptor
+    # invocation.
     flash_kda_native_fwd(**kwargs)
-    binding = _NATIVE_MODULE._get_raw_pointer_binding()
+    binding = _raw_binding_for_inputs(inputs)
     assert binding is not None and binding[1] == 3
     raw_o, raw_ht = flash_kda_native_fwd(**kwargs)
-    monkeypatch.setattr(_NATIVE_MODULE, "_get_raw_pointer_binding", lambda: None)
+    monkeypatch.setattr(
+        _NATIVE_MODULE,
+        "_get_raw_pointer_binding_for_arch",
+        lambda _arch: None,
+    )
     descriptor_o, descriptor_ht = flash_kda_native_fwd(**kwargs)
     torch.cuda.synchronize()
 
@@ -375,7 +423,7 @@ def test_native_gva_descriptor_entry_matches_raw_v3(monkeypatch):
 
 
 @pytest.mark.parametrize("layout", ["dense", "packed"])
-@pytest.mark.parametrize("entry", ["raw-v3", "descriptor"])
+@pytest.mark.parametrize("entry", ["raw-pointer", "descriptor"])
 @requires_rocm_gpu
 def test_native_bf16_resumed_state_matches_reference(monkeypatch, layout, entry):
     """Cover BF16 state input/output through both native launch ABIs."""
@@ -396,14 +444,18 @@ def test_native_bf16_resumed_state_matches_reference(monkeypatch, layout, entry)
         inputs["cu_seqlens"] = None
     _require_native(inputs)
 
-    if entry == "raw-v3":
+    if entry == "raw-pointer":
         # Warm a source-only checkout once so this case proves the direct ABI,
         # rather than accidentally exercising the descriptor cold-start path.
         flash_kda_native_fwd(**_native_kwargs(inputs))
-        binding = _NATIVE_MODULE._get_raw_pointer_binding()
+        binding = _raw_binding_for_inputs(inputs)
         assert binding is not None and binding[1] == 3
     else:
-        monkeypatch.setattr(_NATIVE_MODULE, "_get_raw_pointer_binding", lambda: None)
+        monkeypatch.setattr(
+            _NATIVE_MODULE,
+            "_get_raw_pointer_binding_for_arch",
+            lambda _arch: None,
+        )
 
     initial_copy = inputs["initial_state"].clone()
     native_o, native_ht = flash_kda_native_fwd(
@@ -425,7 +477,7 @@ def test_native_bf16_resumed_state_matches_reference(monkeypatch, layout, entry)
 
 @requires_rocm_gpu
 def test_native_gva_graph_capture_replays_bitwise():
-    """The raw-v3 pointer path must remain capture-safe for serving graphs."""
+    """The raw pointer path must remain capture-safe for serving graphs."""
 
     inputs = _make_k3_inputs((31, 47), heads=2, value_heads=4, resume=True, seed=41)
     _require_native(inputs)
@@ -536,8 +588,8 @@ def test_native_mixed_hint_resume_chain_is_equivalent(monkeypatch, heads, value_
             monkeypatch.delenv(name, raising=False)
 
     # A source-only cold start may use the descriptor ABI while JIT builds the
-    # extension.  Warm it once, then retain the real raw-v3 callable so the spy
-    # below observes ABI transport without replacing native execution.
+    # extension. Warm it once, then retain the real GVA-capable raw callable so
+    # the spy below observes ABI transport without replacing native execution.
     warmup_inputs = _make_k3_inputs(
         (1,),
         heads=heads,
@@ -549,19 +601,24 @@ def test_native_mixed_hint_resume_chain_is_equivalent(monkeypatch, heads, value_
     _require_native(warmup_inputs)
     flash_kda_native_fwd(**_native_kwargs(warmup_inputs))
     torch.cuda.synchronize(device)
-    real_binding = _NATIVE_MODULE._get_raw_pointer_binding()
+    real_binding = _raw_binding_for_inputs(warmup_inputs)
     assert (
         real_binding is not None and real_binding[1] == 3
     ), "mixed-hint coverage requires the native FlashKDA raw-v3 ABI"
     real_raw_v3 = real_binding[0]
-    raw_v3_tail_args: list[tuple[int, int]] = []
+    raw_tail_args: list[tuple[int, int]] = []
 
     def raw_v3_spy(*args):
         assert len(args) == 27
-        raw_v3_tail_args.append((int(args[-2]), int(args[-1])))
+        bound, qk_heads = args[-2:]
+        raw_tail_args.append((int(bound), int(qk_heads)))
         return real_raw_v3(*args)
 
-    monkeypatch.setattr(_NATIVE_MODULE, "_RAW_POINTER_BINDING", (raw_v3_spy, 3))
+    monkeypatch.setattr(
+        _NATIVE_MODULE,
+        "_RAW_POINTER_BINDING",
+        (raw_v3_spy, 3),
+    )
 
     decodes = (1,) * 15
     steps = (
@@ -593,7 +650,7 @@ def test_native_mixed_hint_resume_chain_is_equivalent(monkeypatch, heads, value_
         candidate_input_copy = candidate_state.clone()
         reference_input_copy = reference_state.clone()
 
-        raw_v3_tail_args.clear()
+        raw_tail_args.clear()
         candidate_o, candidate_final = flash_kda_native_fwd(
             **_native_kwargs(candidate_inputs),
             max_seqlen_upper_bound=bound,
@@ -604,13 +661,13 @@ def test_native_mixed_hint_resume_chain_is_equivalent(monkeypatch, heads, value_
         )
         torch.cuda.synchronize(device)
 
-        # This proves native API -> raw-v3 ABI transport. The existing raw
+        # This proves native API -> raw ABI transport. The existing raw
         # graph route validator separately proves that C++ consumes the hint.
         candidate_bound = 0 if bound is None else bound
-        assert raw_v3_tail_args == [
+        assert raw_tail_args == [
             (candidate_bound, heads),
             (0, heads),
-        ], f"{hint_label} raw-v3 tail args were {raw_v3_tail_args}"
+        ], f"{hint_label} raw tail args were {raw_tail_args}"
         assert candidate_final is not None and reference_final is not None
         assert torch.isfinite(candidate_o).all()
         assert torch.isfinite(candidate_final).all()

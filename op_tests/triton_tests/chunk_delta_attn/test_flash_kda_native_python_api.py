@@ -66,7 +66,268 @@ def _cpu_gva_native_inputs() -> dict[str, object]:
 @pytest.fixture(autouse=True)
 def _reset_raw_binding_cache(monkeypatch):
     monkeypatch.setattr(_FLASH_KDA, "_RAW_POINTER_BINDING", None)
+    monkeypatch.setattr(_FLASH_KDA, "_GFX1250_RAW_POINTER_BINDING", None)
     monkeypatch.setattr(_FLASH_KDA._jit_core, "AITER_REBUILD", False)
+    monkeypatch.delenv("FLASH_KDA_GFX1250_ROUTE", raising=False)
+
+
+@pytest.mark.parametrize(
+    ("total_tokens", "value_heads", "expected"),
+    [
+        (2032, 12, 4),
+        (2033, 12, 8),
+        (2048, 12, 8),
+        (24560, 1, 4),
+        (24561, 1, 8),
+    ],
+)
+def test_gfx1250_python_auto_group_policy_matches_native_boundaries(
+    total_tokens, value_heads, expected
+):
+    assert (
+        _FLASH_KDA._choose_gfx1250_auto_group_chunks(
+            total_tokens,
+            value_heads,
+            256,
+        )
+        == expected
+    )
+
+
+def test_gfx1250_auto_route_uses_host_only_total_token_geometry():
+    assert _FLASH_KDA._resolve_gfx1250_route(
+        "auto",
+        total_tokens=2048,
+        query_heads=12,
+        value_heads=12,
+        num_cus=256,
+    ) == ("context8", 8)
+    assert _FLASH_KDA._resolve_gfx1250_route(
+        "auto",
+        total_tokens=2032,
+        query_heads=12,
+        value_heads=12,
+        num_cus=256,
+    ) == ("context4", 4)
+    assert _FLASH_KDA._resolve_gfx1250_route(
+        None,
+        total_tokens=2048,
+        query_heads=12,
+        value_heads=12,
+        num_cus=256,
+    ) == ("context8", 8)
+    assert _FLASH_KDA._resolve_gfx1250_route(
+        None,
+        total_tokens=4096,
+        query_heads=12,
+        value_heads=12,
+        num_cus=256,
+        num_seqs=1,
+        is_varlen=True,
+        output_final_state=True,
+        state_fp32=True,
+    ) == ("context16", 16)
+    with pytest.raises(ValueError, match="must be c16 or auto"):
+        _FLASH_KDA._resolve_gfx1250_route(
+            "invalid",
+            total_tokens=2048,
+            query_heads=12,
+            value_heads=12,
+            num_cus=256,
+        )
+
+
+def test_gfx1250_auto_g16_is_limited_to_measured_groups_and_shape_contract():
+    selected_groups = {12, 14, 15, 16, 24, 32, 48, 64}
+    for query_heads in (3, 12):
+        for group_count in range(1, 65):
+            assert _FLASH_KDA._should_use_gfx1250_auto_g16(
+                group_count * 256,
+                query_heads,
+                12,
+                1,
+                256,
+                is_varlen=True,
+                output_final_state=True,
+                state_fp32=True,
+            ) == (group_count in selected_groups)
+
+    for query_heads in (1, 2, 4, 6):
+        assert not _FLASH_KDA._should_use_gfx1250_auto_g16(
+            4096,
+            query_heads,
+            12,
+            1,
+            256,
+            is_varlen=True,
+            output_final_state=True,
+            state_fp32=True,
+        )
+
+    assert not _FLASH_KDA._should_use_gfx1250_auto_g16(
+        4096,
+        12,
+        12,
+        32,
+        256,
+        is_varlen=True,
+        output_final_state=True,
+        state_fp32=True,
+    )
+    assert not _FLASH_KDA._should_use_gfx1250_auto_g16(
+        4096,
+        12,
+        12,
+        1,
+        256,
+        is_varlen=False,
+        output_final_state=True,
+        state_fp32=True,
+    )
+
+
+@pytest.mark.parametrize("group_chunks", [4, 8, 16])
+def test_gfx1250_context_workspace_tail_is_route_private_and_exact(group_chunks):
+    base = _FLASH_KDA.flash_kda_workspace_size(96, 2, 1)
+    short_tail = _FLASH_KDA._gfx1250_context_b_scratch_size(
+        1, 96, 2, 1, True, group_chunks
+    )
+
+    assert base == _FLASH_KDA.flash_kda_workspace_size(96, 2, 1)
+    expected_short_maps = 6 if group_chunks == 4 else 4
+    assert short_tail == expected_short_maps * 128 * 128 * 4
+    long_tail = _FLASH_KDA._gfx1250_context_b_scratch_size(
+        1, 241, 2, 1, False, group_chunks
+    )
+    expected_long_maps = {4: 8, 8: 4}.get(group_chunks, 0)
+    assert long_tail == expected_long_maps * 128 * 128 * 4
+
+
+def test_gfx1250_context_workspace_tail_covers_packed_short_sequences():
+    tail = _FLASH_KDA._gfx1250_context_b_scratch_size(
+        1, 10, 4, 3, True, 16
+    )
+
+    assert tail == 4 * 4 * 128 * 128 * 4
+    assert (
+        _FLASH_KDA._gfx1250_context_b_scratch_size(
+            1, 10, 4, 3, True, 4
+        )
+        == tail
+    )
+    with pytest.raises(ValueError, match="unsupported gfx1250 context group"):
+        _FLASH_KDA._gfx1250_context_b_scratch_size(
+            1, 10, 4, 3, True, 2
+        )
+
+
+def test_gfx1250_c16_route_uses_base_workspace(monkeypatch):
+    shape = (1, 257, 1, 128)
+    q = torch.zeros(shape, dtype=torch.bfloat16)
+    recorder = _Recorder()
+    inputs = {
+        "q": q,
+        "k": q.clone(),
+        "v": q.clone(),
+        "g": q.clone(),
+        "beta": torch.zeros(shape[:-1], dtype=torch.float32),
+        "A_log": torch.zeros(1, dtype=torch.float32),
+        "dt_bias": torch.zeros(128, dtype=torch.float32),
+    }
+
+    monkeypatch.setattr(_FLASH_KDA, "_device_arch", lambda _device: "gfx1250")
+    monkeypatch.setattr(
+        _FLASH_KDA,
+        "_device_compute_units",
+        lambda _device: (_ for _ in ()).throw(
+            AssertionError("non-auto routes must not query device CU count")
+        ),
+    )
+    monkeypatch.setattr(
+        _FLASH_KDA, "_get_raw_pointer_binding_for_arch", lambda _arch: None
+    )
+    monkeypatch.setattr(_FLASH_KDA, "flash_kda_fwd_hip_gfx1250", recorder)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: None)
+    monkeypatch.setenv("FLASH_KDA_GFX1250_ROUTE", "c16")
+
+    _FLASH_KDA._flash_kda_fwd_prevalidated(**inputs)
+
+    workspace = recorder.calls[0][6]
+    expected = _FLASH_KDA.flash_kda_workspace_size(257, 1, 1)
+    assert workspace.nbytes == expected
+
+
+@pytest.mark.parametrize("query_heads", [3, 12])
+def test_gfx1250_workspace_allocation_tracks_default_auto_route(
+    monkeypatch, query_heads
+):
+    q_shape = (1, 4096, query_heads, 128)
+    v_shape = (1, 4096, 12, 128)
+    q = torch.zeros(q_shape, dtype=torch.bfloat16)
+    v = torch.zeros(v_shape, dtype=torch.bfloat16)
+    recorder = _Recorder()
+    inputs = {
+        "q": q,
+        "k": q.clone(),
+        "v": v,
+        "g": v.clone(),
+        "beta": torch.zeros(v_shape[:-1], dtype=torch.float32),
+        "A_log": torch.zeros(12, dtype=torch.float32),
+        "dt_bias": torch.zeros(12 * 128, dtype=torch.float32),
+        "cu_seqlens": torch.tensor([0, 4096], dtype=torch.int32),
+        "output_final_state": True,
+    }
+
+    monkeypatch.setattr(_FLASH_KDA, "_device_arch", lambda _device: "gfx1250")
+    monkeypatch.setattr(_FLASH_KDA, "_device_compute_units", lambda _device: 256)
+    monkeypatch.setattr(
+        _FLASH_KDA, "_get_raw_pointer_binding_for_arch", lambda _arch: None
+    )
+    monkeypatch.setattr(_FLASH_KDA, "flash_kda_fwd_hip_gfx1250", recorder)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: None)
+    monkeypatch.delenv("FLASH_KDA_GFX1250_ROUTE", raising=False)
+
+    _FLASH_KDA._flash_kda_fwd_prevalidated(**inputs)
+
+    workspace = recorder.calls[0][6]
+    expected = _FLASH_KDA.flash_kda_workspace_size(4096, 12, 1)
+    expected += _FLASH_KDA._gfx1250_context_b_scratch_size(
+        1, 4096, 12, 1, True, 16
+    )
+    assert workspace.nbytes == expected
+
+
+def test_gfx1250_workspace_allocation_tracks_auto_context_route(monkeypatch):
+    shape = (1, 2048, 12, 128)
+    q = torch.zeros(shape, dtype=torch.bfloat16)
+    recorder = _Recorder()
+    inputs = {
+        "q": q,
+        "k": q.clone(),
+        "v": q.clone(),
+        "g": q.clone(),
+        "beta": torch.zeros(shape[:-1], dtype=torch.float32),
+        "A_log": torch.zeros(12, dtype=torch.float32),
+        "dt_bias": torch.zeros(12 * 128, dtype=torch.float32),
+    }
+
+    monkeypatch.setattr(_FLASH_KDA, "_device_arch", lambda _device: "gfx1250")
+    monkeypatch.setattr(_FLASH_KDA, "_device_compute_units", lambda _device: 256)
+    monkeypatch.setattr(
+        _FLASH_KDA, "_get_raw_pointer_binding_for_arch", lambda _arch: None
+    )
+    monkeypatch.setattr(_FLASH_KDA, "flash_kda_fwd_hip_gfx1250", recorder)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: None)
+    monkeypatch.setenv("FLASH_KDA_GFX1250_ROUTE", "auto")
+
+    _FLASH_KDA._flash_kda_fwd_prevalidated(**inputs)
+
+    workspace = recorder.calls[0][6]
+    expected = _FLASH_KDA.flash_kda_workspace_size(2048, 12, 1)
+    expected += _FLASH_KDA._gfx1250_context_b_scratch_size(
+        1, 2048, 12, 1, False, 8
+    )
+    assert workspace.nbytes == expected
 
 
 @pytest.mark.parametrize("value", [True, False, 1.0, "4", object(), _IntSubclass(4)])

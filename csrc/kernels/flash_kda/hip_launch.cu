@@ -67,6 +67,7 @@ void launch_fwd_hip(
     float scale,
     void* out_ptr,
     void* workspace_ptr,
+    int64_t workspace_bytes,
     const float* A_log_ptr,
     const float* dt_bias_ptr,
     float gate_scale,
@@ -83,6 +84,7 @@ void launch_fwd_hip(
     const int32_t* cu_seqlens,
     hipStream_t stream,
     int max_seqlen_upper_bound) {
+    (void)workspace_bytes;
     const FwdParams params{
         q_ptr, k_ptr, v_ptr, g_ptr, beta_ptr, scale, out_ptr, workspace_ptr,
         A_log_ptr, dt_bias_ptr, gate_scale, total_tiles, T_total, H_q, H, N,

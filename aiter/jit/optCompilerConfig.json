@@ -2019,5 +2019,27 @@
         ],
         "verbose": "False",
         "blob_gen_cmd": "''"
+    },
+    "module_flash_kda_gfx1250": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/flash_kda_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/flash_kda/flash_kda_aiter.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/flash_kda/hip_workspace.cpp'",
+            "f'{AITER_CSRC_DIR}/kernels/flash_kda/gfx1250/flash_kda_gfx1250_backend.cu'"
+        ],
+        "flags_extra_cc": [
+            "'-Wno-psabi'",
+            "'-DFLASH_KDA_GFX1250_BACKEND=1'"
+        ],
+        "flags_extra_hip": [
+            "'-Wno-psabi'",
+            "'-DFLASH_KDA_GFX1250_BACKEND=1'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/kernels/flash_kda'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
     }
 }
