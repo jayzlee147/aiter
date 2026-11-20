@@ -71,6 +71,15 @@ _DECODE_GRID_PER_CU_F32_STATE = 2
 _DECODE_V_SPLITS = (8, 4, 2, 1)
 _DECODE_V_SPLITS_F32_STATE = (8, 2, 1)
 
+# gfx1250 executes 32-lane waves; the existing CDNA targets execute 64-lane
+# waves. Decode tiling carries this width into the kernel cache key.
+_WAVE_SIZE_BY_ARCH = {"gfx1250": 32}
+_DEFAULT_WAVE_SIZE = 64
+
+
+def _wave_size(arch: str) -> int:
+    return _WAVE_SIZE_BY_ARCH.get(arch, _DEFAULT_WAVE_SIZE)
+
 # Warp shape for the value tile a split leaves, as (NUM_WARPS,
 # WARP_THREADS_K), keyed on (tile width, fp32 state). A tile of 64 or wider is
 # covered best by four warps over a narrow K group; from 32 down there is no
@@ -88,8 +97,17 @@ _DECODE_WARP_SHAPE = {
     (16, True): (4, 16),
 }
 
+# Measured on gfx1250 with a 512-slot pool and rotating B32/B128/B512 windows.
+# Eight wave32 warps keep the unsplit FP32-state tile resident; a 16-lane K
+# group doubled per-lane state pressure and spilled in that sweep.
+_DECODE_WARP_SHAPE_BY_ARCH = {
+    "gfx1250": {
+        (128, True): (8, 8),
+    },
+}
 
-def _decode_warp_shape(head_k_dim, tile_v, f32_state):
+
+def _decode_warp_shape(head_k_dim, tile_v, f32_state, wave):
     """The warp shape for a value tile: the measured entry, or a derived one.
 
     A K group of ``WARP_THREADS_K`` lanes reads ``values_per_thread_k`` values
@@ -97,18 +115,21 @@ def _decode_warp_shape(head_k_dim, tile_v, f32_state):
     it divides, and the rest fall back to the widest group that fits.
     """
     values_per_thread_k = 4 if f32_state else 8
-    shape = _DECODE_WARP_SHAPE.get((tile_v, f32_state))
+    arch_table = _DECODE_WARP_SHAPE_BY_ARCH.get(GDR_GPU_ARCH) or {}
+    shape = arch_table.get((tile_v, f32_state))
+    if shape is None:
+        shape = _DECODE_WARP_SHAPE.get((tile_v, f32_state))
     if shape is not None:
         num_warps, warp_threads_k = shape
         if head_k_dim % (warp_threads_k * values_per_thread_k) == 0 and (
-            tile_v % (num_warps * (64 // warp_threads_k)) == 0
+            tile_v % (num_warps * (wave // warp_threads_k)) == 0
         ):
             return shape
     best = None
     for warp_threads_k in (8, 16, 4):
         if head_k_dim % (warp_threads_k * values_per_thread_k):
             continue
-        num_warps = _tile_warps(tile_v, 64 // warp_threads_k)
+        num_warps = _tile_warps(tile_v, wave // warp_threads_k)
         if num_warps is not None and (best is None or num_warps > best[0]):
             best = (num_warps, warp_threads_k)
     return best
@@ -123,6 +144,7 @@ def _decode_tiling(batch_size, num_v_heads, head_k_dim, head_v_dim, state_dtype_
     that product.
     """
     f32_state = state_dtype_str == "torch.float32"
+    wave = _wave_size(GDR_GPU_ARCH)
     target = get_num_sms() * (
         _DECODE_GRID_PER_CU_F32_STATE if f32_state else _DECODE_GRID_PER_CU
     )
@@ -130,17 +152,33 @@ def _decode_tiling(batch_size, num_v_heads, head_k_dim, head_v_dim, state_dtype_
     for num_blocks in splits:
         if head_v_dim % num_blocks or batch_size * num_v_heads * num_blocks > target:
             continue
-        shape = _decode_warp_shape(head_k_dim, head_v_dim // num_blocks, f32_state)
+        shape = _decode_warp_shape(
+            head_k_dim, head_v_dim // num_blocks, f32_state, wave
+        )
         if shape is not None:
             return {
                 "NUM_BLOCKS_PER_V_DIM": num_blocks,
                 "NUM_WARPS": shape[0],
                 "WARP_THREADS_K": shape[1],
+                "WAVE_SIZE": wave,
             }
     # Either the grid already covers the machine or nothing tiles the head; hand
     # back the old default and let the builder be the one to refuse it, with its
     # own message.
-    return {"NUM_BLOCKS_PER_V_DIM": 1, "NUM_WARPS": 4, "WARP_THREADS_K": 8}
+    shape = _decode_warp_shape(head_k_dim, head_v_dim, f32_state, wave)
+    if shape is not None:
+        return {
+            "NUM_BLOCKS_PER_V_DIM": 1,
+            "NUM_WARPS": shape[0],
+            "WARP_THREADS_K": shape[1],
+            "WAVE_SIZE": wave,
+        }
+    return {
+        "NUM_BLOCKS_PER_V_DIM": 1,
+        "NUM_WARPS": 4,
+        "WARP_THREADS_K": 8,
+        "WAVE_SIZE": wave,
+    }
 
 
 def get_default_kwargs(
@@ -344,6 +382,11 @@ def flydsl_gdr_decode(
     read_indices: torch.Tensor | None = None,
     write_indices: torch.Tensor | None = None,
 ):
+    if not _is_decode_supported_arch(query.device):
+        raise ValueError(
+            "flydsl_gdr_decode has no kernel for this device; supported "
+            f"archs are {list(_DECODE_SUPPORTED_ARCHS)}."
+        )
     if stream is None:
         stream = torch.cuda.current_stream()
     device = query.device
@@ -451,7 +494,10 @@ flydsl_gdr_decode.zeroes_invalid_output = True
 
 _SUPPORTED_DTYPES = (torch.bfloat16, torch.float16)
 _SUPPORTED_STATE_DTYPES = (torch.float32, torch.bfloat16)
+# MTP remains limited to its swept wave64 targets. Do not add gfx1250 here
+# until its MTP launch policy and register-pressure ladder are validated.
 _SUPPORTED_ARCHS = ("gfx942", "gfx950")
+_DECODE_SUPPORTED_ARCHS = ("gfx942", "gfx950", "gfx1250")
 
 
 @functools.cache
@@ -468,6 +514,22 @@ def _is_supported_arch(device: torch.device) -> bool:
         return False
     index = device.index if device.index is not None else torch.cuda.current_device()
     return _is_supported_arch_index(index)
+
+
+@functools.cache
+def _is_decode_supported_arch_index(index: int) -> bool:
+    try:
+        arch = str(torch.cuda.get_device_properties(index).gcnArchName)
+    except Exception:  # noqa: BLE001 - no live device, meta/CPU tensor
+        return False
+    return arch.split(":")[0] in _DECODE_SUPPORTED_ARCHS
+
+
+def _is_decode_supported_arch(device: torch.device) -> bool:
+    if device.type != "cuda":
+        return False
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _is_decode_supported_arch_index(index)
 
 
 def _unit_strided(t: torch.Tensor) -> bool:
