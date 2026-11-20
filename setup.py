@@ -263,6 +263,8 @@ def _load_modules_from_config():
 def get_exclude_ops():
     all_modules = _load_modules_from_config()
     exclude_ops = []
+    if "gfx950" not in core.get_gfx_list():
+        exclude_ops.append("module_kda_rectangular")
 
     # When CK is disabled, exclude all CK-dependent modules
     if not ENABLE_CK:

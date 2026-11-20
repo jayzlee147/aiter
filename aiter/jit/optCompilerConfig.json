@@ -33,6 +33,16 @@
         "third_party": [],
         "is_experimental": "True"
     },
+    "module_kda_rectangular": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/kda_rectangular_pybind.cpp'",
+            "f'{AITER_CSRC_DIR}/kernels/kda_rectangular/kda_rectangular.cu'"
+        ],
+        "flags_extra_cc": ["'-DENABLE_CK=0'"],
+        "flags_extra_hip": ["'-DENABLE_CK=0'", "'-ffast-math'"],
+        "extra_include": ["f'{AITER_CSRC_DIR}/kernels/kda_rectangular'"],
+        "torch_exclude": "False"
+    },
     "module_aiter_core": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/aiter_core_pybind.cu'"
