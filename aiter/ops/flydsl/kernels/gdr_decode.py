@@ -52,9 +52,10 @@ def create_vk_gdr_decode_kernel(
     NUM_BLOCKS_PER_V_DIM: int = 1,
     NUM_WARPS: int = 4,
     WARP_THREADS_K: int = 8,
+    WAVE_SIZE: int = 64,
 ):
     SCALE_VALUE = float(1.0 / (float(head_k_dim) ** 0.5))
-    WARP_THREADS_V = 64 // WARP_THREADS_K
+    WARP_THREADS_V = WAVE_SIZE // WARP_THREADS_K
 
     if "f32" in state_dtype:
         VALUES_PER_THREAD_K = 4  # 16B
@@ -74,7 +75,11 @@ def create_vk_gdr_decode_kernel(
 
     WARP_SIZE = WARP_THREADS_V * WARP_THREADS_K
     BLOCK_THREADS = NUM_WARPS * WARP_SIZE
-    assert WARP_SIZE == 64
+    assert WAVE_SIZE in (32, 64), f"unsupported wave size {WAVE_SIZE}"
+    assert 0 < WARP_THREADS_K <= WAVE_SIZE, (
+        f"a K group of {WARP_THREADS_K} lanes does not fit a {WAVE_SIZE}-lane wave"
+    )
+    assert WARP_SIZE == WAVE_SIZE
 
     WARP_TILE_K = WARP_THREADS_K * VALUES_PER_THREAD_K
     WARP_TILE_K_ITERS = head_k_dim // WARP_TILE_K
